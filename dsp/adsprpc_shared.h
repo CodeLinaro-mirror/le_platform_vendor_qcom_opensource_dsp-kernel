@@ -670,6 +670,7 @@ void fastrpc_transport_session_init(int cid, char *subsys);
 void fastrpc_transport_session_deinit(int cid);
 int fastrpc_wait_for_transport_interrupt(int cid, unsigned int flags);
 int fastrpc_set_tvm_remote_domain(struct fastrpc_file *fl, struct fastrpc_ioctl_init *init);
+void fastrpc_restart_drivers(int cid);
 
 static inline struct smq_invoke_buf *smq_invoke_buf_start(remote_arg64_t *pra,
 							uint32_t sc)
@@ -742,11 +743,6 @@ struct secure_vm {
 struct gid_list {
 	unsigned int *gids;
 	unsigned int gidcount;
-};
-
-struct qos_cores {
-	int *coreno;
-	int corecount;
 };
 
 struct fastrpc_buf {
@@ -991,7 +987,6 @@ struct fastrpc_apps {
 	/* Non-secure subsystem like CDSP will use regular client */
 	struct wakeup_source *wake_source;
 	uint32_t duplicate_rsp_err_cnt;
-	struct qos_cores silvercores;
 	uint32_t max_size_limit;
 	struct hlist_head frpc_devices;
 	struct hlist_head frpc_drivers;
@@ -1002,6 +997,10 @@ struct fastrpc_apps {
 	int share_securecb;
 	/* Indicates process type is configured for SMMU context bank */
 	bool cb_pd_type;
+	/* Number of lowest capacity cores for given platform */
+	unsigned int lowest_capacity_core_count;
+	/* Flag to check if PM QoS vote needs to be done for only one core */
+	bool single_core_latency_vote;
 };
 
 struct fastrpc_mmap {
@@ -1030,6 +1029,8 @@ struct fastrpc_mmap {
 	/* Mapping for fastrpc shell */
 	bool is_filemap;
 	char *servloc_name;			/* Indicate which daemon mapped this */
+	/* Indicates map is being used by a pending RPC call */
+	unsigned int ctx_refs;
 };
 
 enum fastrpc_perfkeys {

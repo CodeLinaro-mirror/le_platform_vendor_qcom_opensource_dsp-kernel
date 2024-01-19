@@ -25,6 +25,12 @@ KBUILD_CPPFLAGS += -DCONFIG_DSP_SUN=1
 ccflags-y += -DCONFIG_DSP_SUN=1
 endif
 
+ifeq ($(CONFIG_ARCH_NIOBE), y)
+$(info within KBUILD file CONFIG_ARCH_NIOBE = $(CONFIG_ARCH_NIOBE))
+KBUILD_CPPFLAGS += -DCONFIG_DSP_NIOBE=1
+ccflags-y += -DCONFIG_DSP_NIOBE=1
+endif
+
 LINUXINCLUDE += -I$(DSP_ROOT)/include/linux
 LINUXINCLUDE += -I$(DSP_ROOT)/include/uapi
 

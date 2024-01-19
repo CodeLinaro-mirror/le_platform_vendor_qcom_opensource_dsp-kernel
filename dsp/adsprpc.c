@@ -42,6 +42,7 @@
 #include "adsprpc_shared.h"
 #include <soc/qcom/qcom_ramdump.h>
 #include <soc/qcom/minidump.h>
+#include <soc/qcom/secure_buffer.h>
 #include <linux/delay.h>
 #include <linux/debugfs.h>
 #include <linux/pm_qos.h>
@@ -1055,14 +1056,13 @@ static void fastrpc_mmap_free(struct fastrpc_mmap *map, uint32_t flags)
 		map->refs--;
 		if (!map->refs && !map->is_persistent && !map->ctx_refs)
 			hlist_del_init(&map->hn);
-		spin_unlock_irqrestore(&me->hlock, irq_flags);
 		if (map->refs > 0) {
 			ADSPRPC_WARN(
 				"multiple references for remote heap size %zu va 0x%lx ref count is %d\n",
 				map->size, map->va, map->refs);
+			spin_unlock_irqrestore(&me->hlock, irq_flags);
 			return;
 		}
-		spin_lock_irqsave(&me->hlock, irq_flags);
 		if (map->is_persistent && map->in_use)
 			map->in_use = false;
 		spin_unlock_irqrestore(&me->hlock, irq_flags);
@@ -1194,6 +1194,77 @@ bail:
 	return err;
 }
 
+static int get_buffer_attr(struct dma_buf *buf, bool *exclusive_access, bool *hlos_access)
+{
+	const int *vmids_list = NULL, *perms = NULL;
+	int err = 0, vmids_list_len = 0;
+
+	*exclusive_access = false;
+	*hlos_access = false;
+	err = mem_buf_dma_buf_get_vmperm(buf, &vmids_list, &perms, &vmids_list_len);
+	if (err)
+		goto bail;
+
+	/*
+	 * If one VM has access to buffer and is the current VM,
+	 * then VM has exclusive access to buffer
+	 */
+	if (vmids_list_len == 1 && vmids_list[0] == mem_buf_current_vmid())
+		*exclusive_access = true;
+
+#if IS_ENABLED(CONFIG_MSM_ADSPRPC_TRUSTED)
+	/*
+	 * PVM (HLOS) can share buffers with TVM. In that case,
+	 * it is expected to relinquish its ownership to those buffers
+	 * before sharing. But if the PVM still retains access, then
+	 * these buffers cannot be used by TVM.
+	 */
+
+	for (int ii = 0; ii < vmids_list_len; ii++) {
+		if (vmids_list[ii] == VMID_HLOS) {
+			*hlos_access = true;
+			break;
+		}
+	}
+#endif
+
+bail:
+	return err;
+}
+
+static int set_buffer_secure_type(struct fastrpc_mmap *map)
+{
+	int err = 0;
+	bool hlos_access = false, exclusive_access = false;
+
+	VERIFY(err, 0 == (err = get_buffer_attr(map->buf, &exclusive_access, &hlos_access)));
+	if (err) {
+		ADSPRPC_ERR("failed to obtain buffer attributes for fd %d ret %d\n", map->fd, err);
+		err = -EBADFD;
+		goto bail;
+	}
+#if IS_ENABLED(CONFIG_MSM_ADSPRPC_TRUSTED)
+	if (hlos_access) {
+		ADSPRPC_ERR("Sharing HLOS buffer (fd %d) not allowed on TVM\n", map->fd);
+		err = -EACCES;
+		goto bail;
+	}
+#endif
+	/*
+	 * Secure buffers would always be owned by multiple VMs.
+	 * If current VM is the exclusive owner of a buffer, it is considered non-secure.
+	 * In PVM:
+	 *	- CPZ buffers are secure
+	 *	- All other buffers are non-secure
+	 * In TVM:
+	 *	- Since it is a secure environment by default, there are no explicit "secure" buffers
+	 *	- All buffers are marked "non-secure"
+	 */
+	map->secure = (exclusive_access) ? 0 : 1;
+bail:
+	return err;
+}
+
 static int fastrpc_mmap_create(struct fastrpc_file *fl, int fd, struct dma_buf *buf,
 	unsigned int attr, uintptr_t va, size_t len, int mflags,
 	struct fastrpc_mmap **ppmap)
@@ -1257,10 +1328,10 @@ static int fastrpc_mmap_create(struct fastrpc_file *fl, int fd, struct dma_buf *
 			err = -EBADFD;
 			goto bail;
 		}
+		err = set_buffer_secure_type(map);
+		if (err)
+			goto bail;
 
-#if !IS_ENABLED(CONFIG_MSM_ADSPRPC_TRUSTED)
-		map->secure = (mem_buf_dma_buf_exclusive_owner(map->buf)) ? 0 : 1;
-#endif
 		map->va = 0;
 		map->phys = 0;
 
@@ -1323,10 +1394,10 @@ static int fastrpc_mmap_create(struct fastrpc_file *fl, int fd, struct dma_buf *
 				goto bail;
 			}
 		}
+		err = set_buffer_secure_type(map);
+		if (err)
+			goto bail;
 
-#if !IS_ENABLED(CONFIG_MSM_ADSPRPC_TRUSTED)
-		map->secure = (mem_buf_dma_buf_exclusive_owner(map->buf)) ? 0 : 1;
-#endif
 		if (map->secure) {
 			if (!fl->secsctx)
 				err = fastrpc_session_alloc_secure_memory(chan, 1,
@@ -6821,12 +6892,6 @@ int fastrpc_setmode(unsigned long ioctl_param,
 		fl->profile = (uint32_t)ioctl_param;
 		break;
 	case FASTRPC_MODE_SESSION:
-		if (fl->untrusted_process) {
-			err = -EPERM;
-			ADSPRPC_ERR(
-				"multiple sessions not allowed for untrusted apps\n");
-			goto bail;
-		}
 		if (!fl->multi_session_support)
 			fl->sessionid = 1;
 		break;
@@ -6834,7 +6899,6 @@ int fastrpc_setmode(unsigned long ioctl_param,
 		err = -ENOTTY;
 		break;
 	}
-bail:
 	return err;
 }
 

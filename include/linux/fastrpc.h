@@ -10,11 +10,13 @@
 #include <linux/errno.h>
 #include <linux/kernel.h>
 
-#define FASTRPC_DRV_NAME_SIZE 32
 
+/* status send to the client when the process goes down */
 enum fastrpc_driver_status {
 	FASTRPC_PROC_DOWN = 0,
 };
+
+/* Invocation number of operations exposed to the client */
 enum fastrpc_driver_invoke_nums {
 	FASTRPC_DEV_MAP_DMA = 1,
 	FASTRPC_DEV_UNMAP_DMA,
@@ -63,10 +65,10 @@ struct fastrpc_dev_get_hlos_pid {
  * @refs: reference count of drivers using the device
  */
 struct fastrpc_device {
-	struct hlist_node hn;
+	struct list_head hn;
 	struct device dev;
 	int handle;
-	struct fastrpc_file *fl;
+	struct fastrpc_user *fl;
 	bool dev_close;
 	unsigned int refs;
 };
@@ -84,7 +86,7 @@ struct fastrpc_device {
  * @callback: invoked when there is a status change in the process
  */
 struct fastrpc_driver {
-	struct hlist_node hn;
+	struct list_head hn;
 	struct device_driver driver;
 	struct device *device;
 	int handle;

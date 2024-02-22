@@ -3,4 +3,4 @@
  * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
-#define CONFIG_MSM_ADSPRPC 1
+#define CONFIG_QCOM_FASTRPC 1

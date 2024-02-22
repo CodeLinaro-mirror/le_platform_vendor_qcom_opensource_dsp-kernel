@@ -20,7 +20,7 @@ ccflags-y += -DCONFIG_DSP_PINEAPPLE=1
 endif
 
 ifeq ($(CONFIG_ARCH_SUN), y)
-$(info within KBUILD file CONFIG_ARCH_PINEAPPLE = $(CONFIG_ARCH_SUN))
+$(info within KBUILD file CONFIG_ARCH_SUN = $(CONFIG_ARCH_SUN))
 KBUILD_CPPFLAGS += -DCONFIG_DSP_SUN=1
 ccflags-y += -DCONFIG_DSP_SUN=1
 endif
@@ -34,14 +34,8 @@ endif
 LINUXINCLUDE += -I$(DSP_ROOT)/include/linux
 LINUXINCLUDE += -I$(DSP_ROOT)/include/uapi
 
-frpc-adsprpc-y := dsp/adsprpc.o	\
-                  dsp/adsprpc_rpmsg.o \
-
-frpc-adsprpc-$(CONFIG_COMPAT) += dsp/adsprpc_compat.o \
-
-frpc_trusted-adsprpc-y := dsp/adsprpc.o	\
-                          dsp/adsprpc_compat.o \
-                          dsp/adsprpc_socket.o \
+frpc-adsprpc-y := dsp/fastrpc.o	\
+			 dsp/fastrpc_rpmsg.o \
 
 cdsp-loader-y := dsp/cdsp-loader.o
 

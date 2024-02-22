@@ -21,18 +21,15 @@ def define_modules(target, variant):
         kernel_build = "//msm-kernel:{}".format(kernel_build_variant),
         deps = ["//msm-kernel:all_headers"],
         srcs = [
-            "dsp/adsprpc.c",
-            "dsp/adsprpc_compat.c",
-            "dsp/adsprpc_compat.h",
-            "dsp/adsprpc_rpmsg.c",
-            "dsp/adsprpc_shared.h",
-            "dsp/fastrpc_trace.h",
+            "dsp/fastrpc.c",
+            "dsp/fastrpc_rpmsg.c",
+            "dsp/fastrpc_shared.h",
         ],
         local_defines = ["DSP_TRACE_INCLUDE_PATH={}".format(trace_include_path)],
         out = "frpc-adsprpc.ko",
         hdrs = [
-            "include/linux/fastrpc.h",
-            "include/uapi/fastrpc_shared.h",
+	     	"include/uapi/misc/fastrpc.h",
+		"include/linux/fastrpc.h"
         ],
         includes = [
             "include/linux",

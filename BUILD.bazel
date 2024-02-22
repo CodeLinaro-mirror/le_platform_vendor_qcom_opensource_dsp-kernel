@@ -1,6 +1,5 @@
 # Bazel file for fastrpc
-# Three modules to be exported - frpc-adsprpc,
-# cdsp-loader and frpc-trusted
+# Two modules to be exported - fastrpc, cdsp-loader
 
 package(
     default_visibility = [

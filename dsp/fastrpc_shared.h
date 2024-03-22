@@ -463,6 +463,8 @@ struct fastrpc_session_ctx {
 	bool valid;
 	bool secure;
 	bool sharedcb;
+	/* Completion object to let process cleanup before cleaning session */
+	struct completion cleanup;
 	struct mutex map_mutex;
 	/* gen pool for QRTR */
 	struct gen_pool *frpc_genpool;
@@ -527,6 +529,8 @@ struct fastrpc_channel_ctx {
 	u64 cpuinfo_todsp;
 	int max_sess_per_proc;
 	bool pd_type;
+	/* Set teardown flag when remoteproc is shutting down */
+	atomic_t teardown;
 };
 
 struct fastrpc_invoke_ctx {

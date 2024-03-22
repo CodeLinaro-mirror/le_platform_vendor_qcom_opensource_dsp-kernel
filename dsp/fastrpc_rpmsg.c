@@ -18,7 +18,7 @@
 
 void fastrpc_channel_ctx_put(struct fastrpc_channel_ctx *cctx);
 void fastrpc_update_gctx(struct fastrpc_channel_ctx *cctx, int flag);
-void fastrpc_lowest_capacity_corecount(struct fastrpc_channel_ctx *cctx);
+void fastrpc_lowest_capacity_corecount(struct device *dev, struct fastrpc_channel_ctx *cctx);
 int fastrpc_init_privileged_gids(struct device *dev, char *prop_name,
 						struct gid_list *gidlist);
 int fastrpc_setup_service_locator(struct fastrpc_channel_ctx *cctx, char *client_name,
@@ -91,18 +91,17 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 		}
 	}
 
-	for (i = 0; i < FASTRPC_MAX_SESSIONS; i++)
-		mutex_init(&data->session[i].map_mutex);
-
+	atomic_set(&data->teardown, 0);
 	secure_dsp = !(of_property_read_bool(rdev->of_node, "qcom,non-secure-domain"));
 	data->secure = secure_dsp;
 
 	of_property_read_u32(rdev->of_node, "qcom,rpc-latency-us",
 			&data->qos_latency);
-	if (of_property_read_bool(rdev->of_node, "qcom,single-core-latency-vote"))
+
+	fastrpc_lowest_capacity_corecount(rdev, data);
+	if (data->lowest_capacity_core_count > 0 &&
+	    of_property_read_bool(rdev->of_node, "qcom,single-core-latency-vote"))
 		data->lowest_capacity_core_count = 1;
-	else
-		fastrpc_lowest_capacity_corecount(data);
 
 	kref_init(&data->refcount);
 	dev_set_drvdata(&rpdev->dev, data);
@@ -118,13 +117,11 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	ida_init(&data->tgid_frpc_ida);
 	data->domain_id = domain_id;
 	data->max_sess_per_proc = 4; // TODO: Fix this in a macro
+	data->rpdev = rpdev;
 
 	err = of_platform_populate(rdev->of_node, NULL, NULL, rdev);
 	if (err)
 		goto populate_error;
-
-	for (i = 0; i < FASTRPC_MAX_SESSIONS; i++)
-		mutex_init(&data->session[i].map_mutex);
 
 	switch (domain_id) {
 	case ADSP_DOMAIN_ID:
@@ -188,7 +185,6 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	mutex_unlock(&data->wake_mutex);
 
 	fastrpc_update_gctx(data, 1);
-	data->rpdev = rpdev;
 
 	return 0;
 
@@ -212,9 +208,8 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 
 	/* No invocations past this point */
 	spin_lock_irqsave(&cctx->lock, flags);
-	cctx->rpdev = NULL;
+	atomic_set(&cctx->teardown, 1);
 	cctx->staticpd_status = false;
-	fastrpc_mmap_remove_ssr(cctx);
 	list_for_each_entry(user, &cctx->users, user) {
 		fastrpc_queue_pd_status(user, cctx->domain_id, FASTRPC_DSP_SSR);
 		fastrpc_notify_users(user);
@@ -247,7 +242,9 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 
 	kfree(cctx->gidlist.gids);
 	of_platform_depopulate(&rpdev->dev);
-
+	fastrpc_mmap_remove_ssr(cctx);
+	cctx->dev = NULL;
+	cctx->rpdev = NULL;
 	fastrpc_update_gctx(cctx, 0);
 	fastrpc_channel_ctx_put(cctx);
 }
@@ -279,7 +276,7 @@ static struct rpmsg_driver fastrpc_driver = {
 int fastrpc_transport_send(struct fastrpc_channel_ctx *cctx, void *rpc_msg, uint32_t rpc_msg_size) {
 	int err = 0;
 
-	if (cctx->rpdev == NULL)
+	if (atomic_read(&cctx->teardown))
 		return -EPIPE;
 
 	err = rpmsg_send(cctx->rpdev->ept, rpc_msg, rpc_msg_size);

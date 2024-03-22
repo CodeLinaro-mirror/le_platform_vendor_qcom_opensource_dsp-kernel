@@ -809,6 +809,7 @@ static struct fastrpc_session_ctx *fastrpc_session_alloc(
 			cctx->session[i].secure == secure &&
 			cctx->session[i].sharedcb == sharedcb &&
 			(pd_type == DEFAULT_UNUSED || cctx->session[i].pd_type == pd_type || secure)) {
+			reinit_completion(&cctx->session[i].cleanup);
 			cctx->session[i].used = true;
 			session = &cctx->session[i];
 			break;
@@ -825,6 +826,7 @@ static void fastrpc_session_free(struct fastrpc_channel_ctx *cctx,
 	unsigned long flags;
 
 	spin_lock_irqsave(&cctx->lock, flags);
+	complete(&session->cleanup);
 	session->used = false;
 	spin_unlock_irqrestore(&cctx->lock, flags);
 }
@@ -870,14 +872,13 @@ static void fastrpc_pm_relax(struct fastrpc_user *fl,
 	mutex_unlock(&cctx->wake_mutex);
 }
 
-static int get_buffer_attr(struct dma_buf *buf, bool *exclusive_access, bool *hlos_access)
+static int get_buffer_attr(struct dma_buf *buf, bool *exclusive_access)
 {
 	const int *vmids_list = NULL;
 	const int  *perms = NULL;
 	int err = 0;
 	int vmids_list_len = 0;
 	*exclusive_access = false;
-	*hlos_access = false;
 
 	err = mem_buf_dma_buf_get_vmperm(buf, &vmids_list, &perms, &vmids_list_len);
 	if (err)
@@ -888,41 +889,21 @@ static int get_buffer_attr(struct dma_buf *buf, bool *exclusive_access, bool *hl
 	 */
 	if (vmids_list_len == 1 && vmids_list[0] == mem_buf_current_vmid())
 		*exclusive_access = true;
-#if IS_ENABLED(CONFIG_MSM_ADSPRPC_TRUSTED)
-	/*
-	 * PVM (HLOS) can share buffers with TVM. In that case,
-	 * it is expected to relinquish its ownership to those buffers
-	 * before sharing. But if the PVM still retains access, then
-	 * these buffers cannot be used by TVM.
-	 */
-	for (int ii = 0; ii < vmids_list_len; ii++) {
-		if (vmids_list[ii] == VMID_HLOS) {
-			*hlos_access = true;
-			break;
-		}
-	}
-#endif
+
 	return err;
 }
 
 static int set_buffer_secure_type(struct fastrpc_map *map)
 {
 	int err = 0;
-	bool hlos_access = false;
 	bool exclusive_access = false;
 	struct device *dev = map->fl->sctx->dev;
 
-	err = get_buffer_attr(map->buf, &exclusive_access, &hlos_access);
+	err = get_buffer_attr(map->buf, &exclusive_access);
 	if (err) {
 		dev_err(dev, "failed to obtain buffer attributes for fd %d ret %d\n", map->fd, err);
 		return -EBADFD;
 	}
-#if IS_ENABLED(CONFIG_MSM_ADSPRPC_TRUSTED)
-	if (hlos_access) {
-		dev_err(dev, "Sharing HLOS buffer (fd %d) not allowed on TVM\n", map->fd);
-		return -EACCES;
-	}
-#endif
 	/*
 	 * Secure buffers would always be owned by multiple VMs.
 	 * If current VM is the exclusive owner of a buffer, it is considered non-secure.
@@ -933,7 +914,11 @@ static int set_buffer_secure_type(struct fastrpc_map *map)
 	 *	- Since it is a secure environment by default, there are no explicit "secure" buffers
 	 *	- All buffers are marked "non-secure"
 	 */
+#if IS_ENABLED(CONFIG_MSM_ADSPRPC_TRUSTED)
+	map->secure = 0;
+#else
 	map->secure = (exclusive_access) ? 0 : 1;
+#endif
 
 	return err;
 }
@@ -1643,6 +1628,9 @@ static int fastrpc_internal_invoke(struct fastrpc_user *fl,  u32 kernel,
 	u64 *perf_counter = NULL;
 	struct timespec64 invoket = {0};
 
+	if (atomic_read(&fl->cctx->teardown))
+		return -EPIPE;
+
 	if (fl->profile)
 		ktime_get_real_ts64(&invoket);
 
@@ -2163,8 +2151,13 @@ static int fastrpc_create_session_debugfs(struct fastrpc_user *fl)
 			if (fl->debugfs_buf == NULL) {
 				return -ENOMEM;
 			}
-			snprintf(fl->debugfs_buf, size, "%.10s%s%d%s%d",
-				cur_comm, "_", current->pid, "_", domain_id);
+			/*
+			 * Use HLOS process name, HLOS PID, unique fastrpc PID
+			 * domain_id in debugfs filename to create unique file name
+			 */
+			snprintf(fl->debugfs_buf, size, "%.10s%s%d%s%d%s%d",
+				cur_comm, "_", current->pid, "_",
+				fl->tgid_frpc, "_", domain_id);
 			fl->debugfs_file = debugfs_create_file(fl->debugfs_buf, 0644,
 					debugfs_root, fl, &fastrpc_debugfs_fops);
 			if (IS_ERR_OR_NULL(fl->debugfs_file)) {
@@ -2234,7 +2227,7 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 	if (!fl->sctx) {
 		dev_err(fl->cctx->dev, "No session available\n");
 		err = -EBUSY;
-		goto err;
+		goto err_name;
 	}
 
 	is_oispd = !strcmp(name, "oispd");
@@ -2260,6 +2253,10 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 		if (err)
 			goto err_name;
 
+		spin_lock_irqsave(&fl->cctx->lock, flags);
+		list_add_tail(&buf->node, &fl->cctx->gmaps);
+		spin_unlock_irqrestore(&fl->cctx->lock, flags);
+
 		phys = buf->phys;
 		size = buf->size;
 		/* Map if we have any heap VMIDs associated with this ADSP Static Process. */
@@ -2276,9 +2273,6 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 			scm_done = true;
 		}
 		fl->cctx->staticpd_status = true;
-		spin_lock_irqsave(&fl->cctx->lock, flags);
-		list_add_tail(&buf->node, &fl->cctx->gmaps);
-		spin_unlock_irqrestore(&fl->cctx->lock, flags);
 	}
 
 	inbuf.pgid = fl->tgid_frpc;
@@ -2334,11 +2328,13 @@ err_invoke:
 				__func__, phys, size, err);
 	}
 err_map:
-	fl->cctx->staticpd_status = false;
-	spin_lock(&fl->lock);
-	list_del(&buf->node);
-	spin_unlock(&fl->lock);
-	fastrpc_buf_free(buf, false);
+	if (buf) {
+		fl->cctx->staticpd_status = false;
+		spin_lock(&fl->lock);
+		list_del(&buf->node);
+		spin_unlock(&fl->lock);
+		fastrpc_buf_free(buf, false);
+	}
 err_name:
 	kfree(name);
 err:
@@ -2391,6 +2387,14 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 		goto err;
 	}
 
+	/*
+	 * Third-party apps don't have permission to open the fastrpc device, so
+	 * it is opened on their behalf by DSP HAL. This is detected by
+	 * comparing current PID with the one stored during device open.
+	 */
+	if (current->tgid != fl->tgid)
+		fl->untrusted_process = true;
+
 	if (init.attrs & FASTRPC_MODE_UNSIGNED_MODULE)
 		fl->is_unsigned_pd = true;
 
@@ -2414,7 +2418,8 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	fl->sctx = fastrpc_session_alloc(fl->cctx, fl->sharedcb, fl->pd, false);
 	if (!fl->sctx) {
 		dev_err(fl->cctx->dev, "No session available\n");
-		return -EBUSY;
+		err = -EBUSY;
+		goto err;
 	}
 
 	fastrpc_get_process_gids(&fl->gidlist);
@@ -2676,6 +2681,9 @@ static int fastrpc_device_open(struct inode *inode, struct file *filp)
 
 	fdevice = miscdev_to_fdevice(filp->private_data);
 	cctx = fdevice->cctx;
+
+	if (atomic_read(&cctx->teardown))
+		return -EPIPE;
 
 	fl = kzalloc(sizeof(*fl), GFP_KERNEL);
 	if (!fl)
@@ -3099,46 +3107,22 @@ static int fastrpc_internal_control(struct fastrpc_user *fl,
 static int fastrpc_set_session_info(
 		struct fastrpc_user *fl, struct fastrpc_internal_sessinfo *sessinfo)
 {
-	int err = 0;
-
 	spin_lock(&fl->lock);
 	if (fl->set_session_info) {
 		spin_unlock(&fl->lock);
 		dev_err(fl->cctx->dev,"Set session info invoked multiple times\n");
-		err = -EBADR;
-		goto bail;
+		return -EBADR;
 	}
 	fl->set_session_info = true;
 	spin_unlock(&fl->lock);
-	/*
-	 * Third-party apps don't have permission to open the fastrpc device, so
-	 * it is opened on their behalf by DSP HAL. This is detected by
-	 * comparing current PID with the one stored during device open.
-	 */
-	if (current->tgid != fl->tgid)
-		fl->untrusted_process = true;
 
 	if(sessinfo->pd <= DEFAULT_UNUSED ||
 				sessinfo->pd >= MAX_PD_TYPE) {
 		dev_err(fl->cctx->dev,"Invalid PD type %d, range is %d - %d\n",
 					sessinfo->pd, DEFAULT_UNUSED + 1, MAX_PD_TYPE - 1);
-		goto bail;
+		return -EBADR;
 	}
 
-	if (err) {
-		dev_err(fl->cctx->dev,
-		"Session PD type %u is invalid for the process\n",
-							sessinfo->pd);
-		err = -EBADR;
-		goto bail;
-	}
-	if (fl->untrusted_process && sessinfo->pd != USERPD) {
-		dev_err(fl->cctx->dev,
-		"Session PD type %u not allowed for untrusted process\n",
-						sessinfo->pd);
-		err = -EBADR;
-		goto bail;
-	}
 	/*
 	 * If PD type is not configured for context banks,
 	 * ignore PD type passed by the user, leave pd_type set to DEFAULT_UNUSED(0)
@@ -3152,14 +3136,13 @@ static int fastrpc_set_session_info(
 		dev_err(fl->cctx->dev,
 		"Session ID %u cannot be beyond %u\n",
 				sessinfo->session_id, fl->cctx->max_sess_per_proc);
-		err = -EBADR;
-		goto bail;
+		return -EBADR;
 	}
 	fl->sessionid = sessinfo->session_id;
 	// Set multi_session_support, to disable old way of setting session_id
 	fl->multi_session_support = true;
-bail:
-	return err;
+
+	return 0;
 }
 
 static int fastrpc_dspsignal_signal(struct fastrpc_user *fl,
@@ -3170,10 +3153,14 @@ static int fastrpc_dspsignal_signal(struct fastrpc_user *fl,
 	u64 msg = 0;
 	u32 signal_id = fsig->signal_id;
 
+	dev_dbg(fl->cctx->dev, "Send signal PID %u, unique fastrpc pid %u signal %u\n",
+					fl->tgid, fl->tgid_frpc, signal_id);
 	cctx = fl->cctx;
-
-	if (!(signal_id < FASTRPC_DSPSIGNAL_NUM_SIGNALS))
+	if (!(signal_id < FASTRPC_DSPSIGNAL_NUM_SIGNALS)) {
+		dev_err(fl->cctx->dev, "Sending bad signal %u for PID %u",
+				signal_id, fl->tgid);
 		return -EINVAL;
+	}
 
 	msg = (((uint64_t)fl->tgid_frpc) << 32) | ((uint64_t)fsig->signal_id);
 	err = fastrpc_transport_send(cctx, (void *)&msg, sizeof(msg));
@@ -3191,8 +3178,11 @@ int fastrpc_dspsignal_wait(struct fastrpc_user *fl,
 	long ret = 0;
 	unsigned long irq_flags = 0;
 
-	if (!(signal_id <FASTRPC_DSPSIGNAL_NUM_SIGNALS))
+	dev_dbg(fl->cctx->dev, "Wait for signal %u\n", signal_id);
+	if (!(signal_id <FASTRPC_DSPSIGNAL_NUM_SIGNALS)) {
+		dev_err(fl->cctx->dev, "Waiting on bad signal %u\n", signal_id);
 		return -EINVAL;
+	}
 
 	spin_lock_irqsave(&fl->dspsignals_lock, irq_flags);
 	if (fl->signal_groups[signal_id /FASTRPC_DSPSIGNAL_GROUP_SIZE] != NULL) {
@@ -3232,8 +3222,9 @@ int fastrpc_dspsignal_wait(struct fastrpc_user *fl,
 	spin_lock_irqsave(&fl->dspsignals_lock, irq_flags);
 	if (s->state == DSPSIGNAL_STATE_SIGNALED) {
 		s->state = DSPSIGNAL_STATE_PENDING;
+		dev_dbg(fl->cctx->dev, "Signal %u completed\n", signal_id);
 	} else if ((s->state == DSPSIGNAL_STATE_CANCELED) || (s->state == DSPSIGNAL_STATE_UNUSED)) {
-		dev_err(fl->cctx->dev, "Signal %u cancelled or destroyed\n", signal_id);
+		dev_dbg(fl->cctx->dev, "Signal %u cancelled or destroyed\n", signal_id);
 		err = -EINTR;
 	}
 	spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
@@ -3262,6 +3253,7 @@ static int fastrpc_dspsignal_create(struct fastrpc_user *fl,
 		group = kzalloc(FASTRPC_DSPSIGNAL_GROUP_SIZE * sizeof(*group),
 					     GFP_KERNEL);
 		if (group == NULL) {
+			dev_err(fl->cctx->dev, "Unable to allocate signal group\n");
 			mutex_unlock(&fl->signal_create_mutex);
 			return -ENOMEM;
 		}
@@ -3289,6 +3281,7 @@ static int fastrpc_dspsignal_create(struct fastrpc_user *fl,
 
 	spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
 	mutex_unlock(&fl->signal_create_mutex);
+	dev_dbg(fl->cctx->dev, "Signal %u created\n", signal_id);
 
 	return err;
 }
@@ -3300,6 +3293,7 @@ static int fastrpc_dspsignal_destroy(struct fastrpc_user *fl,
 	struct fastrpc_dspsignal *s = NULL;
 	unsigned long irq_flags = 0;
 
+	dev_dbg(fl->cctx->dev, "Destroy signal %u\n", signal_id);
 	if (!(signal_id <FASTRPC_DSPSIGNAL_NUM_SIGNALS))
 		return -EINVAL;
 
@@ -3321,6 +3315,7 @@ static int fastrpc_dspsignal_destroy(struct fastrpc_user *fl,
 	complete_all(&s->comp);
 
 	spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
+	dev_dbg(fl->cctx->dev, "Signal %u destroyed\n", signal_id);
 
 	return 0;
 }
@@ -3332,6 +3327,7 @@ static int fastrpc_dspsignal_cancel_wait(struct fastrpc_user *fl,
 	struct fastrpc_dspsignal *s = NULL;
 	unsigned long irq_flags = 0;
 
+	dev_dbg(fl->cctx->dev, "Cancel wait for signal %u\n", signal_id);
 	if (!(signal_id <FASTRPC_DSPSIGNAL_NUM_SIGNALS))
 		return -EINVAL;
 
@@ -3355,6 +3351,7 @@ static int fastrpc_dspsignal_cancel_wait(struct fastrpc_user *fl,
 	}
 
 	spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
+	dev_dbg(fl->cctx->dev, "Signal %u cancelled\n", signal_id);
 
 	return 0;
 }
@@ -4648,6 +4645,8 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 	sess->valid = true;
 	sess->dev = dev;
 	sess->secure = of_property_read_bool(dev->of_node, "qcom,secure-context-bank");
+	init_completion(&sess->cleanup);
+	mutex_init(&sess->map_mutex);
 	dev_set_drvdata(dev, sess);
 
 	if (of_property_read_u32(dev->of_node, "reg", &sess->sid))
@@ -4671,6 +4670,8 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 				break;
 			dup_sess = &cctx->session[cctx->sesscount++];
 			memcpy(dup_sess, sess, sizeof(*dup_sess));
+			mutex_init(&dup_sess->map_mutex);
+			init_completion(&dup_sess->cleanup);
 		}
 	}
 	spin_unlock_irqrestore(&cctx->lock, flags);
@@ -4791,20 +4792,15 @@ static int fastrpc_cb_remove(struct platform_device *pdev)
 {
 	struct fastrpc_channel_ctx *cctx = dev_get_drvdata(pdev->dev.parent);
 	struct fastrpc_session_ctx *sess = dev_get_drvdata(&pdev->dev);
-	struct fastrpc_user *fl;
 	unsigned long flags;
 	int i;
 
-	list_for_each_entry(fl, &cctx->users, user) {
-		if(fl->sctx && fl->sctx->sid == sess->sid) {
-			fastrpc_cached_buf_list_free(fl);
-			break;
-		}
-	}
 	spin_lock_irqsave(&cctx->lock, flags);
 	for (i = 0; i < FASTRPC_MAX_SESSIONS; i++) {
 		if (cctx->session[i].sid == sess->sid) {
 			spin_unlock_irqrestore(&cctx->lock, flags);
+			if (sess->used)
+				wait_for_completion(&sess->cleanup);
 			mutex_lock(&cctx->session[i].map_mutex);
 			cctx->session[i].dev = NULL;
 			mutex_unlock(&cctx->session[i].map_mutex);
@@ -4864,7 +4860,7 @@ int fastrpc_device_register(struct device *dev, struct fastrpc_channel_ctx *cctx
 	return err;
 }
 
-void fastrpc_lowest_capacity_corecount(struct fastrpc_channel_ctx *cctx)
+void fastrpc_lowest_capacity_corecount(struct device *dev, struct fastrpc_channel_ctx *cctx)
 {
 	u32 cpu = 0;
 
@@ -4873,7 +4869,7 @@ void fastrpc_lowest_capacity_corecount(struct fastrpc_channel_ctx *cctx)
 		if (topology_cluster_id(cpu) == 0)
 			cctx->lowest_capacity_core_count++;
 	}
-	dev_info(cctx->dev, "lowest capacity core count: %u\n",
+	dev_info(dev, "Lowest capacity core count: %u\n",
 					cctx->lowest_capacity_core_count);
 }
 
@@ -4899,14 +4895,13 @@ int fastrpc_setup_service_locator(struct fastrpc_channel_ctx *cctx, char *client
 		err = PTR_ERR(service);
 		goto bail;
 	}
-	pr_info("fastrpc: %s: pdr_add_lookup enabled for %s (%s, %s)\n",
+	dev_info(cctx->dev, "%s: pdr_add_lookup enabled for %s (%s, %s)\n",
 		__func__, service_name, client_name, service_path);
 
 bail:
-	if (err) {
-		pr_err("fastrpc: %s: failed for %s (%s, %s)with err %d\n",
+	if (err)
+		dev_err(cctx->dev, "%s: failed for %s (%s, %s)with err %d\n",
 				__func__, service_name, client_name, service_path, err);
-	}
 	return err;
 }
 

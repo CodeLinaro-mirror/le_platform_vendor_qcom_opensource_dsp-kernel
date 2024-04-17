@@ -30,6 +30,7 @@
 #define CDSP_DOMAIN_ID (3)
 #define FASTRPC_DEV_MAX		4 /* adsp, mdsp, slpi, cdsp*/
 #define FASTRPC_MAX_SESSIONS	14
+#define FASTRPC_MAX_SESSIONS_PER_PROCESS	4
 #define FASTRPC_MAX_SPD		4
 #define FASTRPC_MAX_VMIDS	16
 #define FASTRPC_ALIGN		128
@@ -123,6 +124,14 @@
 #define FASTRPC_RMID_INIT_CREATE_STATIC	8
 #define FASTRPC_RMID_INIT_MEM_MAP      10
 #define FASTRPC_RMID_INIT_MEM_UNMAP    11
+#define FASTRPC_RMID_INIT_MAX (20)
+
+/*
+ * Num of pages shared with process spawn call.
+ *     Page 1 : init-mem buf
+ *     Page 2 : proc attrs debug buf
+ */
+#define NUM_PAGES_WITH_SHARED_BUF 2
 
 #define miscdev_to_fdevice(d) container_of(d, struct fastrpc_device_node, miscdev)
 
@@ -212,8 +221,6 @@
 	(remote_server_instance & 0x3)
 /* Maximun received fastprc packet size */
 #define FASTRPC_SOCKET_RECV_SIZE sizeof(union rsp)
-/* DMA handle reverse RPC support */
-#define DMA_HANDLE_REVERSE_RPC_CAP (128)
 #define FIND_DIGITS(number) ({ \
 		unsigned int count = 0, i= number; \
 		while(i != 0) { \
@@ -238,6 +245,12 @@
 #define USERPD            7  /* DSP User Dynamic PD */
 #define GUEST_OS_SHARED   8  /* Legacy Guest OS Shared */
 #define MAX_PD_TYPE       9  /* Max PD type */
+
+/* Attributes for internal purposes. Clients cannot query these */
+enum fastrpc_internal_attributes {
+	/* DMA handle reverse RPC support */
+	DMA_HANDLE_REVERSE_RPC_CAP = 129,
+};
 
 enum fastrpc_remote_domains_id {
 	SECURE_PD = 0,
@@ -416,6 +429,7 @@ struct fastrpc_buf {
 	struct list_head node; /* list of user requested mmaps */
 	uintptr_t raddr;
 	bool in_use;
+	u32 domain_id;
 };
 
 struct fastrpc_dma_buf_attachment {
@@ -623,6 +637,8 @@ struct fastrpc_user {
 	struct fastrpc_buf *init_mem;
 	/* Pre-allocated header buffer */
 	struct fastrpc_buf *pers_hdr_buf;
+	/* SMMU mapping of process attrs debug buf */
+	struct fastrpc_map *proc_attrs_map;
 	struct fastrpc_static_pd *spd;
 	/* Pre-allocated buffer divided into N chunks */
 	struct fastrpc_buf *hdr_bufs;
@@ -741,4 +757,5 @@ int fastrpc_handle_rpc_response(struct fastrpc_channel_ctx *cctx, void *data, in
 int fastrpc_device_register(struct device *dev, struct fastrpc_channel_ctx *cctx,
 				bool is_secured, const char *domain);
 struct fastrpc_channel_ctx* get_current_channel_ctx(struct device *dev);
+void fastrpc_notify_users(struct fastrpc_user *user);
 #endif /* __FASTRPC_SHARED_H__ */

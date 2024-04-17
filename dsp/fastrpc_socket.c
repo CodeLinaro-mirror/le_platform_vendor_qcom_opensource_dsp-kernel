@@ -27,14 +27,19 @@ struct fastrpc_channel_ctx* get_current_channel_ctx(struct device *dev)
 	}
 
 	scctx->domain_id = CDSP_DOMAIN_ID;
+	atomic_set(&scctx->teardown, 0);
 	scctx->secure = 0;
 	scctx->unsigned_support = false;
 	kref_init(&scctx->refcount);
 	INIT_LIST_HEAD(&scctx->users);
+	INIT_LIST_HEAD(&scctx->gmaps);
+	mutex_init(&scctx->wake_mutex);
 	spin_lock_init(&scctx->lock);
 	spin_lock_init(&(scctx->gmsg_log[scctx->domain_id].tx_lock));
 	spin_lock_init(&(scctx->gmsg_log[scctx->domain_id].rx_lock));
 	idr_init(&scctx->ctx_idr);
+	ida_init(&scctx->tgid_frpc_ida);
+	scctx->max_sess_per_proc = FASTRPC_MAX_SESSIONS_PER_PROCESS;
 	fastrpc_device_register(dev, scctx, true, domains[scctx->domain_id]);
 	fastrpc_device_register(dev, scctx, false, domains[scctx->domain_id]);
 	return scctx;
@@ -119,7 +124,7 @@ static void fastrpc_recv_ctrl_pkt(struct frpc_transport_session_control *session
 	const struct qrtr_ctrl_pkt *pkt = buf;
 
 	if (len < sizeof(struct qrtr_ctrl_pkt)) {
-		dev_err(scctx->dev, "Ignoring short control packet (%d bytes)", len);
+		dev_err(scctx->dev, "Ignoring short control packet (%zu bytes)", len);
 		return;
 	}
 
@@ -199,7 +204,7 @@ static void fastrpc_socket_callback_wq(struct work_struct *work)
 bail:
 	if (!ignore_err && err < 0) {
 		dev_err(scctx->dev,
-			"invalid response data %pK (rx %d bytes), buffer len %d from remote ID (0x%x) err %d\n",
+			"invalid response data %pK (rx %d bytes), buffer len %zu from remote ID (0x%x) err %d\n",
 			msg.iov_base, bytes_rx, msg.iov_len, remote_server_instance, err);
 	}
 }

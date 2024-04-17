@@ -24,12 +24,13 @@ def define_modules(target, variant):
             "dsp/fastrpc.c",
             "dsp/fastrpc_rpmsg.c",
             "dsp/fastrpc_shared.h",
+            "dsp/fastrpc_trace.h"
         ],
         local_defines = ["DSP_TRACE_INCLUDE_PATH={}".format(trace_include_path)],
         out = "frpc-adsprpc.ko",
         hdrs = [
-	     	"include/uapi/misc/fastrpc.h",
-		"include/linux/fastrpc.h"
+            "include/uapi/misc/fastrpc.h",
+            "include/linux/fastrpc.h"
         ],
         includes = [
             "include/linux",

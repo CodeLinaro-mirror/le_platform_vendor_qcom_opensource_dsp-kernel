@@ -177,24 +177,26 @@ TRACE_EVENT(fastrpc_dma_map,
 
 TRACE_EVENT(fastrpc_dma_unmap,
 
-	TP_PROTO(int cid, uint64_t phys, size_t size),
+	TP_PROTO(int cid, uint64_t phys, size_t size, int fd),
 
-	TP_ARGS(cid, phys, size),
+	TP_ARGS(cid, phys, size, fd),
 
 	TP_STRUCT__entry(
 		__field(int, cid)
 		__field(u64, phys)
 		__field(size_t, size)
+		__field(int, fd)
 	),
 
 	TP_fast_assign(
 		__entry->cid = cid;
 		__entry->phys = phys;
 		__entry->size = size;
+		__entry->fd = fd;
 	),
 
-	TP_printk("cid %d, phys 0x%llx, size %zu",
-		__entry->cid, __entry->phys, __entry->size)
+	TP_printk("cid %d, phys 0x%llx, size %zu, fd %d",
+		__entry->cid, __entry->phys, __entry->size, __entry->fd)
 );
 
 TRACE_EVENT(fastrpc_dma_alloc,

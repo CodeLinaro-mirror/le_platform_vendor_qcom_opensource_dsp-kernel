@@ -67,15 +67,6 @@ enum fastrpc_proc_attr {
 	FASTRPC_MODE_SYSTEM_UNSIGNED_PD	= 1 << 17,
 };
 
- /* Types of fastrpc DMA bufs sent to DSP */
- enum fastrpc_buf_type {
-	METADATA_BUF,
-	COPYDATA_BUF,
-	INITMEM_BUF,
-	USER_BUF,
-	REMOTEHEAP_BUF,
-};
-
 /* Fastrpc attribute for memory protection of buffers */
 #define FASTRPC_ATTR_SECUREMAP	(1)
 #define FASTRPC_ATTR_NOVA		(256)
@@ -117,15 +108,6 @@ enum fastrpc_multimode_invoke_type {
 	FASTRPC_INVOKE_MULTISESSION = 6,
 	FASTRPC_INVOKE_CONFIG = 7,
 	FASTRPC_INVOKE_SESSIONINFO = 8,
-};
-
-enum fastrpc_response_flags {
-	NORMAL_RESPONSE = 0,
-	EARLY_RESPONSE = 1,
-	USER_EARLY_SIGNAL = 2,
-	COMPLETE_SIGNAL = 3,
-	STATUS_RESPONSE = 4,
-	POLL_MODE = 5,
 };
 
 struct fastrpc_init_create {

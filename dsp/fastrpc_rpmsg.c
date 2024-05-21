@@ -26,7 +26,7 @@ int fastrpc_setup_service_locator(struct fastrpc_channel_ctx *cctx, char *client
 void fastrpc_register_wakeup_source(struct device *dev,
 	const char *client_name, struct wakeup_source **device_wake_source);
 int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx);
-void fastrpc_queue_pd_status(struct fastrpc_user *fl, int domain, int status);
+void fastrpc_queue_pd_status(struct fastrpc_user *fl, int domain, int status, int sessionid);
 
 static struct fastrpc_channel_ctx *gadsp;
 static struct fastrpc_channel_ctx *gcdsp;
@@ -110,10 +110,11 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	dma_set_mask_and_coherent(rdev, DMA_BIT_MASK(32));
 	INIT_LIST_HEAD(&data->users);
 	INIT_LIST_HEAD(&data->gmaps);
+	INIT_LIST_HEAD(&data->rootheap_bufs.list);
 	mutex_init(&data->wake_mutex);
 	spin_lock_init(&data->lock);
-	spin_lock_init(&(data->gmsg_log[domain_id].tx_lock));
-	spin_lock_init(&(data->gmsg_log[domain_id].rx_lock));
+	spin_lock_init(&(data->gmsg_log.tx_lock));
+	spin_lock_init(&(data->gmsg_log.rx_lock));
 	idr_init(&data->ctx_idr);
 	ida_init(&data->tgid_frpc_ida);
 	data->domain_id = domain_id;
@@ -158,22 +159,22 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 		err = fastrpc_setup_service_locator(data, AUDIO_PDR_SERVICE_LOCATION_CLIENT_NAME,
 			AUDIO_PDR_ADSP_SERVICE_NAME, ADSP_AUDIOPD_NAME, 0);
 		if (err)
-			return err;
+			goto fdev_error;
 
 		err = fastrpc_setup_service_locator(data, SENSORS_PDR_ADSP_SERVICE_LOCATION_CLIENT_NAME,
 			SENSORS_PDR_ADSP_SERVICE_NAME, ADSP_SENSORPD_NAME, 1);
 		if (err)
-			return err;
+			goto fdev_error;
 
 		err = fastrpc_setup_service_locator(data, OIS_PDR_ADSP_SERVICE_LOCATION_CLIENT_NAME,
 			OIS_PDR_ADSP_SERVICE_NAME, ADSP_OISPD_NAME, 2);
 		if (err)
-			return err;
+			goto fdev_error;
 	} else if (domain_id == SDSP_DOMAIN_ID) {
 		err = fastrpc_setup_service_locator(data, SENSORS_PDR_SLPI_SERVICE_LOCATION_CLIENT_NAME,
 			SENSORS_PDR_SLPI_SERVICE_NAME, SLPI_SENSORPD_NAME, 0);
 		if (err)
-			return err;
+			goto fdev_error;
 	}
 
 	mutex_lock(&data->wake_mutex);
@@ -215,7 +216,7 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	atomic_set(&cctx->teardown, 1);
 	cctx->staticpd_status = false;
 	list_for_each_entry(user, &cctx->users, user) {
-		fastrpc_queue_pd_status(user, cctx->domain_id, FASTRPC_DSP_SSR);
+		fastrpc_queue_pd_status(user, cctx->domain_id, FASTRPC_DSP_SSR, user->sessionid);
 		fastrpc_notify_users(user);
 	}
 	spin_unlock_irqrestore(&cctx->lock, flags);

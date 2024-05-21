@@ -35,8 +35,8 @@ struct fastrpc_channel_ctx* get_current_channel_ctx(struct device *dev)
 	INIT_LIST_HEAD(&scctx->gmaps);
 	mutex_init(&scctx->wake_mutex);
 	spin_lock_init(&scctx->lock);
-	spin_lock_init(&(scctx->gmsg_log[scctx->domain_id].tx_lock));
-	spin_lock_init(&(scctx->gmsg_log[scctx->domain_id].rx_lock));
+	spin_lock_init(&(scctx->gmsg_log.tx_lock));
+	spin_lock_init(&(scctx->gmsg_log.rx_lock));
 	idr_init(&scctx->ctx_idr);
 	ida_init(&scctx->tgid_frpc_ida);
 	scctx->max_sess_per_proc = FASTRPC_MAX_SESSIONS_PER_PROCESS;

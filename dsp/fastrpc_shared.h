@@ -39,10 +39,9 @@
 #define FASTRPC_KERNEL_PERF_LIST (PERF_KEY_MAX)
 #define FASTRPC_DSP_PERF_LIST 12
 #define FASTRPC_PHYS(p)	((p) & 0xffffffff)
-#define FASTRPC_CTX_MAX (256)
 #define FASTRPC_INIT_HANDLE	1
 #define FASTRPC_DSP_UTILITIES_HANDLE	2
-#define FASTRPC_CTXID_MASK (0xFF0)
+#define FASTRPC_MAX_STATIC_HANDLE (20)
 #define INIT_FILELEN_MAX (5 * 1024 * 1024)
 #define INIT_FILE_NAMELEN_MAX (128)
 #define FASTRPC_DEVICE_NAME	"fastrpc"
@@ -50,6 +49,56 @@
 #define SESSION_ID_MASK (1 << SESSION_ID_INDEX)
 #define MAX_FRPC_TGID 64
 #define COPY_BUF_WARN_LIMIT (512*1024)
+
+/*
+ * Fastrpc context ID bit-map:
+ *
+ * bits 0-3   : type of remote PD
+ * bit  4     : type of job (sync/async)
+ * bit  5     : reserved
+ * bits 6-15  : IDR id
+ * bits 16-63 : job id counter
+ */
+/* Starting position of idr in context id */
+#define FASTRPC_CTXID_IDR_POS  (6)
+
+/* Number of idr bits in context id */
+#define FASTRPC_CTXID_IDR_BITS (10)
+
+/* Max idr value */
+#define FASTRPC_CTX_MAX (1 << FASTRPC_CTXID_IDR_BITS)
+
+/* Bit-mask for idr */
+#define FASTRPC_CTXID_IDR_MASK (FASTRPC_CTX_MAX - 1)
+
+/* Macro to pack idr into context id  */
+#define FASTRPC_PACK_IDR_IN_CTXID(ctxid, idr) (ctxid | ((idr & \
+	FASTRPC_CTXID_IDR_MASK) << FASTRPC_CTXID_IDR_POS))
+
+/* Macro to extract idr from context id */
+#define FASTRPC_GET_IDR_FROM_CTXID(ctxid) ((ctxid >> FASTRPC_CTXID_IDR_POS) & \
+	FASTRPC_CTXID_IDR_MASK)
+
+/* Number of pd bits in context id (starting pos 0) */
+#define FASTRPC_CTXID_PD_BITS (4)
+
+/* Bit-mask for pd type */
+#define FASTRPC_CTXID_PD_MASK ((1 << FASTRPC_CTXID_PD_BITS) - 1)
+
+/* Macro to pack pd type into context id  */
+#define FASTRPC_PACK_PD_IN_CTXID(ctxid, pd) (ctxid | (pd & \
+		FASTRPC_CTXID_PD_MASK))
+
+/* Starting position of job id counter in context id */
+#define FASTRPC_CTXID_JOBID_POS (16)
+
+/* Macro to pack job id counter into context id  */
+#define FASTRPC_PACK_JOBID_IN_CTXID(ctxid, jobid) (ctxid | \
+		(jobid << FASTRPC_CTXID_JOBID_POS))
+
+/* Macro to extract ctxid (mask pd type) from response context */
+#define FASTRPC_GET_CTXID_FROM_RSP_CTX(rsp_ctx) (rsp_ctx & \
+		~FASTRPC_CTXID_PD_MASK)
 
 /* Maximum buffers cached in cached buffer list */
 #define FASTRPC_MAX_CACHED_BUFS (32)
@@ -130,8 +179,12 @@
  * Num of pages shared with process spawn call.
  *     Page 1 : init-mem buf
  *     Page 2 : proc attrs debug buf
+ *     Page 3 : rootheap buf
+ *     Page 4 : proc_init shared buf
  */
 #define NUM_PAGES_WITH_SHARED_BUF 2
+#define NUM_PAGES_WITH_ROOTHEAP_BUF 3
+#define NUM_PAGES_WITH_PROC_INIT_SHAREDBUF 4
 
 #define miscdev_to_fdevice(d) container_of(d, struct fastrpc_device_node, miscdev)
 
@@ -250,12 +303,39 @@
 enum fastrpc_internal_attributes {
 	/* DMA handle reverse RPC support */
 	DMA_HANDLE_REVERSE_RPC_CAP = 129,
+	ROOTPD_RPC_HEAP_SUPPORT = 132,
 };
 
 enum fastrpc_remote_domains_id {
 	SECURE_PD = 0,
 	GUEST_OS = 1,
 	MAX_REMOTE_ID = SECURE_PD + 1,
+};
+
+ /* Types of fastrpc DMA bufs sent to DSP */
+ enum fastrpc_buf_type {
+	METADATA_BUF,
+	COPYDATA_BUF,
+	INITMEM_BUF,
+	USER_BUF,
+	REMOTEHEAP_BUF,
+	ROOTHEAP_BUF,
+};
+
+/* Types of RPC calls to DSP */
+enum fastrpc_msg_type {
+	USER_MSG = 0,
+	KERNEL_MSG_WITH_ZERO_PID,
+	KERNEL_MSG_WITH_NONZERO_PID,
+};
+
+enum fastrpc_response_flags {
+	NORMAL_RESPONSE = 0,
+	EARLY_RESPONSE = 1,
+	USER_EARLY_SIGNAL = 2,
+	COMPLETE_SIGNAL = 3,
+	STATUS_RESPONSE = 4,
+	POLL_MODE = 5,
 };
 
 struct fastrpc_socket {
@@ -377,7 +457,7 @@ struct fastrpc_tx_msg {
 };
 
 struct fastrpc_rx_msg {
-	struct fastrpc_invoke_rsp rsp;	/* Response from remote subsystem */
+	struct fastrpc_invoke_rspv2 rsp; /* Response from remote subsystem */
 	s64 ns;		/* Timestamp (in ns) of response */
 };
 
@@ -415,6 +495,8 @@ struct fastrpc_buf_overlap {
 };
 
 struct fastrpc_buf {
+	/* Node for adding to buffer lists */
+	struct list_head node;
 	struct fastrpc_user *fl;
 	struct dma_buf *dmabuf;
 	struct device *dev;
@@ -425,8 +507,6 @@ struct fastrpc_buf {
 	/* Lock for dma buf attachments */
 	struct mutex lock;
 	struct list_head attachments;
-	/* mmap support */
-	struct list_head node; /* list of user requested mmaps */
 	uintptr_t raddr;
 	bool in_use;
 	u32 domain_id;
@@ -501,6 +581,13 @@ struct fastrpc_static_pd {
 	struct fastrpc_channel_ctx *cctx;
 };
 
+struct heap_bufs {
+	/* List of bufs */
+	struct list_head list;
+	/* Number of bufs */
+	unsigned int num;
+};
+
 struct fastrpc_channel_ctx {
 	int domain_id;
 	int sesscount;
@@ -531,7 +618,7 @@ struct fastrpc_channel_ctx {
 	struct fastrpc_device_node *fdevice;
 	struct gid_list gidlist;
 	struct list_head gmaps;
-	struct fastrpc_rpmsg_log gmsg_log[FASTRPC_DEV_MAX];
+	struct fastrpc_rpmsg_log gmsg_log;
 	/* Secure subsystems like ADSP/SLPI will use secure client */
 	struct wakeup_source *wake_source_secure;
 	/* Non-secure subsystem like CDSP will use regular client */
@@ -545,15 +632,22 @@ struct fastrpc_channel_ctx {
 	bool pd_type;
 	/* Set teardown flag when remoteproc is shutting down */
 	atomic_t teardown;
+	/* Buffers donated to grow rootheap on DSP */
+	struct heap_bufs rootheap_bufs;
+	/* jobid counter to prepend into ctxid */
+	u64 jobid;
 };
 
 struct fastrpc_invoke_ctx {
+	/* Node for adding to context list */
+	struct list_head node;
 	int nscalars;
 	int nbufs;
 	int retval;
 	int pid;
 	int tgid;
 	u32 sc;
+	u32 handle;
 	u32 *crc;
 	/* user hint of completion time in us */
 	u32 early_wake_time;
@@ -566,7 +660,6 @@ struct fastrpc_invoke_ctx {
 	/* response flags from remote processor */
 	enum fastrpc_response_flags rsp_flags;
 	struct kref refcount;
-	struct list_head node; /* list of ctxs */
 	struct completion work;
 	// struct work_struct put_work;
 	struct fastrpc_msg msg;
@@ -587,8 +680,10 @@ struct fastrpc_device_node {
 };
 
 struct fastrpc_internal_config {
-	int init_fd;
-	int init_size;
+	int user_fd;
+	int user_size;
+	u64 root_addr;
+	u32 root_size;
 };
 
 /* FastRPC ioctl structure to set session related info */
@@ -637,8 +732,8 @@ struct fastrpc_user {
 	struct fastrpc_buf *init_mem;
 	/* Pre-allocated header buffer */
 	struct fastrpc_buf *pers_hdr_buf;
-	/* SMMU mapping of process attrs debug buf */
-	struct fastrpc_map *proc_attrs_map;
+	/* proc_init shared buffer */
+	struct fastrpc_buf *proc_init_sharedbuf;
 	struct fastrpc_static_pd *spd;
 	/* Pre-allocated buffer divided into N chunks */
 	struct fastrpc_buf *hdr_bufs;

@@ -83,9 +83,9 @@
 #define MDSP_DOMAIN_ID	(1)
 #define SDSP_DOMAIN_ID	(2)
 #define CDSP_DOMAIN_ID	(3)
-#define MAX_DOMAIN_ID	CDSP_DOMAIN_ID
+#define CDSP1_DOMAIN_ID (4)
 
-#define NUM_CHANNELS	4	/* adsp, mdsp, slpi, cdsp*/
+#define NUM_CHANNELS	5	/* adsp, mdsp, slpi, cdsp, cdsp1*/
 #define NUM_SESSIONS	14	/* max 11 compute, 3 cpz */
 
 /* Default maximum sessions allowed per process */
@@ -900,8 +900,6 @@ struct fastrpc_file {
 	struct fastrpc_device *device;
 	/* Process kill will wait on work when ram dump collection in progress */
 	struct completion work;
-	/* Flag to indicate ram dump collection status*/
-	bool is_ramdump_pend;
 	/* Process kill will wait on bus driver invoke thread to complete its process */
 	struct completion dma_invoke;
 	/* Flag to indicate invoke pending */

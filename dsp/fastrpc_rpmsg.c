@@ -208,6 +208,7 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	struct fastrpc_channel_ctx *cctx = dev_get_drvdata(&rpdev->dev);
 	struct fastrpc_user *user;
 	unsigned long flags;
+	int i = 0;
 
 	dev_info(cctx->dev, "%s started", __func__);
 
@@ -227,11 +228,9 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	if (cctx->secure_fdevice)
 		misc_deregister(&cctx->secure_fdevice->miscdev);
 
-	if (cctx->domain_id == ADSP_DOMAIN_ID) {
-		pdr_handle_release(cctx->spd[0].pdrhandle);
-		pdr_handle_release(cctx->spd[1].pdrhandle);
-	} else if (cctx->domain_id == SDSP_DOMAIN_ID) {
-		pdr_handle_release(cctx->spd[0].pdrhandle);
+	for (i = 0; i < FASTRPC_MAX_SPD; i++) {
+		if (cctx->spd[i].pdrhandle)
+			pdr_handle_release(cctx->spd[i].pdrhandle);
 	}
 
 	mutex_lock(&cctx->wake_mutex);

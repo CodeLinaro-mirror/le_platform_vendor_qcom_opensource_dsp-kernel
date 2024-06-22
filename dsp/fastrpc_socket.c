@@ -84,6 +84,7 @@ static void fastrpc_recv_del_server(struct frpc_transport_session_control *sessi
 	u32 remote_server_instance = session_control->remote_server_instance;
 	int err = 0;
 	struct fastrpc_user *user;
+	unsigned long flags;
 
 	/* Ignore EOF marker */
 	if (!node && !port) {
@@ -104,8 +105,10 @@ static void fastrpc_recv_del_server(struct frpc_transport_session_control *sessi
 	session_control->frpc_socket.remote_sock_addr.sq_port = 0;
 	session_control->remote_server_online = false;
 	mutex_unlock(&session_control->frpc_socket.socket_mutex);
+	spin_lock_irqsave(&scctx->lock, flags);
 	list_for_each_entry(user, &scctx->users, user)
 		fastrpc_notify_users(user);
+	spin_unlock_irqrestore(&scctx->lock, flags);
 	dev_info(scctx->dev, "Remote server is down: remote ID (0x%x)", remote_server_instance);
 }
 

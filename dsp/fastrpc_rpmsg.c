@@ -15,6 +15,7 @@
 #include <linux/of_reserved_mem.h>
 #include "fastrpc_shared.h"
 #include <linux/soc/qcom/pdr.h>
+#include <linux/delay.h>
 
 void fastrpc_channel_ctx_put(struct fastrpc_channel_ctx *cctx);
 void fastrpc_update_gctx(struct fastrpc_channel_ctx *cctx, int flag);
@@ -27,9 +28,6 @@ void fastrpc_register_wakeup_source(struct device *dev,
 	const char *client_name, struct wakeup_source **device_wake_source);
 int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx);
 void fastrpc_queue_pd_status(struct fastrpc_user *fl, int domain, int status, int sessionid);
-
-static struct fastrpc_channel_ctx *gadsp;
-static struct fastrpc_channel_ctx *gcdsp;
 
 struct fastrpc_channel_ctx* get_current_channel_ctx(struct device *dev)
 {
@@ -117,6 +115,7 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	spin_lock_init(&(data->gmsg_log.rx_lock));
 	idr_init(&data->ctx_idr);
 	ida_init(&data->tgid_frpc_ida);
+	init_completion(&data->ssr_complete);
 	data->domain_id = domain_id;
 	data->max_sess_per_proc = FASTRPC_MAX_SESSIONS_PER_PROCESS;
 	data->rpdev = rpdev;
@@ -135,7 +134,6 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 		if (err)
 			goto fdev_error;
 		data->cpuinfo_todsp = FASTRPC_CPUINFO_DEFAULT;
-		gadsp = data;
 		break;
 	case CDSP_DOMAIN_ID:
 		data->unsigned_support = true;
@@ -148,7 +146,6 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 		if (err)
 			goto fdev_error;
 		data->cpuinfo_todsp = FASTRPC_CPUINFO_EARLY_WAKEUP;
-		gcdsp = data;
 		break;
 	default:
 		err = -EINVAL;
@@ -233,6 +230,27 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 			pdr_handle_release(cctx->spd[i].pdrhandle);
 	}
 
+	spin_lock_irqsave(&cctx->lock, flags);
+	/*
+	 * If there are other ongoing remote invocations, wait for them to
+	 * complete before cleaning up the channel resources, to avoid UAF.
+	 */
+	while (cctx->invoke_cnt != 0) {
+		spin_unlock_irqrestore(&cctx->lock, flags);
+		udelay(1000);
+		spin_lock_irqsave(&cctx->lock, flags);
+	}
+	spin_unlock_irqrestore(&cctx->lock, flags);
+
+	/*
+	 * As remote channel is down, corresponding SMMU devices will also
+	 * be removed. So free all SMMU mappings of every process using this
+	 * channel to avoid any UAF later.
+	 */
+	list_for_each_entry(user, &cctx->users, user) {
+		fastrpc_free_user(user);
+	}
+
 	mutex_lock(&cctx->wake_mutex);
 	if (cctx->wake_source) {
 		wakeup_source_unregister(cctx->wake_source);
@@ -250,6 +268,8 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	fastrpc_mmap_remove_ssr(cctx);
 	cctx->dev = NULL;
 	cctx->rpdev = NULL;
+	// Wake up all process releases, if waiting for SSR to complete
+	complete_all(&cctx->ssr_complete);
 	fastrpc_update_gctx(cctx, 0);
 	fastrpc_channel_ctx_put(cctx);
 }

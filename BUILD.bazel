@@ -24,3 +24,11 @@ define_modules("sun", "perf")
 define_modules("niobe", "consolidate")
 
 define_modules("niobe", "gki")
+
+define_modules("monaco", "consolidate")
+
+define_modules("monaco", "gki")
+
+define_modules("parrot", "consolidate")
+
+define_modules("parrot", "gki")

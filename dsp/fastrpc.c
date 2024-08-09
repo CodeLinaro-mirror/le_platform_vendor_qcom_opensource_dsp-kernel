@@ -774,33 +774,27 @@ static struct fastrpc_invoke_ctx *fastrpc_context_alloc(
 		ctx->maps = kcalloc(ctx->nscalars,
 				    sizeof(*ctx->maps), GFP_KERNEL);
 		if (!ctx->maps) {
-			kfree(ctx);
-			return ERR_PTR(-ENOMEM);
+			ret = -ENOMEM;
+			goto err_alloc;
 		}
 		ctx->olaps = kcalloc(ctx->nscalars,
 				    sizeof(*ctx->olaps), GFP_KERNEL);
 		if (!ctx->olaps) {
-			kfree(ctx->maps);
-			kfree(ctx);
-			return ERR_PTR(-ENOMEM);
+			ret = -ENOMEM;
+			goto err_alloc;
 		}
 		ctx->args = kcalloc(ctx->nscalars,
 				    sizeof(*ctx->args), GFP_KERNEL);
 		if (!ctx->args) {
-			kfree(ctx->olaps);
-			kfree(ctx->maps);
-			kfree(ctx);
-			return ERR_PTR(-ENOMEM);
+			ret = -ENOMEM;
+			goto err_alloc;
 		}
 		if (!kernel) {
 			if (copy_from_user((void *)ctx->args,
 					(void __user *)(uintptr_t)invoke->inv.args,
 					ctx->nscalars * sizeof(*ctx->args))) {
-				kfree(ctx->args);
-				kfree(ctx->olaps);
-				kfree(ctx->maps);
-				kfree(ctx);
-				return ERR_PTR(-EFAULT);
+				ret = -EFAULT;
+				goto err_alloc;
 			}
 		} else {
 			memcpy((void *)ctx->args,
@@ -819,8 +813,10 @@ static struct fastrpc_invoke_ctx *fastrpc_context_alloc(
 	ctx->perf_kernel = (u64 *)(uintptr_t)invoke->perf_kernel;
 	if (ctx->fl->profile) {
 		ctx->perf = kzalloc(sizeof(*(ctx->perf)), GFP_KERNEL);
-		if (!ctx->perf)
-			return ERR_PTR(-ENOMEM);
+		if (!ctx->perf) {
+			ret = -ENOMEM;
+			goto err_perf_alloc;
+		}
 		ctx->perf->tid = ctx->fl->tgid;
 	}
 	ctx->handle = invoke->inv.handle;
@@ -859,7 +855,9 @@ err_idr:
 	spin_lock(&user->lock);
 	list_del(&ctx->node);
 	spin_unlock(&user->lock);
+err_perf_alloc:
 	fastrpc_channel_ctx_put(cctx);
+err_alloc:
 	kfree(ctx->maps);
 	kfree(ctx->olaps);
 	kfree(ctx->args);
@@ -1301,7 +1299,7 @@ map_retry:
 	} else if (attr & FASTRPC_ATTR_NOMAP || mflags == FASTRPC_MAP_FD_NOMAP){
 
 		map->phys = sg_dma_address(map->table->sgl);
-		map->size = len;
+		map->size = sg_dma_len(map->table->sgl);
 		map->va = (void *) (uintptr_t) va;
 	} else {
 		map->phys = sg_dma_address(map->table->sgl);
@@ -1352,7 +1350,7 @@ map_err:
 attach_err:
 	dma_buf_put(map->buf);
 get_err:
-	fastrpc_map_put(map);
+	kfree(map);
 
 	return err;
 }
@@ -3009,6 +3007,9 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 
 	fastrpc_get_process_gids(&fl->gidlist);
 
+	/* In case of privileged process update attributes */
+	fastrpc_check_privileged_process(fl, &init);
+
 	inbuf.pgid = fl->tgid_frpc;
 	inbuf.namelen = strlen(current->comm) + 1;
 	inbuf.filelen = init.filelen;
@@ -3043,8 +3044,6 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 
 	/* Process spawn should not fail if unable to pack root buffer */
 	fastrpc_pack_root_sharedpage(fl, pages, &inbuf.pageslen);
-
-	fastrpc_check_privileged_process(fl, &init);
 
 	memlen = ALIGN(max(INIT_FILELEN_MAX, (int)init.filelen * 4),
 		       1024 * 1024);
@@ -3208,6 +3207,7 @@ static int fastrpc_device_release(struct inode *inode, struct file *file)
 	unsigned long flags, irq_flags;
 	bool locked = false, is_driver_registered = false;
 	spinlock_t *glock = &g_frpc.glock;
+	int err = 0;
 
 	spin_lock_irqsave(glock, irq_flags);
 	spin_lock_irqsave(&cctx->lock, flags);
@@ -3262,7 +3262,12 @@ static int fastrpc_device_release(struct inode *inode, struct file *file)
 	if (fl->spd)
 		atomic_set(&fl->spd->is_attached, 0);
 
-	fastrpc_release_current_dsp_process(fl);
+	err = fastrpc_release_current_dsp_process(fl);
+	if (err == -ETIMEDOUT) {
+		pr_err("%s failed with err %d for process %s fl->tgid %d fl->tgid_frpc %d\n",
+			__func__, err, current->comm, fl->tgid, fl->tgid_frpc);
+		BUG_ON(1);
+	}
 	fl->state = DSP_EXIT_COMPLETE;
 
 	spin_lock_irqsave(&cctx->lock, flags);
@@ -3344,6 +3349,7 @@ static int fastrpc_device_open(struct inode *inode, struct file *filp)
 	struct fastrpc_device_node *fdevice;
 	struct fastrpc_user *fl = NULL;
 	unsigned long flags;
+	int err;
 
 	fdevice = miscdev_to_fdevice(filp->private_data);
 	cctx = fdevice->cctx;
@@ -3383,7 +3389,8 @@ static int fastrpc_device_open(struct inode *inode, struct file *filp)
 
 	if (fl->tgid_frpc == -1) {
 		dev_err(cctx->dev, "too many fastrpc clients, max %u allowed\n", MAX_FRPC_TGID);
-		return -EUSERS;
+		err = -EUSERS;
+		goto error;
 	}
 	dev_dbg(cctx->dev, "HLOS pid %d, domain %d is mapped to unique sessions pid %d",
 			fl->tgid, fl->cctx->domain_id, fl->tgid_frpc);
@@ -3397,8 +3404,10 @@ static int fastrpc_device_open(struct inode *inode, struct file *filp)
 	if (cctx->lowest_capacity_core_count) {
 		fl->dev_pm_qos_req = kzalloc((cctx->lowest_capacity_core_count) *
 				sizeof(struct dev_pm_qos_request), GFP_KERNEL);
-		if (!fl->dev_pm_qos_req)
-			return -ENOMEM;
+		if (!fl->dev_pm_qos_req) {
+			err = -ENOMEM;
+			goto error;
+		}
 	}
 
 	spin_lock_irqsave(&cctx->lock, flags);
@@ -3406,6 +3415,14 @@ static int fastrpc_device_open(struct inode *inode, struct file *filp)
 	spin_unlock_irqrestore(&cctx->lock, flags);
 
 	return 0;
+error:
+	mutex_destroy(&fl->remote_map_mutex);
+	mutex_destroy(&fl->map_mutex);
+	mutex_destroy(&fl->signal_create_mutex);
+	kfree(fl);
+	fastrpc_channel_ctx_put(cctx);
+
+	return err;
 }
 
 static int fastrpc_dmabuf_alloc(struct fastrpc_user *fl, char __user *argp)
@@ -3631,6 +3648,7 @@ read_notif_status:
 	if (notif) {
 		notif_rsp->status = notif->status;
 		notif_rsp->domain = notif->domain;
+		notif_rsp->session = notif->session;
 	} else {// Go back to wait if ctx is invalid
 		dev_err(dev, "Invalid status notification response\n");
 		goto read_notif_status;

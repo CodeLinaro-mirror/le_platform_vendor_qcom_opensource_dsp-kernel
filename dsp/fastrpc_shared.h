@@ -690,9 +690,11 @@ struct fastrpc_channel_ctx {
 	/* Flag to indicate CB pooling is enabled for channel */
 	bool smmucb_pool;
 	/* Number of active ongoing invocations (device ioctl / release) */
-	u32 invoke_cnt;
+	atomic_t invoke_cnt;
 	/* Completion object for threads to wait for SSR handling to finish */
 	struct completion ssr_complete;
+	/* Wait queue to block/resume SSR until all invocations are complete */
+	wait_queue_head_t ssr_wait_queue;
 };
 
 struct fastrpc_invoke_ctx {

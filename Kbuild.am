@@ -13,6 +13,11 @@ $(info within KBUILD file CONFIG_ARCH_SUN = $(CONFIG_ARCH_SUN))
 ccflags-y += -DCONFIG_QCOM_FASTRPC_TRUSTED=1
 endif
 
+ifeq ($(CONFIG_ARCH_NIOBE), y)
+$(info within KBUILD file CONFIG_ARCH_NIOBE = $(CONFIG_ARCH_NIOBE))
+ccflags-y += -DCONFIG_QCOM_FASTRPC_TRUSTED=1
+endif
+
 frpc-trusted-adsprpc-y := dsp/fastrpc.o	\
 					 dsp/fastrpc_socket.o \
 

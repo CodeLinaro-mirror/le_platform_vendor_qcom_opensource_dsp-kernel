@@ -116,6 +116,7 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	idr_init(&data->ctx_idr);
 	ida_init(&data->tgid_frpc_ida);
 	init_completion(&data->ssr_complete);
+	init_waitqueue_head(&data->ssr_wait_queue);
 	data->domain_id = domain_id;
 	data->max_sess_per_proc = FASTRPC_MAX_SESSIONS_PER_PROCESS;
 	data->rpdev = rpdev;
@@ -235,9 +236,10 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	 * If there are other ongoing remote invocations, wait for them to
 	 * complete before cleaning up the channel resources, to avoid UAF.
 	 */
-	while (cctx->invoke_cnt != 0) {
+	while (atomic_read(&cctx->invoke_cnt) > 0) {
 		spin_unlock_irqrestore(&cctx->lock, flags);
-		udelay(1000);
+		wait_event_interruptible(cctx->ssr_wait_queue,
+				atomic_read(&cctx->invoke_cnt) == 0);
 		spin_lock_irqsave(&cctx->lock, flags);
 	}
 	spin_unlock_irqrestore(&cctx->lock, flags);

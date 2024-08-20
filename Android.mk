@@ -7,11 +7,13 @@ ifeq ($(TARGET_KERNEL_DLKM_DISABLE), true)
 endif
 
 ifeq ($(FASTRPC_DLKM_ENABLED), true)
-DLKM_DIR   := device/qcom/common/dlkm
+BOARD_COMMON_DIR ?= device/qcom/common
+BOARD_OPENSOURCE_DIR ?= vendor/qcom/opensource
+DLKM_DIR   := $(BOARD_COMMON_DIR)/dlkm
 
 LOCAL_PATH := $(call my-dir)
 
-DSP_BLD_DIR := $(abspath .)/vendor/qcom/opensource/dsp-kernel
+DSP_BLD_DIR := $(abspath .)/$(BOARD_OPENSOURCE_DIR)/dsp-kernel
 
 LOCAL_MODULE_DDK_BUILD := true
 

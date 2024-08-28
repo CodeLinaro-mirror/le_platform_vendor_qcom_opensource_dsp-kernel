@@ -522,6 +522,8 @@ static int __fastrpc_buf_alloc(struct fastrpc_user *fl,
 	struct fastrpc_buf *buf;
 	struct timespec64 start_ts, end_ts;
 
+	if (!size)
+		return -EFAULT;
 	buf = kzalloc(sizeof(*buf), GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
@@ -3969,7 +3971,8 @@ static int fastrpc_dmabuf_alloc(struct fastrpc_user *fl, char __user *argp)
 
 	if (copy_from_user(&bp, argp, sizeof(bp)))
 		return -EFAULT;
-
+	if (!bp.size)
+		return -EFAULT;
 	if (!fl->sctx)
 		return -EINVAL;
 
@@ -5731,6 +5734,8 @@ static int fastrpc_req_mmap(struct fastrpc_user *fl, char __user *argp)
 		return -EHOSTDOWN;
 	}
 	if (copy_from_user(&req, argp, sizeof(req)))
+		return -EFAULT;
+	if (!req.size)
 		return -EFAULT;
 
 	smmucb = &fl->sctx->smmucb[DEFAULT_SMMU_IDX];

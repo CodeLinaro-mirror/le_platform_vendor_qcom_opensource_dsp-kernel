@@ -1440,17 +1440,21 @@ static int fastrpc_create_maps(struct fastrpc_invoke_ctx *ctx)
 
 	for (i = 0; i < ctx->nscalars; ++i) {
 		bool take_ref = true;
+		int mflags = 0;
 
 		if (ctx->args[i].fd == 0 || ctx->args[i].fd == -1 ||
 		   (i >= ctx->nbufs && cctx->dsp_attributes[DMA_HANDLE_REVERSE_RPC_CAP]) ||
                     ctx->args[i].length == 0)
 			continue;
 
-		if (i >= ctx->nbufs)
+		if (i >= ctx->nbufs) {
 			take_ref = false;
+			/* Set the DMA handle mapping flag for DMA handles */
+			mflags = FASTRPC_MAP_LEGACY_DMA_HANDLE;
+		}
 		mutex_lock(&ctx->fl->map_mutex);
 		err = fastrpc_map_create(ctx->fl, ctx->args[i].fd, (u64)ctx->args[i].ptr, NULL,
-			 ctx->args[i].length, ctx->args[i].attr, 0, &ctx->maps[i], take_ref);
+			 ctx->args[i].length, ctx->args[i].attr, mflags, &ctx->maps[i], take_ref);
 		mutex_unlock(&ctx->fl->map_mutex);
 		if (err) {
 			dev_err(dev, "Error Creating map %d\n", err);
@@ -1685,7 +1689,12 @@ static int fastrpc_put_args(struct fastrpc_invoke_ctx *ctx,
 			break;
 		mutex_lock(&fl->map_mutex);
 		if (!fastrpc_map_lookup(fl, (int)fdlist[i], 0, 0, NULL, 0, &mmap, false))
-			fastrpc_map_put(mmap);
+			/* Validate the map flags for DMA handles and skip freeing map if invalid */
+			if (mmap->flags == FASTRPC_MAP_LEGACY_DMA_HANDLE) {
+				/* Allow DMA handle maps to free only once */
+				mmap->flags = 0;
+				fastrpc_map_put(mmap);
+			}
 		mutex_unlock(&fl->map_mutex);
 	}
 	if (ctx->crc && crclist && rpra) {
@@ -4741,7 +4750,12 @@ static int fastrpc_req_mem_map(struct fastrpc_user *fl, char __user *argp)
 	}
 	if (copy_from_user(&req, argp, sizeof(req)))
 		return -EFAULT;
-
+	/*
+	 * Prevent mapping backward compatible DMA handles here, as they are
+	 * already mapped in the remote call.
+	 */
+	if (req.flags == FASTRPC_MAP_LEGACY_DMA_HANDLE)
+		return -EINVAL;
 	dev = fl->sctx->smmucb[DEFAULT_SMMU_IDX].dev;
 	/* create SMMU mapping */
 	mutex_lock(&fl->map_mutex);

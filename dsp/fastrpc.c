@@ -214,22 +214,22 @@ static int fastrpc_map_lookup(struct fastrpc_user *fl, int fd,
 	struct fastrpc_map *map = NULL;
 	int ret = -ENOENT;
 
+	if (mflags == ADSP_MMAP_DMA_BUFFER) {
+		if (!buf)
+			return ret;
+	} else {
+		/* Fetch DMA buffer from fd */
+		buf = dma_buf_get(fd);
+		if (IS_ERR(buf))
+			return PTR_ERR(buf);
+	}
+
 	spin_lock(&fl->lock);
-	if (mflags ==  ADSP_MMAP_DMA_BUFFER) {
 		list_for_each_entry(map, &fl->maps, node) {
 			if (map->buf == buf)
 				goto map_found;
 		}
-	} else {
-		list_for_each_entry(map, &fl->maps, node) {
-			if (map->fd == fd && va >= (u64)map->va &&
-				va + len >= va &&
-				va + len <= (u64)map->va + map->size)
-				goto map_found;
-		}
-	}
-	spin_unlock(&fl->lock);
-	return ret;
+	goto error;
 
 map_found:
 	if (take_ref) {
@@ -238,16 +238,17 @@ map_found:
 			dev_dbg(sess->smmucb[DEFAULT_SMMU_IDX].dev,
 				"%s: Failed to get map fd=%d ret=%d\n",
 				__func__, fd, ret);
-				spin_unlock(&fl->lock);
 				goto error;
 		}
 	}
-	spin_unlock(&fl->lock);
-
 	*ppmap = map;
 	ret = 0;
 
 error:
+	spin_unlock(&fl->lock);
+	/* Drop the DMA buf ref except for the DMA bus driver */
+	if (mflags != ADSP_MMAP_DMA_BUFFER)
+		dma_buf_put(buf);
 	return ret;
 }
 

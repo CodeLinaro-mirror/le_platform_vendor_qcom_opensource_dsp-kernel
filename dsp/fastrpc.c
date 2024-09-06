@@ -3931,8 +3931,7 @@ void fastrpc_queue_pd_status(struct fastrpc_user *fl, int domain, int status, in
 
 	notif_rsp = kzalloc(sizeof(*notif_rsp), GFP_ATOMIC);
 	if (!notif_rsp) {
-		dev_err(fl->sctx->smmucb[DEFAULT_SMMU_IDX].dev,
-							"Allocation failed for notif\n");
+		dev_err(fl->cctx->dev, "Allocation failed for notif\n");
 		return;
 	}
 
@@ -3974,7 +3973,6 @@ static int fastrpc_wait_on_notif_queue(
 	int err = 0;
 	unsigned long flags;
 	struct fastrpc_notif_rsp *notif = NULL, *inotif, *n;
-	struct device *dev = fl->sctx->smmucb[DEFAULT_SMMU_IDX].dev;
 
 read_notif_status:
 	err = wait_event_interruptible(fl->proc_state_notif.notif_wait_queue,
@@ -3996,7 +3994,7 @@ read_notif_status:
 		notif_rsp->domain = notif->domain;
 		notif_rsp->session = notif->session;
 	} else {// Go back to wait if ctx is invalid
-		dev_err(dev, "Invalid status notification response\n");
+		dev_err(fl->cctx->dev, "Invalid status notification response\n");
 		goto read_notif_status;
 	}
 

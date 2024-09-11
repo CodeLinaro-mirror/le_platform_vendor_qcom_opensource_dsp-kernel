@@ -6551,7 +6551,7 @@ static int fastrpc_device_open(struct inode *inode, struct file *filp)
 
 static int fastrpc_get_process_gids(struct gid_list *gidlist)
 {
-	struct group_info *group_info = get_current_groups();
+	struct group_info *group_info = current_cred()->group_info;
 	int i = 0, err = 0, num_gids = group_info->ngroups + 1;
 	unsigned int *gids = NULL;
 
@@ -8172,6 +8172,12 @@ static int fastrpc_cb_probe(struct device *dev)
 			for (j = 1; j < sharedcb_count &&
 					chan->sesscount < NUM_SESSIONS; j++) {
 				chan->sesscount++;
+				VERIFY(err, chan->sesscount < NUM_SESSIONS);
+				if (err) {
+					ADSPRPC_WARN("failed to add shared session, maximum sessions (%d) reached \n",
+						NUM_SESSIONS);
+					break;
+				}
 				dup_sess = &chan->session[chan->sesscount];
 				memcpy(dup_sess, sess,
 					sizeof(struct fastrpc_session_ctx));

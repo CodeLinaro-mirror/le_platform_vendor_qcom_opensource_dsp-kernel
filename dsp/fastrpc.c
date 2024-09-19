@@ -744,6 +744,7 @@ static void fastrpc_context_free(struct kref *ref)
 	kfree(ctx->maps);
 	kfree(ctx->olaps);
 	kfree(ctx->args);
+	kfree(ctx->outbufs);
 	kfree(ctx);
 
 	fastrpc_channel_ctx_put(cctx);
@@ -1611,8 +1612,8 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 	union fastrpc_remote_arg *rpra;
 	struct fastrpc_invoke_buf *list;
 	struct fastrpc_phy_page *pages;
-	int inbufs, i, oix, err = 0;
-	u64 len, rlen, pkt_size;
+	int inbufs, outbufs, i, oix, err = 0;
+	u64 len, rlen, pkt_size, outbufslen;
 	u64 pg_start, pg_end;
 	u64 *perf_counter = NULL;
 	uintptr_t args;
@@ -1622,6 +1623,7 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 		perf_counter = (u64 *)ctx->perf + PERF_COUNT;
 
 	inbufs = REMOTE_SCALARS_INBUFS(ctx->sc);
+	outbufs = REMOTE_SCALARS_OUTBUFS(ctx->sc);
 	metalen = fastrpc_get_meta_size(ctx);
 	pkt_size = fastrpc_get_payload_size(ctx, metalen);
 	if (!pkt_size) {
@@ -1769,6 +1771,13 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 		rpra[i].dma.len = ctx->args[i].length;
 		rpra[i].dma.offset = (u64) ctx->args[i].ptr;
 	}
+	outbufslen = sizeof(struct fastrpc_remote_buf) * outbufs;
+	ctx->outbufs = kzalloc(outbufslen, GFP_KERNEL);
+	if (!ctx->outbufs) {
+		err = -ENOMEM;
+		goto bail;
+	}
+	memcpy(ctx->outbufs, rpra + inbufs, outbufslen);
 
 bail:
 	if (err)
@@ -1801,9 +1810,10 @@ static int fastrpc_put_args(struct fastrpc_invoke_ctx *ctx,
 
 	for (i = inbufs; i < ctx->nbufs; ++i) {
 		if (!ctx->maps[i]) {
-			void *src = (void *)(uintptr_t)rpra[i].buf.pv;
+			int j = i - inbufs;
+			void *src = (void *)(uintptr_t)ctx->outbufs[j].buf.pv;
 			void *dst = (void *)(uintptr_t)ctx->args[i].ptr;
-			u64 len = rpra[i].buf.len;
+			u64 len = ctx->outbufs[j].buf.len;
 
 			if (!kernel) {
 				if (copy_to_user((void __user *)dst, src, len))

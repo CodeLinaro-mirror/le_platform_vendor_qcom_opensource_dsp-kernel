@@ -217,6 +217,8 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	list_for_each_entry(user, &cctx->users, user) {
 		fastrpc_queue_pd_status(user, cctx->domain_id, FASTRPC_DSP_SSR, user->sessionid);
 		fastrpc_notify_users(user);
+		/* cancel all waiting dspsignals */
+		fastrpc_ssr_dspsignal_cancel_wait(user);
 	}
 	spin_unlock_irqrestore(&cctx->lock, flags);
 

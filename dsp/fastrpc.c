@@ -214,22 +214,22 @@ static int fastrpc_map_lookup(struct fastrpc_user *fl, int fd,
 	struct fastrpc_map *map = NULL;
 	int ret = -ENOENT;
 
+	if (mflags == ADSP_MMAP_DMA_BUFFER) {
+		if (!buf)
+			return ret;
+	} else {
+		/* Fetch DMA buffer from fd */
+		buf = dma_buf_get(fd);
+		if (IS_ERR(buf))
+			return PTR_ERR(buf);
+	}
+
 	spin_lock(&fl->lock);
-	if (mflags ==  ADSP_MMAP_DMA_BUFFER) {
 		list_for_each_entry(map, &fl->maps, node) {
 			if (map->buf == buf)
 				goto map_found;
 		}
-	} else {
-		list_for_each_entry(map, &fl->maps, node) {
-			if (map->fd == fd && va >= (u64)map->va &&
-				va + len >= va &&
-				va + len <= (u64)map->va + map->size)
-				goto map_found;
-		}
-	}
-	spin_unlock(&fl->lock);
-	return ret;
+	goto error;
 
 map_found:
 	if (take_ref) {
@@ -238,16 +238,17 @@ map_found:
 			dev_dbg(sess->smmucb[DEFAULT_SMMU_IDX].dev,
 				"%s: Failed to get map fd=%d ret=%d\n",
 				__func__, fd, ret);
-				spin_unlock(&fl->lock);
 				goto error;
 		}
 	}
-	spin_unlock(&fl->lock);
-
 	*ppmap = map;
 	ret = 0;
 
 error:
+	spin_unlock(&fl->lock);
+	/* Drop the DMA buf ref except for the DMA bus driver */
+	if (mflags != ADSP_MMAP_DMA_BUFFER)
+		dma_buf_put(buf);
 	return ret;
 }
 
@@ -443,6 +444,8 @@ static int __fastrpc_buf_alloc(struct fastrpc_user *fl,
 	struct fastrpc_buf *buf;
 	struct timespec64 start_ts, end_ts;
 
+	if (!size)
+		return -EFAULT;
 	buf = kzalloc(sizeof(*buf), GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
@@ -476,7 +479,7 @@ static int __fastrpc_buf_alloc(struct fastrpc_user *fl,
 		if (smmucb->dev)
 			__fastrpc_dma_alloc(buf);
 		if (buf->virt) {
-			smmucb->allocatedbytes += SMMU_ALIGN(size);
+			smmucb->allocatedbytes += SMMU_ALIGN(buf->size);
 			buf->phys += ((u64)smmucb->sid << 32);
 		}
 		mutex_unlock(&smmucb->map_mutex);
@@ -1306,7 +1309,7 @@ map_retry:
 			sgl_index)
 			map->size += sg_dma_len(sgl);
 		map->va = (void *) (uintptr_t) va;
-		smmucb->allocatedbytes += SMMU_ALIGN(len);
+		smmucb->allocatedbytes += SMMU_ALIGN(map->size);
 	} else if (attr & FASTRPC_ATTR_NOMAP || mflags == FASTRPC_MAP_FD_NOMAP){
 
 		map->phys = sg_dma_address(map->table->sgl);
@@ -1319,7 +1322,7 @@ map_retry:
 			sgl_index)
 			map->size += sg_dma_len(sgl);
 		map->va = (void *) (uintptr_t) va;
-		smmucb->allocatedbytes += SMMU_ALIGN(len);
+		smmucb->allocatedbytes += SMMU_ALIGN(map->size);
 	}
 
 	trace_fastrpc_dma_map(map->fl->cctx->domain_id, map->fd, map->phys,
@@ -1440,17 +1443,21 @@ static int fastrpc_create_maps(struct fastrpc_invoke_ctx *ctx)
 
 	for (i = 0; i < ctx->nscalars; ++i) {
 		bool take_ref = true;
+		int mflags = 0;
 
 		if (ctx->args[i].fd == 0 || ctx->args[i].fd == -1 ||
 		   (i >= ctx->nbufs && cctx->dsp_attributes[DMA_HANDLE_REVERSE_RPC_CAP]) ||
                     ctx->args[i].length == 0)
 			continue;
 
-		if (i >= ctx->nbufs)
+		if (i >= ctx->nbufs) {
 			take_ref = false;
+			/* Set the DMA handle mapping flag for DMA handles */
+			mflags = FASTRPC_MAP_LEGACY_DMA_HANDLE;
+		}
 		mutex_lock(&ctx->fl->map_mutex);
 		err = fastrpc_map_create(ctx->fl, ctx->args[i].fd, (u64)ctx->args[i].ptr, NULL,
-			 ctx->args[i].length, ctx->args[i].attr, 0, &ctx->maps[i], take_ref);
+			 ctx->args[i].length, ctx->args[i].attr, mflags, &ctx->maps[i], take_ref);
 		mutex_unlock(&ctx->fl->map_mutex);
 		if (err) {
 			dev_err(dev, "Error Creating map %d\n", err);
@@ -1685,7 +1692,12 @@ static int fastrpc_put_args(struct fastrpc_invoke_ctx *ctx,
 			break;
 		mutex_lock(&fl->map_mutex);
 		if (!fastrpc_map_lookup(fl, (int)fdlist[i], 0, 0, NULL, 0, &mmap, false))
-			fastrpc_map_put(mmap);
+			/* Validate the map flags for DMA handles and skip freeing map if invalid */
+			if (mmap->flags == FASTRPC_MAP_LEGACY_DMA_HANDLE) {
+				/* Allow DMA handle maps to free only once */
+				mmap->flags = 0;
+				fastrpc_map_put(mmap);
+			}
 		mutex_unlock(&fl->map_mutex);
 	}
 	if (ctx->crc && crclist && rpra) {
@@ -3475,7 +3487,8 @@ static int fastrpc_dmabuf_alloc(struct fastrpc_user *fl, char __user *argp)
 
 	if (copy_from_user(&bp, argp, sizeof(bp)))
 		return -EFAULT;
-
+	if (!bp.size)
+		return -EFAULT;
 	if (!fl->sctx)
 		return -EINVAL;
 
@@ -4093,6 +4106,42 @@ static int fastrpc_dspsignal_cancel_wait(struct fastrpc_user *fl,
 	return 0;
 }
 
+/**
+ * fastrpc_ssr_dspsignal_cancel_wait() -
+ * Function to cancel waiting signals during SSR
+ * @arg1: Fastrpc user file pointer
+ *
+ * dspsignals will be waiting for DSP response
+ * cancel wait for these signals during SSR
+ *
+ * Return: void
+ */
+void fastrpc_ssr_dspsignal_cancel_wait(struct fastrpc_user *fl)
+{
+	unsigned long irq_flags = 0;
+	unsigned int i, j;
+	struct fastrpc_dspsignal *group, *sig;
+
+	spin_lock_irqsave(&fl->dspsignals_lock, irq_flags);
+	for (i = 0; i < (FASTRPC_DSPSIGNAL_NUM_SIGNALS /
+	         FASTRPC_DSPSIGNAL_GROUP_SIZE); i++) {
+		group = fl->signal_groups[i];
+		if (group) {
+			for (j = 0; j < FASTRPC_DSPSIGNAL_GROUP_SIZE;
+			     j++) {
+				sig = &group[j];
+				if (sig && sig->state ==
+				    DSPSIGNAL_STATE_PENDING) {
+					complete_all(&sig->comp);
+					sig->state =
+					    DSPSIGNAL_STATE_CANCELED;
+				}
+			}
+		}
+	}
+	spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
+}
+
 static int fastrpc_invoke_dspsignal(struct fastrpc_user *fl, struct fastrpc_internal_dspsignal *fsig)
 {
 	int err = 0;
@@ -4375,7 +4424,7 @@ static int fastrpc_req_munmap(struct fastrpc_user *fl, char __user *argp)
 	struct fastrpc_req_munmap req;
 	struct fastrpc_map *map = NULL, *iterm, *m;
 	struct device *dev = NULL;
-	int err = 0;
+	int err = -EINVAL;
 	unsigned long flags;
 
 	if (fl->state != DSP_CREATE_COMPLETE) {
@@ -4435,20 +4484,32 @@ static int fastrpc_req_munmap(struct fastrpc_user *fl, char __user *argp)
 	spin_lock(&fl->lock);
 	list_for_each_entry_safe(iterm, m, &fl->maps, node) {
 		if (iterm->raddr == req.vaddrout) {
-			map = iterm;
+			/*
+			 * Check if DSP mapping is complete, then move the state to
+			 * unmap in progress only if there is no other ongoing unmap.
+			 */
+			if (atomic_cmpxchg(&iterm->state, FD_DSP_MAP_COMPLETE,
+				FD_DSP_UNMAP_IN_PROGRESS) != FD_DSP_MAP_COMPLETE)
+				err = -EALREADY;
+			else
+				map = iterm;
 			break;
 		}
 	}
 	spin_unlock(&fl->lock);
 	if (!map) {
 		dev_err(dev, "buffer not in buf or map list\n");
-		return -EINVAL;
+		return err;
 	}
 
 	err = fastrpc_req_munmap_dsp(fl, map->raddr, map->size);
 	if (err) {
 		dev_err(dev, "unmmap\tpt fd = %d, 0x%09llx error\n",  map->fd, map->raddr);
+		/* Revert the map state to map complete */
+		atomic_set(&map->state, FD_DSP_MAP_COMPLETE);
 	} else {
+		/* Set the map state to default on successful unmapping */
+		atomic_set(&map->state, FD_MAP_DEFAULT);
 		mutex_lock(&fl->map_mutex);
 		fastrpc_map_put(map);
 		mutex_unlock(&fl->map_mutex);
@@ -4480,6 +4541,8 @@ static int fastrpc_req_mmap(struct fastrpc_user *fl, char __user *argp)
 		return -EHOSTDOWN;
 	}
 	if (copy_from_user(&req, argp, sizeof(req)))
+		return -EFAULT;
+	if (!req.size)
 		return -EFAULT;
 
 	smmucb = &fl->sctx->smmucb[DEFAULT_SMMU_IDX];
@@ -4558,12 +4621,6 @@ static int fastrpc_req_mmap(struct fastrpc_user *fl, char __user *argp)
 				goto err_assign;
 			}
 		}
-
-		if (copy_to_user((void __user *)argp, &req, sizeof(req))) {
-			err = -EFAULT;
-			goto err_assign;
-		}
-
 		if (req.flags == ADSP_MMAP_REMOTE_HEAP_ADDR) {
 			spin_lock_irqsave(&fl->cctx->lock, flags);
 			list_add_tail(&buf->node, &fl->cctx->gmaps);
@@ -4573,6 +4630,14 @@ static int fastrpc_req_mmap(struct fastrpc_user *fl, char __user *argp)
 			list_add_tail(&buf->node, &fl->mmaps);
 			spin_unlock(&fl->lock);
 		}
+		if (copy_to_user((void __user *)argp, &req, sizeof(req)))
+			/*
+			 * The usercopy failed, but we can't do much about it, as this
+			 * buf is already mapped in the DSP and accessible for the
+			 * current process. Therefore "leak" the buf and rely on the
+			 * process exit path to do any required cleanup.
+			 */
+			return -EFAULT;
 
 	} else {
 		if ((req.flags == ADSP_MMAP_REMOTE_HEAP_ADDR) && fl->is_unsigned_pd) {
@@ -4586,7 +4651,15 @@ static int fastrpc_req_mmap(struct fastrpc_user *fl, char __user *argp)
 			dev_err(dev, "failed to map buffer, fd = %d\n", req.fd);
 			return err;
 		}
-
+		/*
+		 * Update the map state to in progress only if there is no ongoing or
+		 * completed DSP mapping.
+		 */
+		if (atomic_cmpxchg(&map->state, FD_MAP_DEFAULT, FD_DSP_MAP_IN_PROGRESS)
+			!= FD_MAP_DEFAULT) {
+			err = -EALREADY;
+			goto err_invoke;
+		}
 		req_msg.pgid = fl->tgid_frpc;
 		req_msg.flags = req.flags;
 		req_msg.vaddr = req.vaddrin;
@@ -4611,6 +4684,8 @@ static int fastrpc_req_mmap(struct fastrpc_user *fl, char __user *argp)
 		err = fastrpc_internal_invoke(fl, KERNEL_MSG_WITH_ZERO_PID, &ioctl);
 		if (err) {
 			dev_err(dev, "mmap error (len 0x%08llx)\n", map->size);
+			/* Revert the map state to default */
+			atomic_set(&map->state, FD_MAP_DEFAULT);
 			goto err_invoke;
 		}
 
@@ -4619,35 +4694,33 @@ static int fastrpc_req_mmap(struct fastrpc_user *fl, char __user *argp)
 
 		/* let the client know the address to use */
 		req.vaddrout = rsp_msg.vaddr;
+		/* Set the map state to complete on successful mapping */
+		atomic_set(&map->state, FD_DSP_MAP_COMPLETE);
+		if (copy_to_user((void __user *)argp, &req, sizeof(req)))
+			/*
+			 * The usercopy failed, but we can't do much about it, as this
+			 * map is already mapped in the DSP and accessible for the
+			 * current process. Therefore "leak" the map and rely on the
+			 * process exit path to do any required cleanup.
+			 */
+			return -EFAULT;
 
-		if (copy_to_user((void __user *)argp, &req, sizeof(req))) {
-			err = -EFAULT;
-			goto err_assign;
-		}
 	}
 	return 0;
 
 err_assign:
-	if (req.flags != ADSP_MMAP_ADD_PAGES && req.flags != ADSP_MMAP_REMOTE_HEAP_ADDR) {
-		err = fastrpc_req_munmap_dsp(fl, map->raddr, map->size);
-		if (err) {
-			dev_err(dev, "unmmap\tpt fd = %d, 0x%09llx error\n",  map->fd, map->raddr);
-			map = NULL;
+	err = fastrpc_req_munmap_impl(fl, buf);
+	if (err) {
+		if (req.flags == ADSP_MMAP_REMOTE_HEAP_ADDR) {
+			spin_lock_irqsave(&fl->cctx->lock, flags);
+			list_add_tail(&buf->node, &fl->cctx->gmaps);
+			spin_unlock_irqrestore(&fl->cctx->lock, flags);
+		} else {
+			spin_lock(&fl->lock);
+			list_add_tail(&buf->node, &fl->mmaps);
+			spin_unlock(&fl->lock);
 		}
-	} else {
-		err = fastrpc_req_munmap_impl(fl, buf);
-		if (err) {
-			if (req.flags == ADSP_MMAP_REMOTE_HEAP_ADDR) {
-				spin_lock_irqsave(&fl->cctx->lock, flags);
-				list_add_tail(&buf->node, &fl->cctx->gmaps);
-				spin_unlock_irqrestore(&fl->cctx->lock, flags);
-			} else {
-				spin_lock(&fl->lock);
-				list_add_tail(&buf->node, &fl->mmaps);
-				spin_unlock(&fl->lock);
-			}
-			buf = NULL;
-		}
+		buf = NULL;
 	}
 
 err_invoke:
@@ -4668,13 +4741,21 @@ static int fastrpc_req_mem_unmap_impl(struct fastrpc_user *fl, struct fastrpc_me
 	struct fastrpc_enhanced_invoke ioctl;
 	struct fastrpc_map *map = NULL, *iter, *m;
 	struct fastrpc_mem_unmap_req_msg req_msg = { 0 };
-	int err = 0;
+	int err = -EINVAL;
 	struct device *dev = fl->sctx->smmucb[DEFAULT_SMMU_IDX].dev;
 
 	spin_lock(&fl->lock);
 	list_for_each_entry_safe(iter, m, &fl->maps, node) {
 		if ((req->fd < 0 || iter->fd == req->fd) && (iter->raddr == req->vaddr)) {
-			map = iter;
+			/*
+			 * Check if DSP mapping is complete, then move the state to
+			 * unmap in progress only if there is no other ongoing unmap.
+			 */
+			if (atomic_cmpxchg(&iter->state, FD_DSP_MAP_COMPLETE,
+				FD_DSP_UNMAP_IN_PROGRESS) != FD_DSP_MAP_COMPLETE)
+				err = -EALREADY;
+			else
+				map = iter;
 			break;
 		}
 	}
@@ -4683,7 +4764,7 @@ static int fastrpc_req_mem_unmap_impl(struct fastrpc_user *fl, struct fastrpc_me
 
 	if (!map) {
 		dev_err(dev, "map not in list\n");
-		return -EINVAL;
+		return err;
 	}
 
 	req_msg.pgid = fl->tgid_frpc;
@@ -4701,8 +4782,12 @@ static int fastrpc_req_mem_unmap_impl(struct fastrpc_user *fl, struct fastrpc_me
 	err = fastrpc_internal_invoke(fl, KERNEL_MSG_WITH_ZERO_PID, &ioctl);
 	if (err) {
 		dev_err(dev, "Unmap on DSP failed for fd:%d, addr:0x%09llx\n",  map->fd, map->raddr);
+		/* Revert the map state to map complete */
+		atomic_set(&map->state, FD_DSP_MAP_COMPLETE);
 		return err;
 	}
+	/* Set the map state to default on successful unmapping */
+	atomic_set(&map->state, FD_MAP_DEFAULT);
 	mutex_lock(&fl->map_mutex);
 	fastrpc_map_put(map);
 	mutex_unlock(&fl->map_mutex);
@@ -4727,7 +4812,6 @@ static int fastrpc_req_mem_unmap(struct fastrpc_user *fl, char __user *argp)
 
 static int fastrpc_req_mem_map(struct fastrpc_user *fl, char __user *argp)
 {
-	struct fastrpc_mem_unmap req_unmap = { 0 };
 	struct fastrpc_mem_map req = {0};
 	struct device *dev = NULL;
 	struct fastrpc_map *map = NULL;
@@ -4741,7 +4825,12 @@ static int fastrpc_req_mem_map(struct fastrpc_user *fl, char __user *argp)
 	}
 	if (copy_from_user(&req, argp, sizeof(req)))
 		return -EFAULT;
-
+	/*
+	 * Prevent mapping backward compatible DMA handles here, as they are
+	 * already mapped in the remote call.
+	 */
+	if (req.flags == FASTRPC_MAP_LEGACY_DMA_HANDLE)
+		return -EINVAL;
 	dev = fl->sctx->smmucb[DEFAULT_SMMU_IDX].dev;
 	/* create SMMU mapping */
 	mutex_lock(&fl->map_mutex);
@@ -4751,7 +4840,15 @@ static int fastrpc_req_mem_map(struct fastrpc_user *fl, char __user *argp)
 		dev_err(dev, "failed to map buffer, fd = %d\n", req.fd);
 		return err;
 	}
-
+	/*
+	 * Update the map state to in progress only if there is no ongoing or
+	 * completed DSP mapping.
+	 */
+	if (atomic_cmpxchg(&map->state, FD_MAP_DEFAULT, FD_DSP_MAP_IN_PROGRESS)
+		!= FD_MAP_DEFAULT) {
+		err = -EALREADY;
+		goto err_invoke;
+	}
 	map->va = (void *) (uintptr_t) req.vaddrin;
 	/* map to dsp, get virtual adrress for the user*/
 	err = fastrpc_mem_map_to_dsp(fl, map->fd, req.offset,
@@ -4759,19 +4856,23 @@ static int fastrpc_req_mem_map(struct fastrpc_user *fl, char __user *argp)
 					map->size, (uintptr_t *)&req.vaddrout);
 	if (err) {
 		dev_err(dev, "failed to map buffer on dsp, fd = %d\n", map->fd);
+		/* Revert the map state to default */
+		atomic_set(&map->state, FD_MAP_DEFAULT);
 		goto err_invoke;
 	}
 
 	/* update the buffer to be able to deallocate the memory on the DSP */
 	map->raddr = req.vaddrout;
-
-	if (copy_to_user((void __user *)argp, &req, sizeof(req))) {
-		/* unmap the memory and release the buffer */
-		req_unmap.vaddr = (uintptr_t)req.vaddrout;
-		req_unmap.length = map->size;
-		fastrpc_req_mem_unmap_impl(fl, &req_unmap);
+	/* Set the map state to complete on successful mapping */
+	atomic_set(&map->state, FD_DSP_MAP_COMPLETE);
+	if (copy_to_user((void __user *)argp, &req, sizeof(req)))
+		/*
+		 * The usercopy failed, but we can't do much about it, as this
+		 * map is already mapped in the DSP and accessible for the
+		 * current process. Therefore "leak" the map and rely on the
+		 * process exit path to do any required cleanup.
+		 */
 		return -EFAULT;
-	}
 
 	return 0;
 err_invoke:
@@ -4965,15 +5066,28 @@ long fastrpc_dev_map_dma(struct fastrpc_device *dev,
 	mutex_unlock(&fl->map_mutex);
 	if (err)
 		goto error;
+	/*
+	 * Update the map state to in progress only if there is no ongoing or
+	 * completed DSP mapping.
+	 */
+	if (atomic_cmpxchg(&map->state, FD_MAP_DEFAULT, FD_DSP_MAP_IN_PROGRESS)
+		!= FD_MAP_DEFAULT) {
+		err = -EALREADY;
+		goto error;
+	}
 	/* Map DMA buffer on DSP*/
 
 	err = fastrpc_mem_map_to_dsp(fl, -1, 0, map->flags, 0, map->phys, map->size, &raddr);
 	if (err) {
 		pr_err("%s : failed to map buffer on DSP ", __func__);
+		/* Revert the map state to map default */
+		atomic_set(&map->state, FD_MAP_DEFAULT);
 		goto error;
 	}
 	map->raddr = raddr;
 	p.map->v_dsp_addr = raddr;
+	/* Set the map state to complete on successful mapping */
+	atomic_set(&map->state, FD_DSP_MAP_COMPLETE);
 error:
 	if (err && map) {
 		mutex_lock(&fl->map_mutex);
@@ -5017,7 +5131,6 @@ long fastrpc_dev_unmap_dma(struct fastrpc_device *dev,
 	struct fastrpc_map *map = NULL;
 	unsigned long irq_flags = 0;
 	struct fastrpc_channel_ctx * cctx = NULL;
-	int unlocked = 0;
 	spinlock_t *glock = &g_frpc.glock;
 
 	p.unmap = (struct fastrpc_dev_unmap_dma *)invoke_param;
@@ -5043,25 +5156,34 @@ long fastrpc_dev_unmap_dma(struct fastrpc_device *dev,
 
 	mutex_lock(&fl->remote_map_mutex);
 	mutex_lock(&fl->map_mutex);
-	if (!fastrpc_map_lookup(fl, -1, 0, 0, p.unmap->buf,
-				ADSP_MMAP_DMA_BUFFER, &map, false)) {
-		mutex_unlock(&fl->map_mutex);
-		unlocked = 1;
-		/* Un-map DMA buffer on DSP*/
-		err = fastrpc_req_munmap_dsp(fl, map->raddr, map->size);
-		if (err) {
-			pr_err("failed to unmap the buffer on DSP\n");
-			goto error;
-		}
-		if (unlocked)
-			mutex_lock(&fl->map_mutex);
-		fastrpc_map_put(map);
-		mutex_unlock(&fl->map_mutex);
-		unlocked = 1;
+	err = fastrpc_map_lookup(fl, -1, 0, 0, p.unmap->buf,
+				ADSP_MMAP_DMA_BUFFER, &map, false);
+	 /*
+	  * Check if DSP mapping is complete, then move the state to
+	  * unmap in progress only if there is no other ongoing unmap.
+	  */
+	if (!err && atomic_cmpxchg(&map->state, FD_DSP_MAP_COMPLETE,
+		FD_DSP_UNMAP_IN_PROGRESS) != FD_DSP_MAP_COMPLETE)
+		err = -EALREADY;
+	mutex_unlock(&fl->map_mutex);
+	if (err)
+		goto error;
+	/* Un-map DMA buffer on DSP*/
+	err = fastrpc_req_munmap_dsp(fl, map->raddr, map->size);
+	if (err) {
+		pr_err("Unmap on DSP failed for buf phy:0x%llx, raddr:0x%llx, size:0x%llx\n",
+			map->phys, map->raddr, map->size);
+		/* Revert the map state to map complete */
+		atomic_set(&map->state, FD_DSP_MAP_COMPLETE);
+		goto error;
 	}
+	/* Set the map state to default on successful unmapping */
+	atomic_set(&map->state, FD_MAP_DEFAULT);
+	mutex_lock(&fl->map_mutex);
+	fastrpc_map_put(map);
+	mutex_unlock(&fl->map_mutex);
+
 error:
-	if (!unlocked)
-		mutex_unlock(&fl->map_mutex);
 	spin_lock_irqsave(&cctx->lock, irq_flags);
 	if (fl) {
 		if (fl->state >= DSP_EXIT_START && fl->is_dma_invoke_pend) {
@@ -5427,7 +5549,8 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 	struct fastrpc_buf *buf = NULL;
 	struct iommu_domain *domain = NULL;
 	struct gen_pool *gen_pool = NULL;
-	int frpc_gen_addr_pool[2] = {0, 0}, smmu_alloc_range[2] = {0, 0};
+	int frpc_gen_addr_pool[2] = {0, 0};
+	u32 smmu_alloc_range[2] = {0, 0};
 	struct sg_table sgt;
 	struct fastrpc_smmu *smmucb = NULL;
 #ifdef CONFIG_DEBUG_FS
@@ -5498,7 +5621,7 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 
 	/* Set SMMU context bank, min and max allocation range */
 	if (!of_property_read_u32_array(dev->of_node, "alloc-size-range",
-							smmu_alloc_range, 2)) {
+							smmu_alloc_range, sizeof(smmu_alloc_range))) {
 		smmucb->minallocsize = smmu_alloc_range[0];
 		smmucb->maxallocsize = smmu_alloc_range[1];
 	}

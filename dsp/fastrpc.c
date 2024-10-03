@@ -2081,7 +2081,8 @@ static int fastrpc_internal_invoke(struct fastrpc_user *fl,  u32 kernel,
 wait:
 	if (fl->poll_mode &&
 		handle > FASTRPC_MAX_STATIC_HANDLE &&
-		fl->cctx->domain_id == CDSP_DOMAIN_ID &&
+		(fl->cctx->domain_id == CDSP_DOMAIN_ID ||
+		fl->cctx->domain_id == ADSP_DOMAIN_ID) &&
 		(fl->pd_type == USERPD || fl->pd_type == USER_UNSIGNEDPD_POOL))
 		ctx->rsp_flags = POLL_MODE;
 
@@ -3902,9 +3903,10 @@ static int fastrpc_manage_poll_mode(struct fastrpc_user *fl, u32 enable, u32 tim
 {
 	const unsigned int MAX_POLL_TIMEOUT_US = 10000;
 
-	if ((fl->cctx->domain_id != CDSP_DOMAIN_ID) || (fl->pd_type != USERPD &&
-			fl->pd_type != USER_UNSIGNEDPD_POOL)) {
-		dev_err(fl->cctx->dev,"poll mode only allowed for dynamic CDSP process\n");
+	if ((fl->cctx->domain_id != CDSP_DOMAIN_ID &&
+		fl->cctx->domain_id != ADSP_DOMAIN_ID) ||
+		(fl->pd_type != USERPD && fl->pd_type != USER_UNSIGNEDPD_POOL)) {
+		dev_err(fl->cctx->dev, "poll mode only allowed for dynamic CDSP and ADSP process\n");
 		return -EPERM;
 	}
 	if (timeout > MAX_POLL_TIMEOUT_US) {

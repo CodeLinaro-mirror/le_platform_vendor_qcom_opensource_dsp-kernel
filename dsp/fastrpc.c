@@ -2144,7 +2144,7 @@ bail:
 }
 
 static int fastrpc_mem_map_to_dsp(struct fastrpc_user *fl, int fd, int offset,
-				u32 flags, u32 va, u64 phys,
+				u32 flags, u64 va, u64 phys,
 				size_t size, uintptr_t *raddr)
 {
 	struct fastrpc_invoke_args args[4] = { [0 ... 3] = { 0 } };
@@ -2188,7 +2188,7 @@ static int fastrpc_mem_map_to_dsp(struct fastrpc_user *fl, int fd, int offset,
 	ioctl.inv.args = (__u64)args;
 	err = fastrpc_internal_invoke(fl, KERNEL_MSG_WITH_ZERO_PID, &ioctl);
 	if (err) {
-		dev_err(dev, "mem mmap error, fd %d, vaddr %x, size %lx, err 0x%x\n",
+		dev_err(dev, "mem mmap error, fd %d, vaddr %llx, size %zx, err 0x%x\n",
 			fd, va, size, err);
 		return err;
 	}

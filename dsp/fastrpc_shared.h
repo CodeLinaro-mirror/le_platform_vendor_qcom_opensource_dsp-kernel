@@ -740,6 +740,7 @@ struct fastrpc_invoke_ctx {
 	struct fastrpc_msg msg;
 	struct fastrpc_user *fl;
 	union fastrpc_remote_arg *rpra;
+	union fastrpc_remote_arg *outbufs;
 	struct fastrpc_map **maps;
 	struct fastrpc_buf *buf;
 	struct fastrpc_invoke_args *args;

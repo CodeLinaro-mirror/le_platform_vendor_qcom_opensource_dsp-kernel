@@ -309,6 +309,10 @@ int fastrpc_transport_send(struct fastrpc_channel_ctx *cctx, void *rpc_msg, uint
 		return -EPIPE;
 
 	err = rpmsg_send(cctx->rpdev->ept, rpc_msg, rpc_msg_size);
+	if (err == -EIO) {
+		pr_err("fastrpc: failed to send message due to SSR\n");
+		err = -EPIPE;
+	}
 	return err;
 }
 

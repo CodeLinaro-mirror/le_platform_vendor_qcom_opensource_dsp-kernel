@@ -1263,8 +1263,20 @@ static int fastrpc_map_create(struct fastrpc_user *fl, int fd,
 		sess = fl->secsctx;
 		pool_ctx = &fl->secsctx;
 		secure = true;
-	} else if (mflags == FASTRPC_MAP_FD_EXTENDED
-				|| mflags == FASTRPC_MAP_FD_DELAYED_EXTENDED) {
+	} else if (IS_EXTENDED_MAP_FLAG(mflags)) {
+		/*
+		 * Min page-size for extended mappings on DSP is 1MB and it increases in
+ 		 * multiples of 1MB. Min page-size for SMMU mappings is 2MB. Due to these
+		 * HW constraints, following size constraints are imposed for extended
+		 * mapping requests.
+		 */
+		if ((len < SMMU_2M) || (len % SMMU_1M != 0)) {
+			err = -EOPNOTSUPP;
+			dev_err(fl->cctx->dev,
+				"Error 0x%x: %s: Invalid size 0x%llx. Size should be a multiple of 0x%llx and greater than 0x%llx for map flag %d",
+				err, __func__, len, SMMU_1M, SMMU_2M, mflags);
+			goto attach_err;
+		}
 		sess = fl->extctx;
 		pool_ctx = &fl->extctx;
 		pd_type = EXT_MAP_PD_TYPE;
@@ -1355,6 +1367,18 @@ map_retry:
 	trace_fastrpc_dma_map(map->fl->cctx->domain_id, map->fd, map->phys,
 		map->size, map->len, map->attach->dma_map_attrs, map->flags);
 	mutex_unlock(&smmucb->map_mutex);
+
+	/*
+	 * Any mapping request with size > 2MB would be aligned to 2MB by SMMU.
+	 * Since that is the minimum size allowed for extended mapping requests,
+	 * validate that the returned iova is aligned as expected.
+	 */
+	if (IS_EXTENDED_MAP_FLAG(mflags) && !IS_ALIGNED(map->phys, SMMU_2M)) {
+		err = -EOPNOTSUPP;
+		dev_err(dev, "Error %d: %s: iova 0x%llx not aligned to 0x%llx for map flag %d",
+			err, __func__, map->phys, SMMU_2M, mflags);
+		goto assign_err;
+	}
 
 	if (attr & FASTRPC_ATTR_SECUREMAP) {
 		/*

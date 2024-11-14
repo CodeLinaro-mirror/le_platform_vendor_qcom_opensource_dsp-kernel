@@ -36,4 +36,4 @@ cdsp-loader-y := dsp/cdsp-loader.o
 obj-m := frpc-adsprpc.o cdsp-loader.o
 
 BOARD_VENDOR_KERNEL_MODULES += $(KERNEL_MODULES_OUT)/frpc-adsprpc.ko
-#BOARD_VENDOR_KERNEL_MODULES += $(KERNEL_MODULES_OUT)/cdsp-loader.ko
+BOARD_VENDOR_KERNEL_MODULES += $(KERNEL_MODULES_OUT)/cdsp-loader.ko

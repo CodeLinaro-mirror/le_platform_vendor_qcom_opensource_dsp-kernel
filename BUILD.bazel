@@ -7,7 +7,7 @@ package(
     ],
 )
 
-load(":define_modules.bzl", "define_modules")
+load(":define_modules.bzl", "define_modules", "define_vm_modules")
 
 define_modules("pineapple", "consolidate")
 
@@ -21,17 +21,17 @@ define_modules("sun", "consolidate")
 
 define_modules("sun", "perf")
 
-define_modules("sun-tuivm", "debug-defconfig")
-define_modules("sun-oemvm", "debug-defconfig")
+define_vm_modules("sun-tuivm", "debug-defconfig")
+define_vm_modules("sun-oemvm", "debug-defconfig")
 
-define_modules("sun-tuivm", "defconfig")
-define_modules("sun-oemvm", "defconfig")
+define_vm_modules("sun-tuivm", "defconfig")
+define_vm_modules("sun-oemvm", "defconfig")
 
-define_modules("canoe-tuivm", "debug-defconfig")
-define_modules("canoe-oemvm", "debug-defconfig")
+define_vm_modules("canoe-tuivm", "debug-defconfig")
+define_vm_modules("canoe-oemvm", "debug-defconfig")
 
-define_modules("canoe-tuivm", "defconfig")
-define_modules("canoe-oemvm", "defconfig")
+define_vm_modules("canoe-tuivm", "defconfig")
+define_vm_modules("canoe-oemvm", "defconfig")
 
 define_modules("tuna", "consolidate")
 

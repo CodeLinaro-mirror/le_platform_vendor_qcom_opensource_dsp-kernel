@@ -1,4 +1,6 @@
-KBUILD_OPTIONS += DSP_ROOT=$(KERNEL_SRC)/$(M) V=1
+CUR_MKFILE=$(abspath $(lastword $(MAKEFILE_LIST)))
+DSP_ROOT=$(dir $(CUR_MKFILE))
+KBUILD_OPTIONS += DSP_ROOT=$(DSP_ROOT) V=1
 
 all:
 	$(MAKE) -C $(KERNEL_SRC) M=$(M) modules $(KBUILD_OPTIONS)

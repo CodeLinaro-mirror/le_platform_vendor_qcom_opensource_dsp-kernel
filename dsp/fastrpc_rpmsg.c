@@ -26,8 +26,9 @@ int fastrpc_setup_service_locator(struct fastrpc_channel_ctx *cctx, char *client
 					char *service_name, char *service_path, int spd_session);
 void fastrpc_register_wakeup_source(struct device *dev,
 	const char *client_name, struct wakeup_source **device_wake_source);
-int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx);
+int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx, bool is_pdr);
 void fastrpc_queue_pd_status(struct fastrpc_user *fl, int domain, int status, int sessionid);
+void frpc_coredump(struct fastrpc_channel_ctx *cctx);
 
 struct fastrpc_channel_ctx* get_current_channel_ctx(struct device *dev)
 {
@@ -215,7 +216,7 @@ populate_error:
 static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 {
 	struct fastrpc_channel_ctx *cctx = dev_get_drvdata(&rpdev->dev);
-	struct fastrpc_user *user;
+	struct fastrpc_user *user, *n;
 	unsigned long flags;
 	int i = 0;
 
@@ -225,7 +226,10 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	spin_lock_irqsave(&cctx->lock, flags);
 	atomic_set(&cctx->teardown, 1);
 	cctx->staticpd_status = false;
-	list_for_each_entry(user, &cctx->users, user) {
+	spin_unlock_irqrestore(&cctx->lock, flags);
+	frpc_coredump(cctx);
+	spin_lock_irqsave(&cctx->lock, flags);
+	list_for_each_entry_safe(user,  n, &cctx->users, user) {
 		fastrpc_queue_pd_status(user, cctx->domain_id, FASTRPC_DSP_SSR, user->sessionid);
 		fastrpc_notify_users(user);
 	}
@@ -260,7 +264,7 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	 * be removed. So free all SMMU mappings of every process using this
 	 * channel to avoid any UAF later.
 	 */
-	list_for_each_entry(user, &cctx->users, user) {
+	list_for_each_entry_safe(user, n, &cctx->users, user) {
 		fastrpc_free_user(user);
 	}
 
@@ -278,7 +282,7 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	dev_info(cctx->dev, "Closing rpmsg channel for %s", domains[cctx->domain_id]);
 	kfree(cctx->gidlist.gids);
 	of_platform_depopulate(&rpdev->dev);
-	fastrpc_mmap_remove_ssr(cctx);
+	fastrpc_mmap_remove_ssr(cctx, false);
 	cctx->dev = NULL;
 	cctx->rpdev = NULL;
 	// Wake up all process releases, if waiting for SSR to complete

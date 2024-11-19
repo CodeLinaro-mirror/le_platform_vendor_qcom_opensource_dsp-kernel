@@ -289,6 +289,9 @@
 #define OIS_PDR_ADSP_SERVICE_NAME              "tms/servreg"
 #define ADSP_OISPD_NAME                        "msm/adsp/ois_pd"
 
+#define DBG_FS_SIZE (200*1024)
+#define NUM_DUMPED (128)
+
 #define PERF_END ((void)0)
 
 #define PERF(enb, cnt, ff) \
@@ -447,6 +450,23 @@ enum fastrpc_map_state {
 	FD_DSP_MAP_COMPLETE,
 	/* Initiated DSP unmapping */
 	FD_DSP_UNMAP_IN_PROGRESS,
+};
+
+enum fastrpc_dump_type {
+	CMA = 0,
+	DEBUGFS = 1,
+	INIT_MEM = 2,
+};
+
+struct fastrpc_dump_info{
+	/* Type of memory dumped */
+	enum fastrpc_dump_type type;
+	/* Offset at which is a particular memory dumped*/
+	u64 offset;
+	/* Length of memory dumped */
+	u64 size;
+	/*ipa of memory dumped */
+	u64 phys;
 };
 
 struct fastrpc_socket {

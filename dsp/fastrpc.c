@@ -3,6 +3,7 @@
  * Copyright (c) 2018, Linaro Limited
  * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
+#include <linux/devcoredump.h>
 #include <linux/completion.h>
 #include <linux/device.h>
 #include <linux/dma-buf.h>
@@ -2322,7 +2323,30 @@ static void fastrpc_check_privileged_process(struct fastrpc_user *fl,
 	}
 }
 
-int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx)
+static int fastrpc_remote_heap_unassign(struct fastrpc_channel_ctx *cctx, struct fastrpc_buf *buf)
+{
+	u64 src_perms = 0;
+	struct qcom_scm_vmperm dst_perms;
+	int i, err = 0;
+
+	if (cctx->vmcount) {
+		for (i = 0; i < cctx->vmcount; i++)
+			src_perms |= BIT(cctx->vmperms[i].vmid);
+
+		dst_perms.vmid = QCOM_SCM_VMID_HLOS;
+		dst_perms.perm = QCOM_SCM_PERM_RWX;
+		err = qcom_scm_assign_mem(buf->phys, (u64)buf->size,
+					&src_perms, &dst_perms, 1);
+		if (err) {
+			dev_err(cctx->dev, "%s: Failed to assign memory with phys 0x%llx size 0x%llx err %d\n",
+				__func__, buf->phys, buf->size, err);
+			return err;
+		}
+	}
+	return 0;
+}
+
+int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx, bool is_pdr)
 {
 	struct fastrpc_buf *buf, *b, *match;
 	unsigned long flags;
@@ -2340,27 +2364,16 @@ int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx)
 		if (!match)
 			return 0;
 
-		if (cctx->vmcount) {
-			u64 src_perms = 0;
-			struct qcom_scm_vmperm dst_perms;
-			u32 i;
-
-			for (i = 0; i < cctx->vmcount; i++)
-				src_perms |= BIT(cctx->vmperms[i].vmid);
-
-			dst_perms.vmid = QCOM_SCM_VMID_HLOS;
-			dst_perms.perm = QCOM_SCM_PERM_RWX;
-			err = qcom_scm_assign_mem(match->phys, (u64)match->size,
-							&src_perms, &dst_perms, 1);
+		if (is_pdr) {
+			err = fastrpc_remote_heap_unassign(cctx, match);
 			if (err) {
-				dev_err(cctx->dev, "%s: Failed to assign memory with phys 0x%llx size 0x%llx err %d",
-					__func__, match->phys, match->size, err);
 				spin_lock_irqsave(&cctx->lock, flags);
 				list_add_tail(&match->node, &cctx->gmaps);
 				spin_unlock_irqrestore(&cctx->lock, flags);
 				return err;
 			}
 		}
+
 		__fastrpc_buf_free(match);
 
 	} while (match);
@@ -2464,7 +2477,6 @@ static int fastrpc_init_sensor_static_pd_status(struct fastrpc_user *fl)
 	return err;
 }
 
-#ifdef CONFIG_DEBUG_FS
 void print_buf_info(struct seq_file *s_file, struct fastrpc_buf *buf)
 {
     seq_printf(s_file,"\n %s %2s 0x%p", "virt", ":", buf->virt);
@@ -2647,7 +2659,7 @@ static int fastrpc_debugfs_show(struct seq_file *s_file, void *data)
 	}
 	return 0;
 }
-
+#ifdef CONFIG_DEBUG_FS
 DEFINE_SHOW_ATTRIBUTE(fastrpc_debugfs);
 
 static int fastrpc_create_session_debugfs(struct fastrpc_user *fl)
@@ -2766,7 +2778,7 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 		 * Remove any previous mappings in case process is trying
 		 * to reconnect after a PD restart on remote subsystem.
 		 */
-		err = fastrpc_mmap_remove_ssr(fl->cctx);
+		err = fastrpc_mmap_remove_ssr(fl->cctx, true);
 		if (err) {
 			pr_warn("%s: %s: failed to unmap remote heap (err %d)\n",
 				current->comm, __func__, err);
@@ -6154,6 +6166,117 @@ static void fastrpc_pdr_cb(int state, char *service_path, void *priv)
 		break;
 	}
 	return;
+}
+
+static inline void populate_dump_metadata(struct fastrpc_dump_info *entry,
+		u64 offset, u64 size, enum fastrpc_dump_type type, u64 addr)
+{
+	entry->offset = offset;
+	entry->size = size;
+	entry->type = type;
+	entry->phys = addr;
+}
+
+void frpc_coredump(struct fastrpc_channel_ctx *cctx)
+{
+	int iter = 0, err = 0;
+	bool scm_done = false;
+	struct device *dev = cctx->dev;
+	char *pos = NULL, *dump = NULL;
+	u64 total_size = 0, offset = 0;
+	struct fastrpc_user *user, *n;
+	struct seq_file *s_file = NULL;
+	struct fastrpc_dump_info *dinfo;
+	struct fastrpc_buf *buf, *b;
+
+	list_for_each_entry_safe(buf, b, &cctx->gmaps, node)
+		total_size += buf->size;
+
+	list_for_each_entry_safe(user, n, &cctx->users, user) {
+		total_size += DBG_FS_SIZE;
+		if (user->init_mem)
+			total_size += user->init_mem->size;
+	}
+
+	total_size += NUM_DUMPED * sizeof(struct fastrpc_dump_info);
+	dump = vmalloc(total_size);
+	if (!dump) {
+		err = -ENOMEM;
+		goto bail;
+	}
+	pos = dump;
+	dinfo = (struct fastrpc_dump_info *)dump;
+	pos += NUM_DUMPED * sizeof(struct fastrpc_dump_info);
+	offset += NUM_DUMPED * sizeof(struct fastrpc_dump_info);
+
+	list_for_each_entry_safe(buf, b, &cctx->gmaps, node) {
+		err = fastrpc_remote_heap_unassign(cctx, buf);
+		if (err) {
+			list_del(&buf->node);
+			continue;
+		}
+		if ((dump + total_size) - pos >= buf->size) {
+			memcpy(pos, buf->virt, buf->size);
+			populate_dump_metadata(&dinfo[iter], offset, buf->size,
+				CMA, buf->phys);
+			pos += buf->size;
+			iter += 1;
+			offset += buf->size;
+		}
+	}
+	scm_done = true;
+	s_file = kzalloc(sizeof(*s_file), GFP_KERNEL);
+	if (!s_file) {
+		err = -ENOMEM;
+		goto bail;
+	}
+	s_file->size = DBG_FS_SIZE;
+
+	list_for_each_entry_safe(user, n, &cctx->users, user) {
+		s_file->private = user;
+		if ((dump + total_size) - pos >= DBG_FS_SIZE)
+			s_file->buf = pos;
+		else {
+			err = -EFAULT;
+			goto bail;
+		}
+		fastrpc_debugfs_show(s_file, NULL);
+		if (s_file->buf) {
+			memcpy(pos, s_file->buf, DBG_FS_SIZE);
+			populate_dump_metadata(&dinfo[iter], offset, DBG_FS_SIZE, DEBUGFS, 0);
+			pos += DBG_FS_SIZE;
+			iter += 1;
+			offset += DBG_FS_SIZE;
+		}
+		if (user->init_mem) {
+			if ((dump + total_size) - pos >= user->init_mem->size) {
+				memcpy(pos, user->init_mem->virt, user->init_mem->size);
+				populate_dump_metadata(&dinfo[iter], offset, user->init_mem->size,
+					INIT_MEM, user->init_mem->phys);
+				pos += user->init_mem->size;
+				iter += 1;
+				offset += user->init_mem->size;
+			} else {
+				err = -EFAULT;
+				goto bail;
+			}
+		}
+	}
+
+	dev_coredumpv(dev, dump, total_size, GFP_KERNEL);
+bail:
+	if (!scm_done) {
+		list_for_each_entry_safe(buf, b, &cctx->gmaps, node) {
+			err = fastrpc_remote_heap_unassign(cctx, buf);
+			if (err) {
+				list_del(&buf->node);
+			}
+		}
+	}
+	if (err)
+		pr_err("%s : Failed to dump user data for iter %d err %d\n",
+					__func__, iter, err);
+	kfree(s_file);
 }
 
 static const struct file_operations fastrpc_fops = {

@@ -7042,12 +7042,14 @@ void fastrpc_register_wakeup_source(struct device *dev,
 static void fastrpc_notify_user_ctx(struct fastrpc_invoke_ctx *ctx, int retval,
 		u32 rsp_flags, u32 early_wake_time)
 {
-	if (ctx->cctx && !atomic_read(&ctx->cctx->teardown))
-		fastrpc_pm_awake(ctx->fl, ctx->cctx->secure);
+	if (ctx->cctx) {
+		if (!atomic_read(&ctx->cctx->teardown))
+			fastrpc_pm_awake(ctx->fl, ctx->cctx->secure);
+		trace_fastrpc_context_complete(ctx->cctx->domain_id, (uint64_t)ctx,
+			retval, ctx->ctxid, ctx->pid, ctx->sc);
+	}
 	ctx->retval = retval;
 	ctx->rsp_flags = (enum fastrpc_response_flags)rsp_flags;
-	trace_fastrpc_context_complete(ctx->cctx->domain_id, (uint64_t)ctx,
-			retval, ctx->ctxid, ctx->pid, ctx->sc);
 	switch (rsp_flags) {
 	case NORMAL_RESPONSE:
 	case COMPLETE_SIGNAL:

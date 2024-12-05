@@ -4545,6 +4545,81 @@ static int fastrpc_multidomain_ctx_manage(struct fastrpc_user *fl,
 	return err;
 }
 
+/* Make rpc call to dsp to trigger a dump of remote-process state */
+static int fastrpc_remote_process_state_dump(struct fastrpc_user *fl,
+	struct fastrpc_ioctl_remote_proc_state_dump *proc)
+{
+	int err = 0, fd = proc->fd;
+	s32 tgid_frpc = -1;
+	u32 domain = proc->domain, session = proc->session;
+	struct device *dev = fl->cctx->dev;
+	struct fastrpc_enhanced_invoke invoke = {0};
+	struct fastrpc_invoke_args args[2] = {0};
+	struct fastrpc_map *map = NULL;
+	struct fastrpc_phy_page page = {0};
+	struct {
+		s32 tgid_frpc;
+		u32 flags;
+		s32 num_pages;
+	} inargs = {0};
+
+	/* Validate domain and session id passed by user-app */
+	if (!IS_VALID_DOMAIN_ID(domain) || !IS_VALID_SESSION_ID(session)) {
+		err = -EBADR;
+		dev_err(dev, "Error %d: %s: domain %u or session %u is invalid",
+			err, __func__, domain, session);
+		return err;
+	}
+
+	/* Retrieve the fastrpc pid of the session */
+	err = fastrpc_get_frpc_tgid(domain, session, &tgid_frpc);
+	if (err) {
+		dev_err(dev, "Error %d: %s: failed to get frpc tgid for domain %u, session %u",
+			err, __func__, domain, session);
+		return err;
+	}
+
+	/* Create smmu mapping of user's string buffer */
+	mutex_lock(&fl->map_mutex);
+	err = fastrpc_map_create(fl, fd, 0, NULL, proc->size, 0, 0,
+			&map, true);
+	mutex_unlock(&fl->map_mutex);
+	if (err) {
+		dev_err(dev, "Error %d: %s: smmu map failed for log-buf fd %d, size %u",
+			err, __func__, fd, proc->size);
+		return err;
+	}
+
+	/* Prepare args for kernel rpc call to rootpd */
+	inargs.tgid_frpc = tgid_frpc;
+	inargs.flags = proc->level;
+	inargs.num_pages = 1;
+
+	args[0].ptr = (u64)(uintptr_t)&inargs;
+	args[0].length = sizeof(inargs);
+	args[0].fd = -1;
+
+	page.addr = map->phys;
+	page.size = map->size;
+	args[1].ptr = (u64)(uintptr_t)&page;
+	args[1].length = sizeof(page) * inargs.num_pages;
+	args[1].fd = -1;
+
+	invoke.inv.handle = FASTRPC_INIT_HANDLE;
+	invoke.inv.sc = FASTRPC_SCALARS(FASTRPC_RMID_INIT_PROCESS_DUMP, 2, 0);
+	invoke.inv.args = (__u64)args;
+
+	/* Make rpc call to rootpd to dump remote process state */
+	err = fastrpc_internal_invoke(fl, KERNEL_MSG_WITH_ZERO_PID, &invoke);
+
+	if (map) {
+		mutex_lock(&fl->map_mutex);
+		fastrpc_map_put(map);
+		mutex_unlock(&fl->map_mutex);
+	}
+	return err;
+}
+
 static int fastrpc_dspsignal_signal(struct fastrpc_user *fl,
 			     struct fastrpc_internal_dspsignal *fsig)
 {
@@ -4793,6 +4868,7 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 	struct fastrpc_internal_config config;
 	struct fastrpc_internal_sessinfo sessinfo;
 	struct fastrpc_ioctl_mdctx_manage ctxm = {0};
+	struct fastrpc_ioctl_remote_proc_state_dump proc = {0};
 	u32 multisession, size = 0;
 	u64 *perf_kernel;
 	int err = 0;
@@ -4869,6 +4945,12 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 			sizeof(ctxm)))
 			return -EFAULT;
 		err = fastrpc_multidomain_ctx_manage(fl, &ctxm);
+		break;
+	case FASTRPC_INVOKE_REMOTE_PROCESS_STATE_DUMP:
+		if (copy_from_user(&proc, (void __user *)(uintptr_t)invoke.invparam,
+			sizeof(proc)))
+			return -EFAULT;
+		err = fastrpc_remote_process_state_dump(fl, &proc);
 		break;
 	default:
 		err = -ENOTTY;

@@ -2623,9 +2623,9 @@ static int fastrpc_debugfs_show(struct seq_file *s_file, void *data)
 				print_map_info(s_file, map);
 		}
 		seq_printf(s_file,"\n=============== Kernel maps ===============\n");
-		list_for_each_entry(map, &fl->mmaps, node) {
-			if (map)
-				print_map_info(s_file, map);
+		list_for_each_entry(buf, &fl->mmaps, node) {
+			if (buf)
+				print_buf_info(s_file, buf);
 		}
 		seq_printf(s_file,"\n=============== Cached Bufs ===============\n");
 		list_for_each_entry_safe(buf, n, &fl->cached_bufs, node) {

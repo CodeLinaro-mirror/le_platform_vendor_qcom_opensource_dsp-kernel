@@ -19,18 +19,27 @@ def define_modules(target, variant, build_loader):
         ":{}_cdsp-loader".format(kernel_build_variant),
         ]
 
-    # Path to dsp folder from soc-repo/include/trace directory
-    trace_include_path = "../../../{}/dsp".format(native.package_name())
-
-    ddk_module(
-        name = "{}_frpc-adsprpc".format(kernel_build_variant),
-        kernel_build = "//soc-repo:{}_base_kernel".format(kernel_build_variant),
-        deps = [
+    kernel_build = select({
+        "//build/kernel/kleaf:socrepo_true": "//soc-repo:{}_base_kernel".format(kernel_build_variant),
+        "//build/kernel/kleaf:socrepo_false": "//msm-kernel:{}".format(kernel_build_variant),
+    })
+    ddk_deps = select({
+        "//build/kernel/kleaf:socrepo_true":[
             "//soc-repo:all_headers",
             "//soc-repo:{}/drivers/firmware/qcom/qcom-scm".format(kernel_build_variant),
             "//soc-repo:{}/drivers/soc/qcom/mem_buf/mem_buf_dev".format(kernel_build_variant),
             "//soc-repo:{}/drivers/soc/qcom/pdr_interface".format(kernel_build_variant),
         ],
+        "//build/kernel/kleaf:socrepo_false": ["//msm-kernel:all_headers"],
+    })
+
+    # Path to dsp folder from soc-repo/include/trace directory
+    trace_include_path = "../../../{}/dsp".format(native.package_name())
+
+    ddk_module(
+        name = "{}_frpc-adsprpc".format(kernel_build_variant),
+        kernel_build = kernel_build,
+        deps = ddk_deps,
         srcs = [
             "dsp/fastrpc.c",
             "dsp/fastrpc_rpmsg.c",
@@ -72,17 +81,27 @@ def define_modules(target, variant, build_loader):
 def define_vm_modules(target, variant):
     kernel_build_variant = "{}_{}".format(target, variant)
 
+    kernel_build = select({
+        "//build/kernel/kleaf:socrepo_true": "//soc-repo:{}_base_kernel".format(kernel_build_variant),
+        "//build/kernel/kleaf:socrepo_false": "//msm-kernel:{}".format(kernel_build_variant),
+    })
+
+    deps = select({
+        "//build/kernel/kleaf:socrepo_true": [
+            "//soc-repo:all_headers",
+            "//soc-repo:{}/drivers/firmware/qcom/qcom-scm".format(kernel_build_variant),
+            "//soc-repo:{}/drivers/soc/qcom/mem_buf/mem_buf_dev".format(kernel_build_variant),
+            ] ,
+        "//build/kernel/kleaf:socrepo_false": ["//msm-kernel:all_headers"],
+    })
+
     # Path to dsp folder from soc-repo/include/trace directory
     trace_include_path = "../../../{}/dsp".format(native.package_name())
 
     ddk_module(
         name = "{}_frpc-trusted-adsprpc".format(kernel_build_variant),
-        kernel_build = "//soc-repo:{}_base_kernel".format(kernel_build_variant),
-        deps = [
-            "//soc-repo:all_headers",
-            "//soc-repo:{}/drivers/firmware/qcom/qcom-scm".format(kernel_build_variant),
-            "//soc-repo:{}/drivers/soc/qcom/mem_buf/mem_buf_dev".format(kernel_build_variant),
-        ],
+        kernel_build = kernel_build,
+        deps = deps,
         srcs = [
             "dsp/fastrpc.c",
             "dsp/fastrpc_socket.c",

@@ -2579,11 +2579,12 @@ static int fastrpc_debugfs_show(struct seq_file *s_file, void *data)
 		seq_printf(s_file,"%s %9s %d\n", "pd_type", ":", fl->pd_type);
 		seq_printf(s_file,"%s %9s %d\n",  "profile", ":", fl->profile);
 
-		if(fl->cctx) {
-			seq_printf(s_file,"\n=============== Channel Context ===============\n");
-			ctx = fl->cctx;
-			print_ctx_info(s_file, ctx);
-		}
+                if(!fl->cctx)
+                   return 0;
+
+                seq_printf(s_file,"\n=============== Channel Context ===============\n");
+		ctx = fl->cctx;
+		print_ctx_info(s_file, ctx);
 		if(fl->sctx) {
 			seq_printf(s_file,"\n=============== Session Context ===============\n");
 			sctx = fl->sctx;
@@ -2667,7 +2668,7 @@ static int fastrpc_create_session_debugfs(struct fastrpc_user *fl)
 
 	memcpy(cur_comm, current->comm, TASK_COMM_LEN);
 	cur_comm[TASK_COMM_LEN-1] = '\0';
-	if (debugfs_root != NULL) {
+	if (debugfs_root != NULL && fl != NULL) {
 		domain_id = fl->cctx->domain_id;
 		if (!(fl->debugfs_file_create)) {
 			size = strlen(cur_comm) + strlen("_")
@@ -3182,7 +3183,6 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	}
 
 #ifdef CONFIG_DEBUG_FS
-	if (fl != NULL)
 		fastrpc_create_session_debugfs(fl);
 #endif
 	/* remove buffer on success as no longer required */
@@ -3316,6 +3316,7 @@ static int fastrpc_device_release(struct inode *inode, struct file *file)
 	bool locked = false, is_driver_registered = false;
 	spinlock_t *glock = &g_frpc.glock;
 	int err = 0;
+	struct fastrpc_notif_rsp *inotif, *n1;
 
 	spin_lock_irqsave(glock, irq_flags);
 	spin_lock_irqsave(&cctx->lock, flags);
@@ -3396,6 +3397,11 @@ static int fastrpc_device_release(struct inode *inode, struct file *file)
 	spin_lock_irqsave(&fl->proc_state_notif.nqlock, flags);
 	atomic_add(1, &fl->proc_state_notif.notif_queue_count);
 	wake_up_interruptible(&fl->proc_state_notif.notif_wait_queue);
+	list_for_each_entry_safe(inotif, n1, &fl->notif_queue, notifn) {
+		list_del_init(&inotif->notifn);
+		atomic_sub(1, &fl->proc_state_notif.notif_queue_count);
+		kfree(inotif);
+	}
 	spin_unlock_irqrestore(&fl->proc_state_notif.nqlock, flags);
 
 	if (fl->tgid_frpc != -1)
@@ -3663,7 +3669,6 @@ static int fastrpc_init_attach(struct fastrpc_user *fl, int pd)
 		return err;
 
 #ifdef CONFIG_DEBUG_FS
-	if (fl != NULL)
 		fastrpc_create_session_debugfs(fl);
 #endif
 	return 0;
@@ -3740,6 +3745,8 @@ read_notif_status:
 				atomic_read(&fl->proc_state_notif.notif_queue_count));
 	if (err)
 		return err;
+	if (fl->exit_notif)
+		return -EFAULT;
 
 	spin_lock_irqsave(&fl->proc_state_notif.nqlock, flags);
 	list_for_each_entry_safe(inotif, n, &fl->notif_queue, notifn) {
@@ -3812,6 +3819,7 @@ static int fastrpc_internal_control(struct fastrpc_user *fl,
 	int err = 0, ret = 0;
 	struct fastrpc_channel_ctx *cctx = fl->cctx;
 	u32 latency = 0, cpu = 0;
+	unsigned long flags = 0;
 
 	if (!fl) {
 		return -EBADF;
@@ -3891,6 +3899,13 @@ static int fastrpc_internal_control(struct fastrpc_user *fl,
 		break;
 	case FASTRPC_CONTROL_RPC_POLL:
 		err = fastrpc_manage_poll_mode(fl, cp->lp.enable, cp->lp.latency);
+		break;
+	case FASTRPC_CONTROL_NOTIF_WAKE:
+		fl->exit_notif = true;
+		spin_lock_irqsave(&fl->proc_state_notif.nqlock, flags);
+		atomic_add(1, &fl->proc_state_notif.notif_queue_count);
+		wake_up_interruptible(&fl->proc_state_notif.notif_wait_queue);
+		spin_unlock_irqrestore(&fl->proc_state_notif.nqlock, flags);
 		break;
 	default:
 		err = -EBADRQC;
@@ -5984,7 +5999,9 @@ void fastrpc_register_wakeup_source(struct device *dev,
 static void fastrpc_notify_user_ctx(struct fastrpc_invoke_ctx *ctx, int retval,
 		u32 rsp_flags, u32 early_wake_time)
 {
-	if (ctx->cctx && !atomic_read(&ctx->cctx->teardown))
+        if(!ctx->cctx)
+           return;
+	if (!atomic_read(&ctx->cctx->teardown))
 		fastrpc_pm_awake(ctx->fl, ctx->cctx->secure);
 	ctx->retval = retval;
 	ctx->rsp_flags = (enum fastrpc_response_flags)rsp_flags;

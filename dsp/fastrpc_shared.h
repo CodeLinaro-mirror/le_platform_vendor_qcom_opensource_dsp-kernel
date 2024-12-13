@@ -885,6 +885,8 @@ struct fastrpc_user {
 	bool set_session_info;
 	/* Various states throughout process life cycle */
 	atomic_t state;
+	/* Flag to indicate notif thread exit requested */
+	bool exit_notif;
 };
 
 struct fastrpc_ctrl_latency {

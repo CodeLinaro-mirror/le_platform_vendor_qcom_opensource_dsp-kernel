@@ -373,6 +373,18 @@ enum fastrpc_response_flags {
 	POLL_MODE = 5,
 };
 
+/* To maintain the dsp map current state */
+enum fastrpc_map_state {
+	/* Default smmu/global mapping */
+	FD_MAP_DEFAULT = 0,
+	/* Initiated DSP mapping */
+	FD_DSP_MAP_IN_PROGRESS,
+	/* Completed DSP mapping */
+	FD_DSP_MAP_COMPLETE,
+	/* Initiated DSP unmapping */
+	FD_DSP_UNMAP_IN_PROGRESS,
+};
+
 struct fastrpc_socket {
 	struct socket *sock;                   // Socket used to communicate with remote domain
 	struct sockaddr_qrtr local_sock_addr;  // Local socket address on kernel side
@@ -572,6 +584,7 @@ struct fastrpc_map {
 	u32 flags;
 	struct kref refcount;
 	int secure;
+	atomic_t state;
 };
 
 struct fastrpc_perf {
@@ -727,6 +740,7 @@ struct fastrpc_invoke_ctx {
 	struct fastrpc_msg msg;
 	struct fastrpc_user *fl;
 	union fastrpc_remote_arg *rpra;
+	union fastrpc_remote_arg *outbufs;
 	struct fastrpc_map **maps;
 	struct fastrpc_buf *buf;
 	struct fastrpc_invoke_args *args;
@@ -871,6 +885,8 @@ struct fastrpc_user {
 	bool set_session_info;
 	/* Various states throughout process life cycle */
 	atomic_t state;
+	/* Flag to indicate notif thread exit requested */
+	bool exit_notif;
 };
 
 struct fastrpc_ctrl_latency {
@@ -929,6 +945,7 @@ int fastrpc_device_register(struct device *dev, struct fastrpc_channel_ctx *cctx
 				bool is_secured, const char *domain);
 struct fastrpc_channel_ctx* get_current_channel_ctx(struct device *dev);
 void fastrpc_notify_users(struct fastrpc_user *user);
+void fastrpc_ssr_dspsignal_cancel_wait(struct fastrpc_user *fl);
 
 /* Function to clean all SMMU mappings associated with a fastrpc user obj */
 void fastrpc_free_user(struct fastrpc_user *fl);

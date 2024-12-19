@@ -43,12 +43,20 @@ KBUILD_CPPFLAGS += -DCONFIG_DSP_CANOE=1
 ccflags-y += -DCONFIG_DSP_CANOE=1
 endif
 
+ifeq ($(CONFIG_ARCH_SERAPH), y)
+$(info within KBUILD file CONFIG_ARCH_SERAPH = $(CONFIG_ARCH_SERAPH))
+KBUILD_CPPFLAGS += -DCONFIG_DSP_SERAPH=1
+ccflags-y += -DCONFIG_DSP_SERAPH=1
+endif
+
 LINUXINCLUDE += -I$(DSP_ROOT)/include/linux
 LINUXINCLUDE += -I$(DSP_ROOT)/include/uapi
 
 frpc-adsprpc-y := dsp/fastrpc.o	\
 			 dsp/fastrpc_rpmsg.o \
 
-obj-m := frpc-adsprpc.o
+cdsp-loader-y := dsp/cdsp-loader.o
+
+obj-m := frpc-adsprpc.o cdsp-loader.o
 
 BOARD_VENDOR_KERNEL_MODULES += $(KERNEL_MODULES_OUT)/frpc-adsprpc.ko

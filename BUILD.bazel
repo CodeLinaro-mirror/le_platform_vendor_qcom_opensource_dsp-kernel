@@ -56,3 +56,7 @@ define_modules("parrot", "gki")
 define_modules("canoe", "perf")
 
 define_modules("canoe", "consolidate")
+
+define_modules("seraph", "consolidate")
+
+define_modules("seraph", "gki")

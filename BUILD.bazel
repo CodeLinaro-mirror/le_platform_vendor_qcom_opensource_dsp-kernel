@@ -9,17 +9,17 @@ package(
 
 load(":define_modules.bzl", "define_modules", "define_vm_modules")
 
-define_modules("pineapple", "consolidate")
+define_modules("pineapple", "consolidate", "no")
 
-define_modules("pineapple", "gki")
+define_modules("pineapple", "gki", "no")
 
-define_modules("blair", "consolidate")
+define_modules("blair", "consolidate", "no")
 
-define_modules("blair", "gki")
+define_modules("blair", "gki", "no")
 
-define_modules("sun", "consolidate")
+define_modules("sun", "consolidate", "no")
 
-define_modules("sun", "perf")
+define_modules("sun", "perf", "no")
 
 define_vm_modules("sun-tuivm", "debug-defconfig")
 define_vm_modules("sun-oemvm", "debug-defconfig")
@@ -33,30 +33,34 @@ define_vm_modules("canoe-oemvm", "debug-defconfig")
 define_vm_modules("canoe-tuivm", "defconfig")
 define_vm_modules("canoe-oemvm", "defconfig")
 
-define_modules("tuna", "consolidate")
+define_modules("tuna", "consolidate", "no")
 
-define_modules("tuna", "perf")
+define_modules("tuna", "perf", "no")
 
-define_modules("kera", "consolidate")
+define_modules("kera", "consolidate", "no")
 
-define_modules("kera", "perf")
+define_modules("kera", "perf", "no")
 
-define_modules("niobe", "consolidate")
+define_modules("niobe", "consolidate", "no")
 
-define_modules("niobe", "gki")
+define_modules("niobe", "gki", "no")
 
-define_modules("monaco", "consolidate")
+define_modules("monaco", "consolidate", "no")
 
-define_modules("monaco", "gki")
+define_modules("monaco", "gki", "no")
 
-define_modules("parrot", "consolidate")
+define_modules("parrot", "consolidate", "no")
 
-define_modules("parrot", "gki")
+define_modules("parrot", "gki", "no")
 
-define_modules("canoe", "perf")
+define_modules("canoe", "perf", "no")
 
-define_modules("canoe", "consolidate")
+define_modules("canoe", "consolidate", "no")
 
-define_modules("seraph", "consolidate")
+define_modules("seraph", "consolidate", "yes")
 
-define_modules("seraph", "gki")
+define_modules("seraph", "gki", "yes")
+
+define_modules("vienna", "perf", "no")
+
+define_modules("vienna", "consolidate", "no")

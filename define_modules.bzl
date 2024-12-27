@@ -10,8 +10,14 @@ load(
     "kernel_modules_install",
 )
 
-def define_modules(target, variant):
+def define_modules(target, variant, build_loader):
     kernel_build_variant = "{}_{}".format(target, variant)
+    data = [
+        ":{}_frpc-adsprpc".format(kernel_build_variant),]
+    if build_loader == "yes":
+        data += [
+        ":{}_cdsp-loader".format(kernel_build_variant),
+        ]
 
     # Path to dsp folder from soc-repo/include/trace directory
     trace_include_path = "../../../{}/dsp".format(native.package_name())
@@ -43,11 +49,18 @@ def define_modules(target, variant):
         ],
     )
 
+    if build_loader == "yes":
+        ddk_module(
+            name = "{}_cdsp-loader".format(kernel_build_variant),
+            kernel_build = "//msm-kernel:{}".format(kernel_build_variant),
+            deps = ["//msm-kernel:all_headers"],
+            srcs = ["dsp/cdsp-loader.c"],
+            out = "cdsp-loader.ko",
+        )
+
     copy_to_dist_dir(
         name = "{}_dsp-kernel_dist".format(kernel_build_variant),
-        data = [
-            ":{}_frpc-adsprpc".format(kernel_build_variant),
-        ],
+        data = data,
         dist_dir = "out/target/product/{}/dlkm/lib/modules/".format(target),
         flat = True,
         wipe_dist_dir = False,

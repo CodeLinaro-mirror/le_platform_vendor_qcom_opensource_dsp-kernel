@@ -229,9 +229,13 @@ static int cdsp_loader_remove(struct platform_device *pdev)
 
 	priv = platform_get_drvdata(pdev);
 
-	if (!priv)
+	if (!priv) {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 10, 0)
 		return 0;
-
+#else
+		return;
+#endif
+	}
 	if (priv->pil_h) {
 		rproc_shutdown(priv->pil_h);
 		priv->pil_h = NULL;

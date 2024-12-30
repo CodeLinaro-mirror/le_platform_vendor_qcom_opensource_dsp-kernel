@@ -3333,6 +3333,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	struct fastrpc_pool_ctx *sctx = NULL;
 	int memlen;
 	int err = 0;
+	void *file = NULL;
 	struct {
 		int pgid;
 		u32 namelen;
@@ -3353,6 +3354,27 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 				DSP_CREATE_START) != DEFAULT_PROC_STATE)
 		return -EALREADY;
 
+	/* Verify shell file passed by user */
+	if (init.filefd <= 0) {
+		if (!init.filelen || !init.file) {
+		/*In this case shell will be loaded by DSP using daemon */
+			init.file = 0;
+			init.filelen = 0;
+		} else {
+			file = kzalloc(init.filelen, GFP_KERNEL);
+			if (!file) {
+				err = -ENOMEM;
+				goto err_out;
+			}
+			if (copy_from_user(file,
+				(void *)(uintptr_t)init.file,
+				init.filelen)) {
+				err = -EFAULT;
+				dev_err(fl->cctx->dev, "copy_from_user failed for shell file\n");
+				goto err_out;
+			}
+		}
+	}
 	/*
 	 * Third-party apps don't have permission to open the fastrpc device, so
 	 * it is opened on their behalf by DSP HAL. This is detected by
@@ -3448,7 +3470,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	args[1].length = inbuf.namelen;
 	args[1].fd = -1;
 
-	args[2].ptr = (u64) init.file;
+	args[2].ptr = file ? (u64)(uintptr_t)file : init.file;
 	args[2].length = inbuf.filelen;
 	args[2].fd = init.filefd;
 
@@ -3490,6 +3512,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 		fastrpc_buf_free(fl->proc_init_sharedbuf, false);
 		fl->proc_init_sharedbuf = NULL;
 	}
+	kfree(file);
 
 	return 0;
 
@@ -3509,6 +3532,7 @@ err_alloc:
 		mutex_unlock(&fl->map_mutex);
 	}
 err_out:
+	kfree(file);
 	/* Reset the process state to its default in case of an error. */
 	atomic_set(&fl->state, DEFAULT_PROC_STATE);
 	return err;

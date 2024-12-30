@@ -1164,7 +1164,6 @@ struct fastrpc_user {
 	/*mutex for process maps synchronization*/
 	struct mutex map_mutex;
 	struct mutex signal_create_mutex;
-	struct gid_list gidlist;
 	/* mutex for qos request synchronization */
 	struct mutex pm_qos_mutex;
 	/* Compleation object for dma invocations by client driver*/

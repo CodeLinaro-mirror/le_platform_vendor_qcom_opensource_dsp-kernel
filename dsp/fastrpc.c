@@ -2634,17 +2634,30 @@ static int fastrpc_get_process_gids(struct gid_list *gidlist)
 static void fastrpc_check_privileged_process(struct fastrpc_user *fl,
 				struct fastrpc_init_create *init)
 {
-	u32 gid = sorted_lists_intersection(fl->gidlist.gids,
-			fl->gidlist.gidcount, fl->cctx->gidlist.gids,
-			fl->cctx->gidlist.gidcount);
+	struct gid_list gidlist = {0};
+	u32 gid;
 
 	/* disregard any privilege bits from userspace */
 	init->attrs &= (~FASTRPC_MODE_PRIVILEGED);
+
+	if (fastrpc_get_process_gids(&gidlist)) {
+		dev_info(fl->cctx->dev, "%s failed to get gidlist\n",
+				__func__);
+		return;
+	}
+
+	gid = sorted_lists_intersection(gidlist.gids,
+			gidlist.gidcount, fl->cctx->gidlist.gids,
+			fl->cctx->gidlist.gidcount);
+
+
 	if (gid) {
 		dev_info(fl->cctx->dev, "%s: %s (PID %d, GID %u) is a privileged process\n",
 				__func__, current->comm, current->tgid, gid);
 		init->attrs |= FASTRPC_MODE_PRIVILEGED;
 	}
+	/* Free memory for gid allocated in fastrpc_get_process_gids */
+	kfree(gidlist.gids);
 }
 
 static int fastrpc_remote_heap_unassign(struct fastrpc_channel_ctx *cctx, struct fastrpc_buf *buf)
@@ -3457,8 +3470,6 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	}
 	fl->sctx = sctx;
 
-	fastrpc_get_process_gids(&fl->gidlist);
-
 	/* In case of privileged process update attributes */
 	fastrpc_check_privileged_process(fl, &init);
 
@@ -3825,7 +3836,6 @@ static int fastrpc_user_obj_free(struct fastrpc_user *user,
 	spin_lock_irqsave(&cctx->lock, flags);
 	list_del(&fl->user);
 	spin_unlock_irqrestore(&cctx->lock, flags);
-	kfree(fl->gidlist.gids);
 
 	spin_lock_irqsave(&fl->proc_state_notif.nqlock, flags);
 	atomic_add(1, &fl->proc_state_notif.notif_queue_count);

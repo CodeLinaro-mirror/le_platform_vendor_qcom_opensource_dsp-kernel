@@ -4799,10 +4799,14 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 		return -EFAULT;
 	switch (invoke.req) {
 	case FASTRPC_INVOKE:
+		size = sizeof(struct fastrpc_invoke);
+		fallthrough;
 	case FASTRPC_INVOKE_ENHANCED:
 		/* nscalars is truncated here to max supported value */
+		if (!size)
+			size = sizeof(struct fastrpc_enhanced_invoke);
 		if (copy_from_user(&inv2, (void __user *)(uintptr_t)invoke.invparam,
-				   invoke.size))
+				   size))
 			return -EFAULT;
 		perf_kernel = (u64 *)(uintptr_t)inv2.perf_kernel;
 		if (perf_kernel)

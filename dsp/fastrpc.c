@@ -1522,14 +1522,7 @@ static int fastrpc_get_buffer_offset(struct fastrpc_invoke_ctx *ctx, int index,
 			goto bail;
 		}
 		*offset = addr - vm_start;
-	} else {
-		/* validate user passed buffer length with map buffer size */
-		if (ctx->args[index].length > ctx->maps[index]->size) {
-			err = -EFAULT;
-			goto bail;
-		}
 	}
-
 	return 0;
 
 bail:
@@ -1608,7 +1601,15 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 
 			rpra[i].buf.pv = (u64) ctx->args[i].ptr;
 			pages[i].addr = ctx->maps[i]->phys;
-
+			/* validate user passed buffer length with map buffer size */
+			if (len > ctx->maps[i]->size) {
+				err = -EFAULT;
+				dev_err(dev,
+					"Invalid buffer addr 0x%llx len 0x%llx IPA 0x%llx size 0x%llx fd %d\n",
+					ctx->args[i].ptr, len, ctx->maps[i]->phys,
+					ctx->maps[i]->size, ctx->maps[i]->fd);
+				goto bail;
+			}
 			err = fastrpc_get_buffer_offset(ctx, i, &offset);
 			if (err)
 				goto bail;

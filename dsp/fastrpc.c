@@ -34,6 +34,7 @@
 #include "fastrpc_shared.h"
 #include <linux/platform_device.h>
 #include <linux/types.h>
+#include <linux/remoteproc.h>
 
 #define CREATE_TRACE_POINTS
 #include "fastrpc_trace.h"
@@ -104,6 +105,10 @@ static struct fastrpc_domain *fastrpc_lookup_domain_in_table(u32 key,
 
 static int fastrpc_convert_legacy_id_to_logical_id(u32 legacy_id,
 	u32 *logical_id);
+static int fastrpc_release_current_dsp_process(struct fastrpc_user *fl);
+
+void fastrpc_queue_pd_status(struct fastrpc_user *fl, int domain,
+	int status, int sessionid);
 
 /*
  * Checks if a given logical domain id is valid.
@@ -133,6 +138,22 @@ static inline struct fastrpc_channel_ctx
 	struct fastrpc_domain *domain = fastrpc_lookup_domain_in_table(domain_id,
 		false);
 	return domain ? domain->cctx : NULL;
+}
+
+/*
+ * Retrieves the fastrpc ssr handler for a given Logical domain ID.
+ *
+ * @param domain_id Logical domain id of channel context
+ *
+ * @return A pointer to the fastrpc ssr handler for the
+ *         specified domain or NULL if the domain is not found.
+ */
+static inline struct fastrpc_ssr_handler
+	*fastrpc_get_ssr_handler(int domain_id)
+{
+	struct fastrpc_domain *domain = fastrpc_lookup_domain_in_table(domain_id,
+		false);
+	return domain ? &domain->ssr_handler : NULL;
 }
 
 static void dma_buf_unmap_attachment_wrap(struct fastrpc_map *map)
@@ -1977,16 +1998,208 @@ static int poll_for_remote_response(struct fastrpc_invoke_ctx *ctx, u32 timeout)
 	return err;
 }
 
-static inline int fastrpc_wait_for_response(struct fastrpc_invoke_ctx *ctx,
+/*
+ * Callback function for kernel worker thread to trigger dsp ssr in case
+ * of a timeout of a kernel rpc call
+ */
+static void fastrpc_handle_ssr_request(struct work_struct *work)
+{
+	int rc = 0;
+	struct fastrpc_ssr_handler *ssr_handler =
+		container_of(work, struct fastrpc_ssr_handler, ssr_work);
+	void *rphandle = ssr_handler->rphandle;
+
+	if (!rphandle) {
+		pr_err("Error: %s: invalid rproc handle for domain %d\n",
+			__func__, ssr_handler->domain_id);
+		goto bail;
+	}
+
+	/* Shut down DSP */
+	rc = rproc_shutdown(rphandle);
+	if (rc) {
+		pr_err("Error: %s: rproc_shutdown failed with rc %d and rphandle %pK\n",
+			__func__, rc, rphandle);
+		goto bail;
+	}
+
+	/* Reboot DSP */
+	rc = rproc_boot(rphandle);
+	if (rc) {
+		pr_err("Error: %s: rproc_boot failed with rc %d and rphandle %pK\n",
+			__func__, rc, rphandle);
+		goto bail;
+	}
+	pr_info("%s : SSR completed successfully", __func__);
+
+bail:
+	return;
+}
+
+/*
+ * Callback function invoked when the timer for a kernel rpc call expires
+ *
+ * If kernel rpc call times out, it indicates that the dsp is potentially
+ * in an irrecoverable state as fastrpc on rootpd is unresponsive. So,
+ * trigger an ssr on the dsp
+ */
+
+static void ssr_timer_callback(struct timer_list *timer)
+{
+	struct fastrpc_channel_ctx *cctx = NULL;
+	unsigned long flags;
+	void *rphandle = NULL;
+	struct fastrpc_ssr_handler *ssr_handler = NULL;
+	struct fastrpc_invoke_ctx *ctx =
+		container_of(timer, struct fastrpc_invoke_ctx, ssr_timer);
+
+	if (!ctx) {
+		pr_err("Error: %s: invoke ctx is null\n", __func__);
+		return;
+	}
+
+	cctx = ctx->fl->cctx;
+	if (!cctx) {
+		pr_err("Error: %s channel ctx is null for handle 0x%x, sc 0x%x, pid %d, tid %d\n",
+			__func__, ctx->handle, ctx->sc, ctx->tgid, ctx->pid);
+		return;
+	}
+
+	fastrpc_channel_ctx_get(cctx);
+	spin_lock_irqsave(&cctx->lock, flags);
+
+	/* Ensure that ssr is triggered only once for a channel */
+	if (cctx->startshutdown)
+		goto bail;
+	else
+		cctx->startshutdown = true;
+
+	if (cctx->rpdev && !atomic_read(&cctx->teardown)) {
+		/* Get remote processor handle associated with device */
+		rphandle = rproc_get_by_child(&cctx->rpdev->dev);
+		if (!rphandle) {
+			pr_err("Error: %s: rproc_get_by_child failed for domain %d\n",
+				__func__, cctx->domain_id);
+			goto bail;
+		}
+	} else {
+		pr_err("Error: %s: channel already down for domain %d, handle 0x%x, sc 0x%x, pid %d, tid %d\n",
+			__func__, cctx->domain_id, ctx->handle, ctx->sc, ctx->tgid, ctx->pid);
+		goto bail;
+	}
+
+	ssr_handler = fastrpc_get_ssr_handler(cctx->domain_id);
+	if (!ssr_handler) {
+		pr_err("Error: %s: failed to get ssr handler for domain %d\n",
+			__func__, cctx->domain_id);
+		goto bail;
+	}
+
+	ssr_handler->domain_id = cctx->domain_id;
+
+	spin_unlock_irqrestore(&cctx->lock, flags);
+	fastrpc_channel_ctx_put(cctx);
+
+	/* Launch kernel worker thread to trigger ssr */
+	ssr_handler->rphandle = rphandle;
+	INIT_WORK(&ssr_handler->ssr_work, fastrpc_handle_ssr_request);
+	schedule_work(&ssr_handler->ssr_work);
+	return;
+
+bail:
+	spin_unlock_irqrestore(&cctx->lock, flags);
+	fastrpc_channel_ctx_put(cctx);
+}
+
+static int fastrpc_wait_for_response(struct fastrpc_invoke_ctx *ctx,
 						u32 kernel)
 {
-	int interrupted = 0;
+	int interrupted = 0, err = 0;
+	long timeleft = 0;
+	bool is_timer_set = false;
+	struct fastrpc_user *fl = ctx->fl;
+	struct fastrpc_channel_ctx *cctx = fl->cctx;
+	const unsigned int FASTRPC_MIN_INTERRUPT_WAIT_TIMEOUT = 5000,
+		FASTRPC_NONINTERRUPT_CALL_TIMEOUT = 5000;
 
-	if (kernel)
+	if (kernel) {
+		/*
+		 * For all non-interruptible kernel rpc calls (like process
+		 * spawn or kill, map / unmap), in case of a timeout,
+		 * trigger an SSR on the dsp from a kernel-worker thread
+		 */
+		if (cctx->domain->type == FASTRPC_NSP &&
+			(fl->pd_type == USERPD ||
+			fl->pd_type == USER_UNSIGNEDPD_POOL) &&
+			!atomic_read(&cctx->teardown)) {
+			/*
+			 * Start timer that will trigger ssr when kernel rpc
+			 * call times out
+			 */
+			timer_setup(&ctx->ssr_timer, ssr_timer_callback, 0);
+			mod_timer(&ctx->ssr_timer, jiffies +
+			msecs_to_jiffies(FASTRPC_NONINTERRUPT_CALL_TIMEOUT));
+			is_timer_set = true;
+			dev_dbg(cctx->dev,
+				"%s: started timer for domain %d, handle 0x%x, sc 0x%x, pid %d, tid %d\n",
+				__func__, cctx->domain_id, ctx->handle,
+				ctx->sc, ctx->tgid, ctx->pid);
+		}
+
 		wait_for_completion(&ctx->work);
-	else
-		interrupted = wait_for_completion_interruptible(&ctx->work);
 
+		if (is_timer_set) {
+			// Delete timer after ssr callback is completed
+			if (!del_timer_sync(&ctx->ssr_timer))
+				interrupted = -ETIME;
+
+			dev_dbg(cctx->dev,
+				"%s: deleted timer for domain %d, handle 0x%x, sc 0x%x, pid %d, tid %d\n",
+				__func__, cctx->domain_id, ctx->handle,
+				ctx->sc, ctx->tgid, ctx->pid);
+		}
+	} else {
+		/*
+		 * For interruptible user rpc calls, after the user-specified
+		 * timeout, issue a kill rpc call for the corresponding user pd
+		 * as it is in an unresponsive state.
+		 */
+		if (ctx->handle > FASTRPC_MAX_STATIC_HANDLE &&
+			cctx->domain->type == FASTRPC_NSP &&
+			fl->timeout >= FASTRPC_MIN_INTERRUPT_WAIT_TIMEOUT) {
+			timeleft =
+				wait_for_completion_interruptible_timeout(
+					&ctx->work,
+					msecs_to_jiffies(fl->timeout));
+			if (timeleft == 0) {
+				dev_err(cctx->dev,
+					"%s: user-call timed out after %ums for domain %d, handle 0x%x, sc 0x%x, pid %d, tid %d\n",
+					__func__, fl->timeout, cctx->domain_id,
+					ctx->handle, ctx->sc, ctx->tgid, ctx->pid);
+
+				/* Send rpc timeout notification to user app */
+				fastrpc_queue_pd_status(fl, cctx->domain_id,
+					FASTRPC_USERPD_TIMEOUT, fl->sessionid);
+
+				/* Close corresponding user-process on dsp */
+				err = fastrpc_release_current_dsp_process(fl);
+				if (err == -ETIME) {
+					pr_err("%s: release dsp process timed out after %ums for domain %d, handle 0x%x, sc 0x%x, pid %d, tid %d\n",
+						__func__, FASTRPC_NONINTERRUPT_CALL_TIMEOUT,
+						cctx->domain_id, ctx->handle, ctx->sc,
+						ctx->tgid, ctx->pid);
+				}
+
+				atomic_set(&fl->state, DSP_EXIT_COMPLETE);
+				interrupted = err;
+			} else if (timeleft < 0) {
+				interrupted = timeleft;
+			}
+		} else {
+			interrupted =
+				wait_for_completion_interruptible(&ctx->work);
+		}
+	}
 	return interrupted;
 }
 
@@ -4009,6 +4222,32 @@ static int fastrpc_get_notif_response(
 	return 0;
 }
 
+/*
+ * fastrpc_user_set_rpc_timeout()
+ * Set user specified RPC timeout
+ */
+static int fastrpc_user_set_rpc_timeout(struct fastrpc_user *fl,
+	struct fastrpc_internal_proc_timeout *rpc)
+{
+	int err = 0, ii = 0;
+	uint32_t rsvd = 0;
+
+	/* Validate that reserved fields are all zero */
+	for (ii = 0; ii < FASTRPC_RPC_TIMEOUT_IOCTL_RSVD; ii++) {
+		rsvd = rpc->reserved[ii];
+		if (rsvd) {
+			err = -EINVAL;
+			dev_err(fl->cctx->dev, "Error %d: %s: rsvd[%d] %u expected to be 0",
+				err, __func__, ii, rsvd);
+			return err;
+		}
+	}
+	spin_lock(&fl->lock);
+	fl->timeout = rpc->timeout;
+	spin_unlock(&fl->lock);
+	return 0;
+}
+
 static int fastrpc_manage_poll_mode(struct fastrpc_user *fl, u32 enable, u32 timeout)
 {
 	const unsigned int MAX_POLL_TIMEOUT_US = 10000;
@@ -5096,6 +5335,7 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 	struct fastrpc_internal_sessinfo sessinfo;
 	struct fastrpc_ioctl_mdctx_manage ctxm = {0};
 	struct fastrpc_ioctl_remote_proc_state_dump proc = {0};
+	struct fastrpc_internal_proc_timeout rpc = {0};
 	u32 multisession, size = 0;
 	u64 *perf_kernel;
 	int err = 0;
@@ -5181,6 +5421,12 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 			sizeof(proc)))
 			return -EFAULT;
 		err = fastrpc_remote_process_state_dump(fl, &proc);
+		break;
+	case FASTRPC_INVOKE_SET_RPC_TIMEOUT:
+		if (copy_from_user(&rpc,
+			(void __user *)(uintptr_t)invoke.invparam, sizeof(rpc)))
+			return -EFAULT;
+		err = fastrpc_user_set_rpc_timeout(fl, &rpc);
 		break;
 	default:
 		err = -ENOTTY;

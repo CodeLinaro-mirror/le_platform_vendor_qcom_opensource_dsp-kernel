@@ -2319,17 +2319,30 @@ static int fastrpc_get_process_gids(struct gid_list *gidlist)
 static void fastrpc_check_privileged_process(struct fastrpc_user *fl,
 				struct fastrpc_init_create *init)
 {
-	u32 gid = sorted_lists_intersection(fl->gidlist.gids,
-			fl->gidlist.gidcount, fl->cctx->gidlist.gids,
-			fl->cctx->gidlist.gidcount);
+	struct gid_list gidlist = {0};
+	u32 gid;
 
 	/* disregard any privilege bits from userspace */
 	init->attrs &= (~FASTRPC_MODE_PRIVILEGED);
+
+	if (fastrpc_get_process_gids(&gidlist)) {
+		dev_info(fl->cctx->dev, "%s failed to get gidlist\n",
+				__func__);
+		return;
+	}
+
+	gid = sorted_lists_intersection(gidlist.gids,
+			gidlist.gidcount, fl->cctx->gidlist.gids,
+			fl->cctx->gidlist.gidcount);
+
+
 	if (gid) {
 		dev_info(fl->cctx->dev, "%s: %s (PID %d, GID %u) is a privileged process\n",
 				__func__, current->comm, fl->tgid, gid);
 		init->attrs |= FASTRPC_MODE_PRIVILEGED;
 	}
+	/* Free memory for gid allocated in fastrpc_get_process_gids */
+	kfree(gidlist.gids);
 }
 
 int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx)
@@ -2635,9 +2648,9 @@ static int fastrpc_debugfs_show(struct seq_file *s_file, void *data)
 				print_map_info(s_file, map);
 		}
 		seq_printf(s_file,"\n=============== Kernel maps ===============\n");
-		list_for_each_entry(map, &fl->mmaps, node) {
-			if (map)
-				print_map_info(s_file, map);
+		list_for_each_entry(buf, &fl->mmaps, node) {
+			if (buf)
+				print_buf_info(s_file, buf);
 		}
 		seq_printf(s_file,"\n=============== Cached Bufs ===============\n");
 		list_for_each_entry_safe(buf, n, &fl->cached_bufs, node) {
@@ -3037,6 +3050,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	int memlen;
 	int err = 0;
 	int user_fd = fl->config.user_fd, user_size = fl->config.user_size;
+	void *file = NULL;
 	struct {
 		int pgid;
 		u32 namelen;
@@ -3057,6 +3071,27 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 				DSP_CREATE_START) != DEFAULT_PROC_STATE)
 		return -EALREADY;
 
+	/* Verify shell file passed by user */
+	if (init.filefd <= 0) {
+		if (!init.filelen || !init.file) {
+		/*In this case shell will be loaded by DSP using daemon */
+			init.file = 0;
+			init.filelen = 0;
+		} else {
+			file = kzalloc(init.filelen, GFP_KERNEL);
+			if (!file) {
+				err = -ENOMEM;
+				goto err_out;
+			}
+			if (copy_from_user(file,
+				(void *)(uintptr_t)init.file,
+				init.filelen)) {
+				err = -EFAULT;
+				dev_err(fl->cctx->dev, "copy_from_user failed for shell file\n");
+				goto err_out;
+			}
+		}
+	}
 	/*
 	 * Third-party apps don't have permission to open the fastrpc device, so
 	 * it is opened on their behalf by DSP HAL. This is detected by
@@ -3093,9 +3128,6 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 		err = -EBUSY;
 		goto err_out;
 	}
-
-	fastrpc_get_process_gids(&fl->gidlist);
-
 	/* In case of privileged process update attributes */
 	fastrpc_check_privileged_process(fl, &init);
 
@@ -3150,7 +3182,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	args[1].length = inbuf.namelen;
 	args[1].fd = -1;
 
-	args[2].ptr = (u64) init.file;
+	args[2].ptr = file ? (u64)(uintptr_t)file : init.file;
 	args[2].length = inbuf.filelen;
 	args[2].fd = init.filefd;
 
@@ -3191,6 +3223,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 		fastrpc_buf_free(fl->proc_init_sharedbuf, false);
 		fl->proc_init_sharedbuf = NULL;
 	}
+	kfree(file);
 
 	return 0;
 
@@ -3210,6 +3243,7 @@ err_alloc:
 		mutex_unlock(&fl->map_mutex);
 	}
 err_out:
+	kfree(file);
 	/* Reset the process state to its default in case of an error. */
 	atomic_set(&fl->state, DEFAULT_PROC_STATE);
 	return err;
@@ -3252,21 +3286,20 @@ static int fastrpc_release_current_dsp_process(struct fastrpc_user *fl)
 	return fastrpc_internal_invoke(fl, KERNEL_MSG_WITH_NONZERO_PID, &ioctl);
 }
 
-/* Helper function to increment / decrement invoke count of channel */
+/*
+ * Helper function to increment / decrement invoke count of channel
+ * Caller of this function MUST spin-lock 'cctx->lock' first.
+ */
 static inline void fastrpc_channel_update_invoke_cnt(
 		struct fastrpc_channel_ctx *cctx, bool incr)
 {
-	unsigned long flags = 0;
-
 	if (incr) {
-		atomic_inc(&cctx->invoke_cnt);
+		cctx->invoke_cnt++;
 	} else {
-		spin_lock_irqsave(&cctx->lock, flags);
-		atomic_dec(&cctx->invoke_cnt);
+		cctx->invoke_cnt--;
 		/* Wake up any waiting SSR handling thread */
-		if (atomic_read(&cctx->invoke_cnt) == 0)
+		if (cctx->invoke_cnt == 0)
 			wake_up_interruptible(&cctx->ssr_wait_queue);
-		spin_unlock_irqrestore(&cctx->lock, flags);
 	}
 }
 
@@ -3393,7 +3426,6 @@ static int fastrpc_device_release(struct inode *inode, struct file *file)
 	spin_lock_irqsave(&cctx->lock, flags);
 	list_del(&fl->user);
 	spin_unlock_irqrestore(&cctx->lock, flags);
-	kfree(fl->gidlist.gids);
 
 	spin_lock_irqsave(&fl->proc_state_notif.nqlock, flags);
 	atomic_add(1, &fl->proc_state_notif.notif_queue_count);
@@ -3452,7 +3484,9 @@ static int fastrpc_device_release(struct inode *inode, struct file *file)
 	spin_lock_irqsave(glock, irq_flags);
 	kfree(fl);
 
+	spin_lock_irqsave(&cctx->lock, flags);
 	fastrpc_channel_update_invoke_cnt(cctx, false);
+	spin_unlock_irqrestore(&cctx->lock, flags);
 	fastrpc_channel_ctx_put(cctx);
 	file->private_data = NULL;
 	spin_unlock_irqrestore(glock, irq_flags);
@@ -5038,7 +5072,9 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int cmd,
 			atomic_set(&fl->state, DSP_CREATE_COMPLETE);
 	}
 
+	spin_lock_irqsave(&cctx->lock, flags);
 	fastrpc_channel_update_invoke_cnt(cctx, false);
+	spin_unlock_irqrestore(&cctx->lock, flags);
 	fastrpc_channel_ctx_put(fl->cctx);
 	return err;
 }
@@ -5100,6 +5136,7 @@ long fastrpc_dev_map_dma(struct fastrpc_device *dev,
 			unsigned long invoke_param)
 {
 	int err = 0;
+	bool is_cnt_updated = false;
 	union fastrpc_dev_param p;
 	struct fastrpc_user *fl = NULL;
 	struct fastrpc_map *map = NULL;
@@ -5109,7 +5146,6 @@ long fastrpc_dev_map_dma(struct fastrpc_device *dev,
 	spinlock_t *glock = &g_frpc.glock;
 
 	p.map = (struct fastrpc_dev_map_dma *)invoke_param;
-
 
 	spin_lock_irqsave(glock, irq_flags);
 	if (!dev || dev->dev_close) {
@@ -5130,6 +5166,22 @@ long fastrpc_dev_map_dma(struct fastrpc_device *dev,
 	fastrpc_channel_ctx_get(cctx);
 	fl->is_dma_invoke_pend = true;
 	spin_unlock_irqrestore(glock, irq_flags);
+
+	spin_lock_irqsave(&cctx->lock, irq_flags);
+	if (atomic_read(&cctx->teardown)) {
+		spin_unlock_irqrestore(&cctx->lock, irq_flags);
+		err = -EPIPE;
+		goto error;
+	} else {
+		/*
+		 * Update invoke count to block SSR handling thread
+		 * from cleaning up the channel resources, while it
+		 * is stillbeing used by this thread.
+		 */
+		fastrpc_channel_update_invoke_cnt(cctx, true);
+		is_cnt_updated = true;
+	}
+	spin_unlock_irqrestore(&cctx->lock, irq_flags);
 
 	/* Map DMA buffer on SMMU device*/
 	mutex_lock(&fl->remote_map_mutex);
@@ -5180,9 +5232,11 @@ error:
 		}
 		fl->is_dma_invoke_pend = false;
 	}
+	mutex_unlock(&fl->remote_map_mutex);
+	if (is_cnt_updated)
+		fastrpc_channel_update_invoke_cnt(cctx, false);
 	spin_unlock_irqrestore(&cctx->lock, irq_flags);
 	fastrpc_channel_ctx_put(cctx);
-	mutex_unlock(&fl->remote_map_mutex);
 	return err;
 }
    /*
@@ -5200,6 +5254,7 @@ long fastrpc_dev_unmap_dma(struct fastrpc_device *dev,
 			unsigned long invoke_param)
 {
 	int err = 0;
+	bool is_cnt_updated = false;
 	union fastrpc_dev_param p;
 	struct fastrpc_user *fl = NULL;
 	struct fastrpc_map *map = NULL;
@@ -5227,6 +5282,22 @@ long fastrpc_dev_unmap_dma(struct fastrpc_device *dev,
 	fastrpc_channel_ctx_get(cctx);
 	fl->is_dma_invoke_pend = true;
 	spin_unlock_irqrestore(glock, irq_flags);
+
+	spin_lock_irqsave(&cctx->lock, irq_flags);
+	if (atomic_read(&cctx->teardown)) {
+		spin_unlock_irqrestore(&cctx->lock, irq_flags);
+		err = -EPIPE;
+		goto error;
+	} else {
+		/*
+		 * Update invoke count to block SSR handling thread
+		 * from cleaning up the channel resources, while it
+		 * is stillbeing used by this thread.
+		 */
+		fastrpc_channel_update_invoke_cnt(cctx, true);
+		is_cnt_updated = true;
+	}
+	spin_unlock_irqrestore(&cctx->lock, irq_flags);
 
 	mutex_lock(&fl->remote_map_mutex);
 	mutex_lock(&fl->map_mutex);
@@ -5269,9 +5340,11 @@ error:
 		}
 		fl->is_dma_invoke_pend = false;
 	}
+	mutex_unlock(&fl->remote_map_mutex);
+	if (is_cnt_updated)
+		fastrpc_channel_update_invoke_cnt(cctx, false);
 	spin_unlock_irqrestore(&cctx->lock, irq_flags);
 	fastrpc_channel_ctx_put(cctx);
-	mutex_unlock(&fl->remote_map_mutex);
 	return err;
 }
    /*

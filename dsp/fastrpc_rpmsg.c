@@ -190,14 +190,14 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	return 0;
 
 fdev_error:
-	kfree(data);
-
-populate_error:
 	if (data->fdevice)
 		misc_deregister(&data->fdevice->miscdev);
 	if (data->secure_fdevice)
 		misc_deregister(&data->secure_fdevice->miscdev);
-
+populate_error:
+	kfree(data->gidlist.gids);
+	data->gidlist.gids = NULL;
+	kfree(data);
 	return err;
 }
 
@@ -238,10 +238,10 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	 * If there are other ongoing remote invocations, wait for them to
 	 * complete before cleaning up the channel resources, to avoid UAF.
 	 */
-	while (atomic_read(&cctx->invoke_cnt) > 0) {
+	while (cctx->invoke_cnt > 0) {
 		spin_unlock_irqrestore(&cctx->lock, flags);
 		wait_event_interruptible(cctx->ssr_wait_queue,
-				atomic_read(&cctx->invoke_cnt) == 0);
+				cctx->invoke_cnt == 0);
 		spin_lock_irqsave(&cctx->lock, flags);
 	}
 	spin_unlock_irqrestore(&cctx->lock, flags);

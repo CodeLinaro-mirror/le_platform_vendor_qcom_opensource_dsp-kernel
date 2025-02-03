@@ -4409,7 +4409,6 @@ static int fastrpc_multidomain_ctx_setup(struct fastrpc_user *fl,
 				FASTRPC_CTX_MAX, GFP_ATOMIC);
 
 	if (err < 0) {
-		mutex_unlock(gmut);
 		dev_err(dev, "Error %d: %s: idr alloc failed", err, __func__);
 		goto bail;
 	}
@@ -4419,13 +4418,10 @@ static int fastrpc_multidomain_ctx_setup(struct fastrpc_user *fl,
 	err = fastrpc_multidomain_ctx_dsp_manage(fl, ctxm->req, ctx, mdctx,
 				mdctx->num_domains);
 	if (err) {
-		mutex_unlock(gmut);
 		dev_err(dev, "Error 0x%x: %s: peer-info register failed",
 			err, __func__);
 		goto bail;
 	}
-
-	mutex_unlock(gmut);
 
 	/* Copy context back to user */
 	err = copy_to_user((void __user *)ctxm->ctx, &ctx, sizeof(ctx));
@@ -4444,16 +4440,15 @@ static int fastrpc_multidomain_ctx_setup(struct fastrpc_user *fl,
 	spin_unlock(&fl->lock);
 bail:
 	if (err) {
-		if (ctx) {
-			mutex_lock(gmut);
+		if (ctx)
 			idr_remove(mdctx_idr, ctx);
-			mutex_unlock(gmut);
-		}
+
 		kfree(mdctx->tgids_frpc);
 		kfree(mdctx->session_ids);
 		kfree(mdctx->domains);
 		kfree(mdctx);
 	}
+	mutex_unlock(gmut);
 	return err;
 }
 

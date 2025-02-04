@@ -17,6 +17,9 @@
 #include <linux/seq_file.h>
 #include <linux/version.h>
 #include <linux/soc/qcom/pdr.h>
+#include <linux/kobject.h>
+#include <linux/hashtable.h>
+#include "../include/uapi/misc/fastrpc.h"
 
 #if (KERNEL_VERSION(6, 3, 0) <= LINUX_VERSION_CODE)
 #include <linux/cpu.h>
@@ -29,12 +32,13 @@
 #define MDSP_DOMAIN_ID (1)
 #define SDSP_DOMAIN_ID (2)
 #define CDSP_DOMAIN_ID (3)
-#define FASTRPC_DEV_MAX		4 /* adsp, mdsp, slpi, cdsp*/
+#define CDSP1_DOMAIN_ID (4)
+#define NUM_LEGACY_ID_MAX	5 /* adsp, mdsp, slpi, cdsp, cdsp1 */
 #define FASTRPC_MAX_SESSIONS	14
 #define FASTRPC_MAX_SESSIONS_PER_PROCESS	4
 
 /* Check if given domain id is valid */
-#define IS_VALID_DOMAIN_ID(domain) (domain < FASTRPC_DEV_MAX)
+#define IS_LEGACY_DOMAIN_ID(domain) (domain < NUM_LEGACY_ID_MAX)
 
 /* Check if given session id is valid */
 #define IS_VALID_SESSION_ID(sess) (sess < FASTRPC_MAX_SESSIONS_PER_PROCESS)
@@ -60,6 +64,9 @@
 #define SMMU_4K 0x1000
 #define SMMU_2M 0x200000
 #define SMMU_1G 0x40000000
+
+/* Max length of domain name */
+#define MAX_DOMAIN_NAMELEN 30
 
 /*
  * Align the size to next IOMMU page size
@@ -199,6 +206,10 @@
 
 #define FASTRPC_CREATE_PROCESS_NARGS	6
 #define FASTRPC_CREATE_STATIC_PROCESS_NARGS	3
+
+/* DSP status macros */
+#define DSP_STATUS_UP true
+#define DSP_STATUS_DOWN false
 
 /*
  * Num of pages shared with process spawn call.
@@ -362,6 +373,30 @@
 	(phys += sid << sid_pos)
 
 /*
+ * Generates a physical ID for a DSP (Digital Signal Processor) device.
+ *
+ * The resulting physical ID is a composite value consisting of:
+ *   Type identifier multiplied by 1000, plus the instance identifier
+ *
+ * @param type        : Type identifier for the DSP device
+ * @param instance_id : Instance identifier for the DSP device
+ *
+ * @return The generated physical ID for the DSP device
+ */
+#define GENERATE_DSP_PHYSICAL_ID(type, instance_id) \
+	((type * 1000) + instance_id)
+
+/*
+ * Generates a unique logical domain ID by combining a type and counter.
+ *
+ * @param type    : The type of domain (e.g. NSP, LPASS)
+ * @param counter : Global count of DSPs discovered for specific type
+ * @return A unique logical domain ID for DSP
+ */
+#define GENERATE_LOGICAL_DOMAIN_ID(type, counter) \
+	((type * 1000) + counter)
+
+/*
  * Process types on remote subsystem
  * Always add new PD types at the end, before MAX_PD_TYPE
  */
@@ -470,6 +505,25 @@ struct fastrpc_dump_info{
 	u64 phys;
 };
 
+/* Legacy domain names of DSP */
+static const char *legacy_domains[NUM_LEGACY_ID_MAX] =
+{
+	"adsp",
+	"mdsp",
+	"sdsp",
+	"cdsp",
+	"cdsp1"
+};
+
+/* DSP labels defined in device tree */
+static const char *fastrpc_dsp_labels[FASTRPC_MAX_DSP_TYPE] =
+{
+	NULL,
+	"nsp",
+	"lpass",
+	"sdsp"
+};
+
 struct fastrpc_socket {
 	struct socket *sock;                   // Socket used to communicate with remote domain
 	struct sockaddr_qrtr local_sock_addr;  // Local socket address on kernel side
@@ -485,9 +539,6 @@ struct frpc_transport_session_control {
 	struct work_struct work;               // work for handling incoming messages
 	struct workqueue_struct *wq;           // workqueue to post @work on
 };
-
-static const char *domains[FASTRPC_DEV_MAX] = { "adsp", "mdsp",
-						"sdsp", "cdsp"};
 
 struct fastrpc_phy_page {
 	u64 addr;		/* physical address */
@@ -744,11 +795,15 @@ struct heap_bufs {
 	unsigned int num;
 };
 
+struct fastrpc_domain;
+
 struct fastrpc_channel_ctx {
 	int domain_id;
 	int sesscount;
 	int vmcount;
 	u64 perms;
+	/* Structure holding info on domain associated with channel */
+	struct fastrpc_domain *domain;
 	struct qcom_scm_vmperm vmperms[FASTRPC_MAX_VMIDS];
 #if !IS_ENABLED(CONFIG_QCOM_FASTRPC_TRUSTED)
 	struct rpmsg_device *rpdev;
@@ -770,8 +825,18 @@ struct fastrpc_channel_ctx {
 	u32 dsp_attributes[FASTRPC_MAX_DSP_ATTRIBUTES];
 	u32 lowest_capacity_core_count;
 	u32 qos_latency;
+	/* Channel sysfs object */
+	struct kobject kobj_sysfs;
+	/* Flag to indicate if sysfs node has been created for channel */
+	bool sys_fs_init;
+	/* Secure device node for channel */
 	struct fastrpc_device_node *secure_fdevice;
+	/* Non-secure device node for channel */
 	struct fastrpc_device_node *fdevice;
+	/* Non secure device node using legacy device name */
+	struct fastrpc_device_node *legacy_fdevice;
+	/* Secure device node using legacy device name */
+	struct fastrpc_device_node *legacy_secure_fdevice;
 	struct gid_list gidlist;
 	struct list_head gmaps;
 	struct fastrpc_rpmsg_log gmsg_log;
@@ -804,6 +869,45 @@ struct fastrpc_channel_ctx {
 	u32 iova_format;
 	/* Default user object for making kernel-to-rootpd rpc calls */
 	struct fastrpc_user *default_user;
+};
+
+struct fastrpc_domain {
+	/* Node for adding to global domains hash-table */
+	struct hlist_node node;
+	/* Logical domain ID returned to users */
+	u32 id;
+	/* Name of the dsp domain */
+	char name[MAX_DOMAIN_NAMELEN];
+	/* Flag to indicate domain up or down */
+	bool status;
+	/* Flag to indicate if configured as legacy node */
+	bool legacy;
+	/* Instance ID configured in dtsi */
+	u32 instance_id;
+	/* Unique physical ID - the key for the kernel hash-table */
+	u32 phy_id;
+	/* Type of DSP */
+	enum fastrpc_dsp_type type;
+	/*
+	 * Legacy name - This will be assigned to the dsp with the instance id '0'
+	 * for types LPASS, SDSP
+	 * for NSP, instance id '0' would be assigned legacy name 'cdsp'
+	 *          instance id '1' would be assigned legacy name 'cdsp1'
+	 * This will be used to handle all the rpc calls made by clients
+	 * using old legacy domain names
+	 */
+	char *legacy_name;
+	/*
+	 * Legacy id - This will be assigned to the dsp with the instance id '0'
+	 * for types LPASS, SDSP
+	 * for NSP, instance id '0' would be assigned CDSP_DOMAIN_ID
+	 *          instance id '1' would be assigned CDSP1_DOMAIN_ID
+	 * This will be used to handle all the rpc calls made by clients
+	 * using old legacy domain ids
+	 */
+	u32 legacy_id;
+	/* Channel context for domain */
+	struct fastrpc_channel_ctx *cctx;
 };
 
 struct fastrpc_invoke_ctx {
@@ -852,6 +956,10 @@ struct fastrpc_mdctx_info {
 	struct list_head node;
 	/* List of domains on which context was created */
 	uint32_t *domains;
+	/* List of physical ids of the domains */
+	uint32_t *phy_ids;
+	/* List of HW instance ids of the domains */
+	uint32_t *instance_ids;
 	/* List of session ids on each domain */
 	uint32_t *session_ids;
 	/* List of fastrpc-assigned tgids of each session */
@@ -1069,8 +1177,21 @@ int fastrpc_transport_send(struct fastrpc_channel_ctx *cctx, void *rpc_msg, uint
 int fastrpc_transport_init(void);
 void fastrpc_transport_deinit(void);
 int fastrpc_handle_rpc_response(struct fastrpc_channel_ctx *cctx, void *data, int len);
+
+/*
+ * Registers a device with the FastRPC framework.
+ *
+ * @param dev        The device to register.
+ * @param cctx       FastRPC channel context.
+ * @param is_secured flag for secure device node
+ * @param legacy     flag for legacy device node.
+ * @param domain     Name of the domain the device is associated
+ *
+ * @return 0 on success, negative error code on failure.
+ */
 int fastrpc_device_register(struct device *dev, struct fastrpc_channel_ctx *cctx,
-				bool is_secured, const char *domain);
+				bool is_secured, bool legacy, const char *domain);
+
 struct fastrpc_channel_ctx* get_current_channel_ctx(struct device *dev);
 void fastrpc_notify_users(struct fastrpc_user *user);
 
@@ -1082,4 +1203,54 @@ int fastrpc_channel_default_user_delete(struct fastrpc_channel_ctx *cctx);
 
 /* Function to clean all SMMU mappings associated with a fastrpc user obj */
 void fastrpc_free_user(struct fastrpc_user *fl);
+
+/*
+ * Creates a sysfs interface for the given fastrpc channel context.
+ *
+ * @param cctx The fastrpc channel context to create the sysfs interface for.
+ *
+ * @return 0 on success, a negative error code on failure.
+ */
+int fastrpc_sysfs_domain_create(struct fastrpc_channel_ctx *cctx);
+
+/*
+ * Removes sysfs directory of a channel.
+ *
+ * This function is responsible for deleting the sysfs directory
+ * associated with a specific channel context.
+ * It takes a pointer to the channel context as an argument.
+ *
+ * @param cctx Pointer to the channel context to remove sysfs directory
+ */
+void fastrpc_sysfs_domain_remove(struct fastrpc_channel_ctx *cctx);
+
+/*
+ * Populate fastrpc_domain from device tree node.
+ *
+ * @param rdev   Device structure to extract info from.
+ * @param domain Pointer to fastrpc_domain pointer to be populated.
+ *
+ * @return 0 on success, negative error code on failure.
+ */
+int fastrpc_populate_domain_from_dt(struct device *rdev,
+	struct fastrpc_domain **domain);
+
+/*
+ * fastrpc_sysfs_register_kset - Register the fastrpc kset
+ *
+ * Creates a kset to create a parent directory "fastrpc" under /sys/kernel.
+ *
+ * Return: 0 on success, -ENOMEM on failure
+ */
+int fastrpc_sysfs_register_kset(void);
+
+/*
+ * fastrpc_sysfs_deregister_kset - Deregister the fastrpc kset from sysfs
+ *
+ * This function deregisters the fastrpc kset from the sysfs file system.
+ *
+ * @return: None
+ */
+void fastrpc_sysfs_deregister_kset(void);
+
 #endif /* __FASTRPC_SHARED_H__ */

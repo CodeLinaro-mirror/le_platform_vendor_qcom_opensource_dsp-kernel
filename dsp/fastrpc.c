@@ -33,9 +33,17 @@
 #include <soc/qcom/secure_buffer.h>
 #include "fastrpc_shared.h"
 #include <linux/platform_device.h>
+#include <linux/types.h>
 
 #define CREATE_TRACE_POINTS
 #include "fastrpc_trace.h"
+
+/*
+ * The size of the hash table used to store fastrpc domains.
+ * This value determines the max number of domains that can be
+ * added to the table..
+ */
+#define DOMAINS_TABLE_SIZE 8
 
 /* Struct to hold globally used variables */
 struct fastrpc_common {
@@ -51,8 +59,17 @@ struct fastrpc_common {
 	 */
 	struct mutex gmut;
 
-	/* global copy of channel contexts */
-	struct fastrpc_channel_ctx *gctx[FASTRPC_DEV_MAX];
+	/* Mutex to protect access of global domains hash tables */
+	struct mutex hmut;
+
+	/*
+	 * Declare a hash table to store fastrpc domains.
+	 * The hash table is used to efficiently manage and look up fastrpc domains.
+	 */
+	DECLARE_HASHTABLE(fastrpc_domains_table, DOMAINS_TABLE_SIZE);
+
+	/* Global counter for number of dsp's of each type that booted up */
+	int dsp_counter[FASTRPC_MAX_DSP_TYPE];
 
 	/* global list of multidomain context ids */
 	struct idr mdctx_idr;
@@ -77,34 +94,45 @@ static inline int64_t getnstimediff(struct timespec64 *start)
 	return ns;
 }
 
-
 static int fastrpc_device_create(struct fastrpc_user *fl);
 
 static int fastrpc_multidomain_ctx_cleanup(struct fastrpc_user *fl,
 	uint32_t req, uint64_t ctx);
 
+static struct fastrpc_domain *fastrpc_lookup_domain_in_table(u32 key,
+	bool use_phy_id);
+
+static int fastrpc_convert_legacy_id_to_logical_id(u32 legacy_id,
+	u32 *logical_id);
+
 /*
-* fastrpc_update_gctx() - copy channel context to a global structure.
-* @arg1: channel context.
-* @arg2: flag to enable or disable copy
-*
-*/
-
-void fastrpc_update_gctx(struct fastrpc_channel_ctx *cctx, int flag)
+ * Checks if a given logical domain id is valid.
+ *
+ * @param domain_id Logical domain ID to check.
+ *
+ * @return true if the domain ID is valid, false otherwise.
+ */
+static bool fastrpc_is_valid_logical_domain_id(u32 domain_id)
 {
-	struct fastrpc_channel_ctx **ctx = &g_frpc.gctx[cctx->domain_id];
-
-	if (flag == 1)
-		*ctx = cctx;
-	else
-		*ctx = NULL;
+	struct fastrpc_domain *domain = fastrpc_lookup_domain_in_table(domain_id,
+		false);
+	return domain ? true : false;
 }
 
-/* Get channel ctx object for given domain id */
+/*
+ * Retrieves the fastrpc channel context for a given Logical domain ID.
+ *
+ * @param domain_id Logical domain id of channel context
+ *
+ * @return A pointer to the fastrpc channel context for the
+ *         specified domain or NULL if the domain is not found.
+ */
 static inline struct fastrpc_channel_ctx
 	*fastrpc_get_domain_channel_ctx(int domain_id)
 {
-	return g_frpc.gctx[domain_id];
+	struct fastrpc_domain *domain = fastrpc_lookup_domain_in_table(domain_id,
+		false);
+	return domain ? domain->cctx : NULL;
 }
 
 static void dma_buf_unmap_attachment_wrap(struct fastrpc_map *map)
@@ -2082,8 +2110,8 @@ static int fastrpc_internal_invoke(struct fastrpc_user *fl,  u32 kernel,
 wait:
 	if (fl->poll_mode &&
 		handle > FASTRPC_MAX_STATIC_HANDLE &&
-		(fl->cctx->domain_id == CDSP_DOMAIN_ID ||
-		fl->cctx->domain_id == ADSP_DOMAIN_ID) &&
+		(fl->cctx->domain->type == FASTRPC_NSP ||
+		fl->cctx->domain->type == FASTRPC_LPASS) &&
 		(fl->pd_type == USERPD || fl->pd_type == USER_UNSIGNEDPD_POOL))
 		ctx->rsp_flags = POLL_MODE;
 
@@ -2675,7 +2703,7 @@ static int fastrpc_create_session_debugfs(struct fastrpc_user *fl)
 		if (!(fl->debugfs_file_create)) {
 			size = strlen(cur_comm) + strlen("_")
 				+ COUNT_OF(current->pid) + strlen("_")
-				+ COUNT_OF(FASTRPC_DEV_MAX)
+				+ COUNT_OF(domain_id)
 				+ 1;
 
 			fl->debugfs_buf = kzalloc(size, GFP_KERNEL);
@@ -3180,7 +3208,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	if (err)
 		goto err_invoke;
 
-	if (fl->cctx->domain_id == CDSP_DOMAIN_ID) {
+	if (fl->cctx->domain->type == FASTRPC_NSP) {
 		fastrpc_create_persistent_headers(fl);
 	}
 
@@ -3770,9 +3798,9 @@ static int fastrpc_init_attach(struct fastrpc_user *fl, int pd)
 		fl->pd_type = pd;
 
 	if (pd == SENSORS_STATICPD) {
-		if (fl->cctx->domain_id == ADSP_DOMAIN_ID)
+		if (fl->cctx->domain->type == FASTRPC_LPASS)
 			fl->servloc_name = SENSORS_PDR_ADSP_SERVICE_LOCATION_CLIENT_NAME;
-		else if (fl->cctx->domain_id == SDSP_DOMAIN_ID)
+		else if (fl->cctx->domain->type == FASTRPC_SDSP)
 			fl->servloc_name = SENSORS_PDR_SLPI_SERVICE_LOCATION_CLIENT_NAME;
 
 		err = fastrpc_init_sensor_static_pd_status(fl);
@@ -3895,14 +3923,38 @@ read_notif_status:
 	return err;
 }
 
+/*
+ * Retrieves the remote process status notification response from dsp.
+ *
+ * @param notif: Pointer to the fastrpc_internal_notif_rsp structure
+ *         containing the notification response.
+ * @param param: User addr to which notification response needs to be copied.
+ * @param fl:     Pointer to the fastrpc_user object
+ * @param legacy_domains: Flag indicating whether to return legacy
+ *                        domains or logical domain ids.
+ *
+ * Returns 0 on Success.
+ */
 static int fastrpc_get_notif_response(
 			struct fastrpc_internal_notif_rsp *notif,
-			void *param, struct fastrpc_user *fl)
+			void *param, struct fastrpc_user *fl, bool legacy_domains)
 {
 	int err = 0;
+	struct fastrpc_domain *domain = NULL;
+
 	err = fastrpc_wait_on_notif_queue(notif, fl);
 	if (err)
 		return err;
+
+	/*
+	 * If user is using legacy domain ids, send the legacy id back to
+	 * client in process status notification.
+	 */
+	if (legacy_domains) {
+		domain = fastrpc_lookup_domain_in_table(notif->domain, false);
+		if (domain->legacy)
+			notif->domain = domain->legacy_id;
+	}
 
 	if (copy_to_user((void __user *)param, notif,
 			sizeof(struct fastrpc_internal_notif_rsp)))
@@ -3915,8 +3967,8 @@ static int fastrpc_manage_poll_mode(struct fastrpc_user *fl, u32 enable, u32 tim
 {
 	const unsigned int MAX_POLL_TIMEOUT_US = 10000;
 
-	if ((fl->cctx->domain_id != CDSP_DOMAIN_ID &&
-		fl->cctx->domain_id != ADSP_DOMAIN_ID) ||
+	if ((fl->cctx->domain->type != FASTRPC_NSP &&
+		fl->cctx->domain->type != FASTRPC_LPASS) ||
 		(fl->pd_type != USERPD && fl->pd_type != USER_UNSIGNEDPD_POOL)) {
 		dev_err(fl->cctx->dev, "poll mode only allowed for dynamic CDSP and ADSP process\n");
 		return -EPERM;
@@ -4086,7 +4138,7 @@ static int fastrpc_get_frpc_tgid(uint32_t domain, uint32_t session,
 	if (!cctx) {
 		/* Channel is going thru ssr */
 		err = -EPIPE;
-		goto bail;
+		return err;
 	}
 	fastrpc_channel_ctx_get(cctx);
 	if (atomic_read(&cctx->teardown)) {
@@ -4121,24 +4173,49 @@ static int fastrpc_multidomain_ctx_get_tgids(struct device *dev,
 	struct fastrpc_mdctx_info *mdctx)
 {
 	int err = 0, ii = 0;
-	uint32_t domain = 0, session = 0, num_domains = mdctx->num_domains;
+	uint32_t logical_domain_id = 0, domain = 0 , session = 0;
+	uint32_t num_domains = mdctx->num_domains;
 
 	for (ii = 0; ii < num_domains; ii++) {
 		domain = mdctx->domains[ii];
 		session = mdctx->session_ids[ii];
 
-		if (!IS_VALID_DOMAIN_ID(domain) || !IS_VALID_SESSION_ID(session)) {
-			err = -EBADR;
-			dev_err(dev, "Error %d: %s: [%u of %u]: domain %u or session %u is invalid",
-					err, __func__, ii, num_domains, domain, session);
+		/* Validate domain id passed by user */
+		if (fastrpc_is_valid_logical_domain_id(domain)) {
+			logical_domain_id = domain;
+		} else {
+			if (IS_LEGACY_DOMAIN_ID(domain)) {
+				/* If its a valid legacy id, get the corresponding logical id */
+				err = fastrpc_convert_legacy_id_to_logical_id(domain, &logical_domain_id);
+				if (err != 0) {
+					dev_err(dev, "Error %d: %s: [%u of %u]: no domain found for legacy domain id %u",
+						err, __func__, ii, num_domains, domain);
+					break;
+				}
+			} else {
+				/*
+				 * If domain id is neither a valid logical id nor a legacy id,
+				 * return error.
+				 */
+				err = -EINVAL;
+				dev_err(dev, "Error %d: %s: [%u of %u]: %u is not a valid logical domain id",
+					err, __func__, ii, num_domains, domain);
+				break;
+			}
+		}
+
+		if (!IS_VALID_SESSION_ID(session)) {
+			err = -EINVAL;
+			dev_err(dev, "Error %d: %s: [%u of %u]: session %u is invalid",
+					err, __func__, ii, num_domains, session);
 			break;
 		}
 
-		err = fastrpc_get_frpc_tgid(domain, session,
+		err = fastrpc_get_frpc_tgid(logical_domain_id, session,
 					&mdctx->tgids_frpc[ii]);
 		if (err) {
 			dev_err(dev, "Error %d: %s: [%d of %d]: unable to get frpc tgid for domain %u, session %u",
-							err, __func__, ii, num_domains, domain, session);
+							err, __func__, ii, num_domains, logical_domain_id, session);
 			break;
 		}
 	}
@@ -4152,12 +4229,16 @@ static int fastrpc_multidomain_ctx_obj_init(struct fastrpc_user *fl,
 {
 	int err = 0, ii = 0;
 	uint32_t rsvd = 0, num_domains = ctxm->num_domains,
-		max_domains = (FASTRPC_DEV_MAX * FASTRPC_MAX_SESSIONS_PER_PROCESS);
+		max_domains = ((FASTRPC_MAX_DSP_TYPE - 1) *
+						FASTRPC_MAX_SESSIONS_PER_PROCESS);
 	struct device *dev = fl->cctx->dev;
 	size_t size = 0;
 	uint32_t *domains = NULL, *session_ids = NULL;
+	uint32_t *phy_ids = NULL, *instance_ids = NULL;
 	int32_t *tgids_frpc = NULL;
 	struct fastrpc_mdctx_info *mdctx = NULL;
+	struct fastrpc_domain *domain = NULL;
+	uint32_t logical_domain_id = 0;
 
 	/* Validate that reserved fields are all zero */
 	for (ii = 0; ii < FASTRPC_MDCTX_IOCTL_RSVD; ii++) {
@@ -4225,6 +4306,47 @@ static int fastrpc_multidomain_ctx_obj_init(struct fastrpc_user *fl,
 		goto bail;
 	}
 
+	instance_ids = kzalloc(size, GFP_KERNEL);
+	if (instance_ids == NULL) {
+		err = -ENOMEM;
+		dev_err(dev, "Error %d: %s: failed to alloc instance_ids array of size %zu",
+			err, __func__, size);
+		goto bail;
+	}
+
+	phy_ids = kzalloc(size, GFP_KERNEL);
+	if (phy_ids == NULL) {
+		err = -ENOMEM;
+		dev_err(dev, "Error %d: %s: failed to alloc phy_ids array of size %zu",
+			err, __func__, size);
+		goto bail;
+	}
+
+	/* Retrieve phy_ids and instance_ids of the domains in the context */
+	for(ii = 0 ; ii < num_domains; ii++) {
+		if (IS_LEGACY_DOMAIN_ID(domains[ii])) {
+			err = fastrpc_convert_legacy_id_to_logical_id(domains[ii],
+					&logical_domain_id);
+			if (err != 0) {
+				dev_err(dev, "Error %d: %s: failed to get logical id for legacy domain %u",
+					err, __func__, domains[ii]);
+				goto bail;
+			}
+		} else {
+			logical_domain_id = domains[ii];
+		}
+
+		domain = fastrpc_lookup_domain_in_table(logical_domain_id, false);
+		if (!domain) {
+			err = -EINVAL;
+			pr_err("Error %d : %s : no domain found for logical id %u\n",
+				err, __func__, logical_domain_id);
+			goto bail;
+		}
+		instance_ids[ii] = domain->instance_id;
+		phy_ids[ii] = domain->phy_id;
+	}
+
 	/* Allocate tgids array to send to dsp */
 	size = sizeof(*tgids_frpc) * num_domains;
 	tgids_frpc = kzalloc(size, GFP_KERNEL);
@@ -4238,6 +4360,8 @@ static int fastrpc_multidomain_ctx_obj_init(struct fastrpc_user *fl,
 	mdctx->domains = domains;
 	mdctx->session_ids = session_ids;
 	mdctx->tgids_frpc = tgids_frpc;
+	mdctx->phy_ids = phy_ids;
+	mdctx->instance_ids = instance_ids;
 	INIT_LIST_HEAD(&mdctx->node);
 
 	err = fastrpc_multidomain_ctx_get_tgids(dev, mdctx);
@@ -4251,6 +4375,8 @@ bail:
 		kfree(session_ids);
 		kfree(domains);
 		kfree(mdctx);
+		kfree(phy_ids);
+		kfree(instance_ids);
 	}
 	return err;
 }
@@ -4262,13 +4388,15 @@ static int fastrpc_multidomain_ctx_dsp_send(struct fastrpc_channel_ctx *cctx,
 {
 	int err = 0;
 	struct fastrpc_enhanced_invoke invoke = {0};
-	struct fastrpc_invoke_args args[4] = {0};
+	struct fastrpc_invoke_args args[5] = {0};
+
 	struct {
 		u32 req;
 		u32 pad;
 		u64 ctx;
 		u32 id;
 		u32 num_domains;
+		u32 num_phy_ids;
 		u32 num_tgids;
 		u32 rsvd_len;
 	} inargs = {0};
@@ -4281,30 +4409,33 @@ static int fastrpc_multidomain_ctx_dsp_send(struct fastrpc_channel_ctx *cctx,
 	}
 	fastrpc_channel_update_invoke_cnt(cctx, true);
 
-	/* Convert logical domain ids to physical ids */
-
 	/* Prepare args for kernel to rootpd rpc call */
 	inargs.req = req;
 	inargs.ctx = ctx;
 	inargs.id = id;
 	inargs.num_tgids = num_domains;
 	inargs.num_domains = num_domains;
+	inargs.num_phy_ids = num_domains;
 
 	args[0].ptr = (u64)(uintptr_t)&inargs;
 	args[0].length = sizeof(inargs);
 	args[0].fd = -1;
 
-	/* This should be list of physical domain ids */
-	args[1].ptr = (u64)(uintptr_t)mdctx->domains;
-	args[1].length = num_domains * sizeof(*(mdctx->domains));
+	/* Peer-info will be shared as list of instance id's */
+	args[1].ptr = (u64)(uintptr_t)mdctx->instance_ids;
+	args[1].length = num_domains * sizeof(*(mdctx->instance_ids));
 	args[1].fd = -1;
 
-	args[2].ptr = (u64)(uintptr_t)mdctx->tgids_frpc;
-	args[2].length = num_domains * sizeof(*(mdctx->tgids_frpc));
+	args[2].ptr = (u64)(uintptr_t)mdctx->phy_ids;
+	args[2].length = num_domains * sizeof(*(mdctx->phy_ids));
 	args[2].fd = -1;
 
+	args[3].ptr = (u64)(uintptr_t)mdctx->tgids_frpc;
+	args[3].length = num_domains * sizeof(*(mdctx->tgids_frpc));
+	args[3].fd = -1;
+
 	invoke.inv.handle = FASTRPC_INIT_HANDLE;
-	invoke.inv.sc = FASTRPC_SCALARS(FASTRPC_RMID_INIT_MDCTX_MANAGE, 4, 0);
+	invoke.inv.sc = FASTRPC_SCALARS(FASTRPC_RMID_INIT_MDCTX_MANAGE, 5, 0);
 	invoke.inv.args = (__u64)args;
 
 	err = fastrpc_internal_invoke(cctx->default_user,
@@ -4328,7 +4459,7 @@ static int fastrpc_multidomain_ctx_dsp_manage(struct fastrpc_user *fl,
 	uint32_t num_domains)
 {
 	int err = 0, ii = 0;
-	uint32_t domain = 0;
+	uint32_t domain = 0, logical_domain_id = 0;
 	struct fastrpc_channel_ctx *cctx = NULL;
 	struct device *dev = fl->cctx->dev;
 
@@ -4343,7 +4474,18 @@ static int fastrpc_multidomain_ctx_dsp_manage(struct fastrpc_user *fl,
 		if (ii > 0 && domain == mdctx->domains[0])
 			break;
 
-		cctx = fastrpc_get_domain_channel_ctx(domain);
+		if (IS_LEGACY_DOMAIN_ID(domain)) {
+			err = fastrpc_convert_legacy_id_to_logical_id(domain, &logical_domain_id);
+			if (err != 0) {
+				dev_err(dev, "Error %d: %s: failed to get logical id for domain %u",
+					err, __func__, domain);
+				goto bail;
+			}
+		} else {
+			logical_domain_id = domain;
+		}
+
+		cctx = fastrpc_get_domain_channel_ctx(logical_domain_id);
 		if (!cctx) {
 			if (req == FASTRPC_MDCTX_REMOVE) {
 				/*
@@ -4564,6 +4706,7 @@ static int fastrpc_remote_process_state_dump(struct fastrpc_user *fl,
 	int err = 0, fd = proc->fd;
 	s32 tgid_frpc = -1;
 	u32 domain = proc->domain, session = proc->session;
+	u32 logical_domain_id = 0;
 	struct device *dev = fl->cctx->dev;
 	struct fastrpc_enhanced_invoke invoke = {0};
 	struct fastrpc_invoke_args args[2] = {0};
@@ -4575,19 +4718,43 @@ static int fastrpc_remote_process_state_dump(struct fastrpc_user *fl,
 		s32 num_pages;
 	} inargs = {0};
 
-	/* Validate domain and session id passed by user-app */
-	if (!IS_VALID_DOMAIN_ID(domain) || !IS_VALID_SESSION_ID(session)) {
+	/* Validate domain id passed by user */
+	if (!fastrpc_is_valid_logical_domain_id(domain)) {
+		if (IS_LEGACY_DOMAIN_ID(domain)) {
+			/* If its a valid legacy id, get the corresponding logical id */
+			err = fastrpc_convert_legacy_id_to_logical_id(domain, &logical_domain_id);
+			if (err != 0) {
+				err = -EBADR;
+				dev_err(dev, "Error %d: %s: no domain found for legacy domain id %u",
+					err, __func__, domain);
+				return err;
+			}
+		} else {
+			/*
+			 * If domain id is neither a valid logical id nor a legacy id,
+			 * return error.
+			 */
+			err = -EBADR;
+			dev_err(dev, "Error %d: %s: %u is not a valid logical domain id",
+					err, __func__, domain);
+			return err;
+		}
+	} else {
+		logical_domain_id = domain;
+	}
+
+	if (!IS_VALID_SESSION_ID(session)) {
 		err = -EBADR;
-		dev_err(dev, "Error %d: %s: domain %u or session %u is invalid",
-			err, __func__, domain, session);
+		dev_err(dev, "Error %d: %s: session %u is invalid",
+				err, __func__, session);
 		return err;
 	}
 
 	/* Retrieve the fastrpc pid of the session */
-	err = fastrpc_get_frpc_tgid(domain, session, &tgid_frpc);
+	err = fastrpc_get_frpc_tgid(logical_domain_id, session, &tgid_frpc);
 	if (err) {
 		dev_err(dev, "Error %d: %s: failed to get frpc tgid for domain %u, session %u",
-			err, __func__, domain, session);
+			err, __func__, logical_domain_id, session);
 		return err;
 	}
 
@@ -4884,6 +5051,7 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 	u32 multisession, size = 0;
 	u64 *perf_kernel;
 	int err = 0;
+	bool legacy_domains = true;
 
 	if (copy_from_user(&invoke, argp, sizeof(invoke)))
 		return -EFAULT;
@@ -4924,8 +5092,10 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 		kfree(fsig);
 		break;
 	case FASTRPC_INVOKE_NOTIF:
+		if (invoke.dynamic_domains)
+			legacy_domains = false;
 		err = fastrpc_get_notif_response(&notif,
-						(void *)invoke.invparam, fl);
+						(void *)invoke.invparam, fl, legacy_domains);
 		break;
 	case FASTRPC_INVOKE_MULTISESSION:
 		if (copy_from_user(&multisession, (void __user *)(uintptr_t)invoke.invparam, sizeof(multisession)))
@@ -5048,15 +5218,12 @@ static int fastrpc_get_dsp_info(struct fastrpc_user *fl, char __user *argp)
 		return  -EFAULT;
 
 	cap.capability = 0;
-	if (cap.domain >= FASTRPC_DEV_MAX) {
+
+	/* Validate that domain passed is either a logical or legacy domain id */
+	if (!IS_LEGACY_DOMAIN_ID(cap.domain) &&
+		!fastrpc_is_valid_logical_domain_id(cap.domain)) {
 		dev_err(fl->cctx->dev, "Error: Invalid domain id:%d, err:%d\n",
 			cap.domain, err);
-		return -ECHRNG;
-	}
-
-	/* Fastrpc Capablities does not support modem domain */
-	if (cap.domain == MDSP_DOMAIN_ID) {
-		dev_err(fl->cctx->dev, "Error: modem not supported %d\n", err);
 		return -ECHRNG;
 	}
 
@@ -6116,6 +6283,7 @@ int fastrpc_driver_register(struct fastrpc_driver *frpc_driver)
 	unsigned long irq_flags = 0;
 	struct fastrpc_user *user = NULL;
 	struct fastrpc_channel_ctx *cctx = NULL;
+	struct fastrpc_domain *domain = NULL;
 
 	if(frpc_driver == NULL) {
 		pr_err("%s : invalid registraion request", __func__);
@@ -6129,8 +6297,8 @@ int fastrpc_driver_register(struct fastrpc_driver *frpc_driver)
 	 * Iterate through all channel contexts to find the process
 	 * requested by the client driver.
 	 */
-	for (i = 0; i < FASTRPC_DEV_MAX; i++) {
-		cctx = g_frpc.gctx[i];
+	hash_for_each(g_frpc.fastrpc_domains_table, i, domain, node) {
+		cctx = domain->cctx;
 		if (!cctx)
 			continue;
 
@@ -6225,7 +6393,7 @@ static void fastrpc_pdr_cb(int state, char *service_path, void *priv)
 		pr_info("fastrpc: %s: %s (%s) is down for PDR on %s\n",
 			__func__, spd->spdname,
 			spd->servloc_name,
-			domains[cctx->domain_id]);
+			cctx->domain->name);
 		spin_lock_irqsave(&cctx->lock, flags);
 		spd->pdrcount++;
 		atomic_set(&spd->ispdup, 0);
@@ -6241,7 +6409,7 @@ static void fastrpc_pdr_cb(int state, char *service_path, void *priv)
 		pr_info("fastrpc: %s: %s (%s) is up for PDR on %s\n",
 			__func__, spd->spdname,
 			spd->servloc_name,
-			domains[cctx->domain_id]);
+			cctx->domain->name);
 		atomic_set(&spd->ispdup, 1);
 		break;
 	default:
@@ -6688,7 +6856,7 @@ static struct platform_driver fastrpc_cb_driver = {
 };
 
 int fastrpc_device_register(struct device *dev, struct fastrpc_channel_ctx *cctx,
-				   bool is_secured, const char *domain)
+				   bool is_secured, bool legacy, const char *domain)
 {
 	struct fastrpc_device_node *fdev;
 	int err;
@@ -6702,19 +6870,36 @@ int fastrpc_device_register(struct device *dev, struct fastrpc_channel_ctx *cctx
 	cctx->dev = dev;
 	fdev->miscdev.minor = MISC_DYNAMIC_MINOR;
 	fdev->miscdev.fops = &fastrpc_fops;
-	fdev->miscdev.name = devm_kasprintf(dev, GFP_KERNEL, "fastrpc-%s%s",
-					    domain, is_secured ? "-secure" : "");
+	if (legacy)
+		fdev->miscdev.name = devm_kasprintf(dev, GFP_KERNEL, "fastrpc-%s%s",
+						domain, is_secured ? "-secure" : "");
+	else
+		fdev->miscdev.name = devm_kasprintf(dev, GFP_KERNEL, "fastrpc-%s",
+							domain);
 	if (!fdev->miscdev.name)
 		return -ENOMEM;
 
 	err = misc_register(&fdev->miscdev);
 	if (!err) {
-		if (is_secured)
-			cctx->secure_fdevice = fdev;
-		else
+		/*
+		 * Device nodes are created based on following criteria:
+		 *   - For all channels, create a single device node with the
+		 *     new domain name
+		 *   - For channels that are marked as the legacy dsp of that type,
+		 *     (for backward compatibility), also create the secure (and
+		 *     non-secure, if applicable) device nodes using the legacy name
+		 *     of the channel (eg: using CDSP name for the first NSP)
+		 */
+		if (legacy) {
+			if (is_secured)
+					cctx->legacy_secure_fdevice = fdev;
+			else
+					cctx->legacy_fdevice = fdev;
+		} else {
 			cctx->fdevice = fdev;
+			cctx->secure_fdevice = fdev;
+		}
 	}
-
 	return err;
 }
 
@@ -6939,16 +7124,264 @@ int fastrpc_handle_rpc_response(struct fastrpc_channel_ctx *cctx, void *data, in
 	return 0;
 }
 
+/*
+ * Add entry for domain in hash-table or update status of existing entry.
+ *
+ * @param domain  Pointer to the fastrpc domain structure to be added.
+ * @param type    Type of the domain.
+ * @param label   Label of the domain.
+ * @param instance_id  Instance ID of the domain.
+ *
+ * @return 0 on success, negative error code on failure.
+ */
+static int fastrpc_add_domain_to_table(struct fastrpc_domain **domain,
+	u32 type, const char* label, u32 instance_id)
+{
+	struct fastrpc_domain *entry = NULL;
+	struct mutex *hmut = &g_frpc.hmut;
+	u32 phy_id = 0;
+	int err = 0;
+
+	phy_id = GENERATE_DSP_PHYSICAL_ID(type, instance_id);
+
+	/* Validate if there is an exisitng entry for phy_id */
+	entry = fastrpc_lookup_domain_in_table(phy_id, true);
+	if (!entry) {
+		/*
+		 * If the domain is not found in the table, create a new
+		 * entry and populate all the attributes
+		 * phy_id, instance_id, type, logical_id, name
+		 */
+		entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+		if (!entry)
+			return -ENOMEM;
+		entry->phy_id = phy_id;
+		entry->instance_id = instance_id;
+		entry->type = type;
+
+		/* Channel name will be generated as <dsp-type-name><physical-id> */
+		err = snprintf(entry->name, sizeof(entry->name), "%s%d", label, phy_id);
+		if (err < 0 || err != sizeof(entry->name)) {
+			err = -EFAULT;
+			pr_err("Error %d: %s failed to generate name for label %s phy_id %u",
+				err, __func__, label, phy_id);
+			return err;
+		}
+
+		mutex_lock(hmut);
+		hash_add(g_frpc.fastrpc_domains_table, &entry->node, phy_id);
+		g_frpc.dsp_counter[type]++;
+
+		if (instance_id == 0 || (type == FASTRPC_NSP && instance_id == 1))  {
+			/*
+			 * For LPASS, SDSP types only the dsp with instance_id 0 is
+			 *                 assigned as legacy adsp, slpi domains
+			 * For NSP types, DSP with instance id '0' and '1' are marked as legacy
+			 *                to handle legacy cdsp and cdsp1 domains
+			*/
+			entry->legacy = true;
+		}
+
+		entry->id = GENERATE_LOGICAL_DOMAIN_ID(type, g_frpc.dsp_counter[type]);
+		mutex_unlock(hmut);
+	} else {
+		if (entry->status != DSP_STATUS_DOWN) {
+			/*
+			* If entry for channel is already present in hash-table, it means
+			* the channel has gone through ssr. In that case, its status has to be
+			* DOWN. If not, system is in bad-state.
+			 */
+			err = EINVAL;
+			pr_err("Error %d: %s: %s (phy id %u) already in table with bad status %d",
+					err, __func__, entry->name, entry->phy_id, entry->status);
+			return err;
+		}
+	}
+	*domain = entry;
+	return 0;
+}
+
+/*
+ * fastrpc_lookup_domain_in_table() -
+ * Looks up a domain in the in the fastrpc domains hash-table using either
+ * physical id or logical domain id based on the flag.
+ *
+ * @param key          : physical id / logical domain id to lookup in table
+ * @param use_phy_id   : Flag to indicate whether to lookup using phy id
+ *                       or logical id.
+ *
+ * @return Pointer to the matching domain structure, or NULL if not found.
+ */
+static struct fastrpc_domain *fastrpc_lookup_domain_in_table(
+	u32 key, bool use_phy_id)
+{
+	struct fastrpc_domain *domain = NULL, *match = NULL;
+	struct mutex *hmut = &g_frpc.hmut;
+	int i = 0;
+
+	mutex_lock(hmut);
+	hash_for_each(g_frpc.fastrpc_domains_table, i, domain, node) {
+		/*
+		 * Based on flag, lookup domain based on 32-bit physical id,
+		 * logical id
+		 */
+		if (use_phy_id) {
+			if (domain->phy_id == key) {
+				match = domain;
+				break;
+			}
+		} else {
+			if (domain->id == key) {
+				match = domain;
+				break;
+			}
+		}
+	}
+	mutex_unlock(hmut);
+	return match;
+}
+
+/*
+ * Deletes all entries from the fastrpc domains hash-table.
+ */
+static void fastrpc_delete_domains_table(void)
+{
+	struct fastrpc_domain *domain = NULL;
+	struct mutex *hmut = &g_frpc.hmut;
+	int i = 0;
+
+	mutex_lock(hmut);
+	hash_for_each(g_frpc.fastrpc_domains_table, i, domain, node) {
+		hash_del(&domain->node);
+		kfree(domain);
+	}
+	mutex_unlock(hmut);
+}
+
+/*
+ * Convert legacy domain ID to logical domain ID
+ *
+ * This function takes a legacy ID as input and returns the corresponding
+ * logical ID.
+ *
+ * @param id: Legacy ID to convert
+ * @param logical_id :   Pointer to logical id
+ *
+ * @return 0 on success
+ *         EINAL if logical id is not found.
+ */
+static int fastrpc_convert_legacy_id_to_logical_id(u32 legacy_id,
+	u32 *logical_id)
+{
+	struct fastrpc_domain *domain = NULL;
+	struct mutex *hmut = &g_frpc.hmut;
+	int i = 0, err = -EINVAL;
+
+	mutex_lock(hmut);
+	hash_for_each(g_frpc.fastrpc_domains_table, i, domain, node) {
+		if (domain->legacy_id == legacy_id) {
+			*logical_id = domain->id;
+			err = 0;
+			break;
+		}
+	}
+	mutex_unlock(hmut);
+	return err;
+}
+
+/*
+ * Populate fastrpc_domain from device tree node.
+ *
+ * @param rdev   Device structure to extract info from.
+ * @param domain Pointer to fastrpc_domain pointer to be populated.
+ *
+ * @return 0 on success, negative error code on failure.
+ */
+int fastrpc_populate_domain_from_dt(struct device *rdev,
+				struct fastrpc_domain **domain)
+{
+	const char *label = NULL;
+	u32 type = 0, instance_id = U32_MAX;
+	int err = 0;
+	bool valid_label = false;
+
+	/* Retrieve the label of DSP from DT */
+	err = of_property_read_string(rdev->of_node, "label", &label);
+	if (err < 0) {
+		dev_err(rdev, "Error %d: %s: FastRPC DSP label not specified in DT\n",
+			err, __func__);
+		return err;
+	}
+	/* Validate the label retrieved from DT */
+	for (int i = 1; i < FASTRPC_MAX_DSP_TYPE; i++) {
+		if (strcmp(label, fastrpc_dsp_labels[i]) == 0) {
+			valid_label = true;
+			break;
+		}
+	}
+
+	/*
+	 * Fail the device probe if it has invalid label. This driver assumes that
+	 * the DTSI file is always updated to contain the new DT properties.
+	 */
+	if (!valid_label) {
+		err = -EINVAL;
+		dev_err(rdev, "Error %d: %s: DSP label %s specified in DT is invalid\n",
+			err, __func__, label);
+		return err;
+	}
+
+	/*
+	 * Retrieve and validate the type of DSP from DT
+	 *
+	 * Fail the call if either dsp-type is not present in DT,
+	 * or invalid DSP type is specified in DT
+	 */
+	err = of_property_read_u32(rdev->of_node, "dsp-type", &type);
+	if (err < 0) {
+		dev_err(rdev, "Error %d : %s: dsp-type not specified for %s",
+			err, __func__, label);
+		return -EINVAL;
+	} else if (type >= FASTRPC_MAX_DSP_TYPE || type == 0) {
+		err = -EINVAL;
+		dev_err(rdev, "Error %d: %s: DSP type %u specified in DT is invalid\n",
+			err, __func__, type);
+		return err;
+	}
+
+	/* Retrieve the instance id of the DSP, fail the call if not specified */
+	err = of_property_read_u32(rdev->of_node, "instance-id", &instance_id);
+	if (err < 0) {
+		dev_err(rdev, "Error %d: %s: instance-id not specified for %s\n",
+			err, __func__, label);
+		return -EINVAL;
+	}
+
+	/* Add the info to the domain table */
+	err = fastrpc_add_domain_to_table(domain, type, label, instance_id);
+	if (err < 0) {
+		dev_err(rdev, "Error %d: %s: failed to add domain %s to table (type %u, instance id %u)",
+			err, __func__, label, type, instance_id);
+		return err;
+	}
+	return err;
+}
+
 static int fastrpc_init(void)
 {
-	int ret;
+	int ret, i;
 #ifdef CONFIG_DEBUG_FS
 	struct dentry *debugfs_root = NULL;
 #endif
-
 	spin_lock_init(&g_frpc.glock);
 	mutex_init(&g_frpc.gmut);
+	mutex_init(&g_frpc.hmut);
 	idr_init(&g_frpc.mdctx_idr);
+	hash_init(g_frpc.fastrpc_domains_table);
+	fastrpc_sysfs_register_kset();
+	for (i = 0; i < FASTRPC_MAX_DSP_TYPE; i++) {
+		g_frpc.dsp_counter[i] = -1;
+	}
 	ret = platform_driver_register(&fastrpc_cb_driver);
 	if (ret < 0) {
 		pr_err("fastrpc: failed to register cb driver\n");
@@ -6977,9 +7410,12 @@ module_init(fastrpc_init);
 
 static void fastrpc_exit(void)
 {
+	fastrpc_sysfs_deregister_kset();
 	platform_driver_unregister(&fastrpc_cb_driver);
 	idr_destroy(&g_frpc.mdctx_idr);
 	mutex_destroy(&g_frpc.gmut);
+	fastrpc_delete_domains_table();
+	mutex_destroy(&g_frpc.hmut);
 	fastrpc_transport_deinit();
 #ifdef CONFIG_DEBUG_FS
 	debugfs_remove_recursive(g_frpc.debugfs_root);

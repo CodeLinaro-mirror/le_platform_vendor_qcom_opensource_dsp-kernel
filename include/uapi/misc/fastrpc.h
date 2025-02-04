@@ -114,7 +114,8 @@ enum fastrpc_multimode_invoke_type {
 	FASTRPC_INVOKE_MULTISESSION = 6,
 	FASTRPC_INVOKE_CONFIG = 7,
 	FASTRPC_INVOKE_SESSIONINFO = 8,
-	FASTRPC_INVOKE_MDCTX_MANAGE,
+	FASTRPC_INVOKE_MDCTX_MANAGE = 9,
+	FASTRPC_INVOKE_REMOTE_PROCESS_STATE_DUMP = 10,
 };
 
 struct fastrpc_init_create {
@@ -200,6 +201,26 @@ struct fastrpc_ioctl_mdctx_manage {
 	 */
 	__u64 ctx;
 	__u32 reserved[FASTRPC_MDCTX_IOCTL_RSVD];
+};
+
+/* Payload for FASTRPC_INVOKE_REMOTE_PROCESS_STATE_DUMP type */
+struct fastrpc_ioctl_remote_proc_state_dump {
+	/* Domain id of dsp on which remote process is running */
+	__u32 domain;
+
+	/* Session id of remote process */
+	__u32 session;
+
+	/* Level of logging on remote subsystem */
+	__u32 level;
+
+	/* String buffer where process state log will be written to */
+	__s32 fd;
+
+	/* Size of buffer */
+	__u32 size;
+
+	__u32 reserved[5];
 };
 
 enum fastrpc_control_type {

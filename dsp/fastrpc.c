@@ -6380,8 +6380,9 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 	struct fastrpc_buf *buf = NULL;
 	struct iommu_domain *domain = NULL;
 	struct gen_pool *gen_pool = NULL;
-	int frpc_gen_addr_pool[2] = {0, 0};
-	u32 smmu_alloc_range[2] = {0, 0};
+	int frpc_gen_addr_pool[2] = {0};
+	u32 smmu_alloc_range32[2] = {0};
+	u64 smmu_alloc_range64[2] = {0};
 	struct sg_table sgt;
 	struct fastrpc_smmu *smmucb = NULL;
 #ifdef CONFIG_DEBUG_FS
@@ -6462,14 +6463,24 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 	if (of_property_read_u32(dev->of_node, "reg", &smmucb->sid))
 		dev_info(dev, "FastRPC Session ID not specified in DT\n");
 
-	/* Set SMMU context bank, min and max allocation range */
-	if (!of_property_read_u32_array(dev->of_node, "alloc-size-range",
-				smmu_alloc_range,
-				sizeof(smmu_alloc_range)/sizeof(smmu_alloc_range[0]))) {
-		smmucb->minallocsize = smmu_alloc_range[0];
-		smmucb->maxallocsize = smmu_alloc_range[1];
+	/*
+	 * Set SMMU context bank, min and max allocation range.
+	 * Read alloc-size-range property according to defintion array
+	 * type in devicetree.
+	 */
+	if (!of_property_read_u64_array(dev->of_node, "alloc-size-range",
+				smmu_alloc_range64,
+				sizeof(smmu_alloc_range64)/sizeof(smmu_alloc_range64[0]))) {
+		smmucb->minallocsize = smmu_alloc_range64[0];
+		smmucb->maxallocsize = smmu_alloc_range64[1];
+	} else if (!of_property_read_u32_array(dev->of_node, "alloc-size-range",
+				smmu_alloc_range32,
+				sizeof(smmu_alloc_range32)/sizeof(smmu_alloc_range32[0]))) {
+		smmucb->minallocsize = (u64)smmu_alloc_range32[0];
+		smmucb->maxallocsize = (u64)smmu_alloc_range32[1];
 	}
-	smmucb->totalbytes = SMMU_4GB_ADDRESS_SPACE;
+
+	smmucb->totalbytes = (1ULL << smmucb->pa_bits) - 1;
 
 	/* Set SMMU device private data with fastrpc SMMU CB pointer */
 	dev_set_drvdata(dev, smmucb);

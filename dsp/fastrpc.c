@@ -1604,9 +1604,9 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 					(addr - vm_start) + len > ctx->maps[i]->size) {
 					err = -EFAULT;
 					dev_err(dev,
-						"Invalid buffer addr 0x%llx len 0x%llx vm start 0x%llx vm end 0x%llx IPA 0x%llx size 0x%llx",
+						"Invalid buffer addr 0x%llx len 0x%llx vm start 0x%llx vm end 0x%llx IPA 0x%llx size 0x%llx\n",
 						ctx->args[i].ptr, len, vm_start, vm_end,
-							ctx->maps[i]->phys, ctx->maps[i]->size);
+						ctx->maps[i]->phys, ctx->maps[i]->size);
 					goto bail;
 				}
 				else
@@ -1660,9 +1660,8 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 			PERF(ctx->fl->profile, GET_COUNTER(perf_counter, PERF_COPY),
 
 			if (!kernel) {
-				if (copy_from_user(dst, (void __user *)src,
-						   len)) {
-					dev_err(dev, "Error: invalid buffer length 0x%llx", len);
+				if (copy_from_user(dst, (void __user *)src, len)) {
+					dev_err(dev, "invalid buffer length 0x%llx\n", len);
 					err = -EFAULT;
 					goto bail;
 				}

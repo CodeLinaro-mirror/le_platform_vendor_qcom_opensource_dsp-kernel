@@ -35,34 +35,242 @@ struct fastrpc_channel_ctx* get_current_channel_ctx(struct device *dev)
 	return dev_get_drvdata(dev->parent);
 }
 
+/*
+ * Retrieves legacy information for a given fastrpc_domain.
+ *
+ * This function maps the domain's type to its corresponding legacy name
+ * and ID, based on the following table:
+ *
+ *   Domain Type       | Legacy Name              | Legacy ID
+ *   ------------------|--------------------------|---------------
+ *   SDSP              | domains[SDSP_DOMAIN_ID]  | SDSP_DOMAIN_ID
+ *   LPASS             | domains[ADSP_DOMAIN_ID]  | ADSP_DOMAIN_ID
+ *   NSP(instance 0)   | domains[CDSP_DOMAIN_ID]  | CDSP_DOMAIN_ID
+ *   NSP(instance 1)   | domains[CDSP1_DOMAIN_ID] | CDSP1_DOMAIN_ID
+ *
+ * @param domain Pointer to the fastrpc_domain structure to retrieve
+ * legacy info
+ *
+ * @return 0 on success, or a negative error code on failure
+ *
+ * Error codes:
+ *   -EINVAL: Invalid domain type
+ */
+static int fastrpc_retrieve_legacy_info(struct fastrpc_domain *domain)
+{
+	int err = 0;
+
+	switch (domain->type) {
+	case FASTRPC_SDSP:
+		domain->legacy_name = (char *)legacy_domains[SDSP_DOMAIN_ID];
+		domain->legacy_id = SDSP_DOMAIN_ID;
+		break;
+	case FASTRPC_LPASS:
+		domain->legacy_name = (char *)legacy_domains[ADSP_DOMAIN_ID];
+		domain->legacy_id = ADSP_DOMAIN_ID;
+		break;
+	case FASTRPC_NSP:
+		if (domain->instance_id == 0) {
+			domain->legacy_name = (char *)legacy_domains[CDSP_DOMAIN_ID];
+			domain->legacy_id = CDSP_DOMAIN_ID;
+		} else if (domain->instance_id == 1) {
+			domain->legacy_name = (char *)legacy_domains[CDSP1_DOMAIN_ID];
+			domain->legacy_id = CDSP1_DOMAIN_ID;
+		}
+		break;
+	default:
+		err = -EINVAL;
+		break;
+	}
+	return err;
+}
+
+/*
+ * Configures the service locator for a given fastrpc channel context.
+ *
+ * This function sets up the service locator for the specified domain type,
+ * registering the necessary services and clients.
+ *
+ * @param data Pointer to the fastrpc channel context structure
+ *
+ * @return 0 on success, or a negative error code on failure
+ *
+ * Supported domain types:
+ *   - LPASS: Sets up service locators for audio, sensors, and OIS
+ *            PDR services
+ *   - SDSP: Sets up service locator for sensors PDR SLPI service
+ *
+ * Note: Other domain types are currently unsupported and will return 0
+ *		 without configuring any services.
+ */
+static int fastrpc_configure_service_locator(
+	struct fastrpc_channel_ctx *data)
+{
+	struct fastrpc_domain *domain = data->domain;
+	int err = 0;
+
+	switch (domain->type) {
+	case FASTRPC_LPASS:
+		err = fastrpc_setup_service_locator(
+				data, AUDIO_PDR_SERVICE_LOCATION_CLIENT_NAME,
+				AUDIO_PDR_ADSP_SERVICE_NAME, ADSP_AUDIOPD_NAME, 0);
+		if (err)
+			return err;
+
+		err = fastrpc_setup_service_locator(
+				data, SENSORS_PDR_ADSP_SERVICE_LOCATION_CLIENT_NAME,
+				SENSORS_PDR_ADSP_SERVICE_NAME, ADSP_SENSORPD_NAME, 1);
+		if (err)
+			return err;
+
+		err = fastrpc_setup_service_locator(
+				data, OIS_PDR_ADSP_SERVICE_LOCATION_CLIENT_NAME,
+				OIS_PDR_ADSP_SERVICE_NAME, ADSP_OISPD_NAME, 2);
+		if (err)
+			return err;
+		break;
+
+	case FASTRPC_SDSP:
+		err = fastrpc_setup_service_locator(
+				data, SENSORS_PDR_SLPI_SERVICE_LOCATION_CLIENT_NAME,
+				SENSORS_PDR_SLPI_SERVICE_NAME, SLPI_SENSORPD_NAME, 0);
+		if (err)
+			return err;
+		break;
+	default:
+		break;
+	}
+	return err;
+}
+
+/*
+ * Configures device nodes for a given fastrpc channel context and device.
+ *
+ * This function registers device nodes for the specified channel
+ *
+ * For NSP domains:
+ *   - Registers a single device node with domain name
+ *   - If the domain has a legacy set to true,
+ *     registers two additional device nodes with the legacy name
+ *     one for secure and non-secure.
+ *
+ * For non-NSP domains:
+ *   - Registers a single device node with the domain name
+ *   - If the domain has a legacy name,
+ *     registers an additional secure device node with the
+ *     legacy name
+ *
+ * @param data Pointer to the fastrpc channel context structure
+ * @param rdev Pointer to the device structure
+ *
+ * @return 0 on success, or a negative error code on failure
+ */
+static int fastrpc_configure_device_nodes(struct fastrpc_channel_ctx *data,
+	struct device *rdev)
+{
+	struct fastrpc_domain *domain = data->domain;
+	int err = 0;
+
+	err = fastrpc_device_register(rdev, data, true, false,
+				domain->name);
+	if (err)
+		return err;
+
+	if (domain->legacy) {
+		err = fastrpc_retrieve_legacy_info(domain);
+		if (err)
+			return err;
+
+		/* Register a secure device with legacy name */
+		err = fastrpc_device_register(rdev, data, true, true,
+			domain->legacy_name);
+		if (err)
+			return err;
+
+		/* For NSP register a non secure device with legacy name*/
+		if (domain->type == FASTRPC_NSP) {
+			err = fastrpc_device_register(rdev, data, false, true,
+				domain->legacy_name);
+			if (err)
+				return err;
+		}
+	}
+
+	return 0;
+}
+
+static void fastrpc_remove_device_nodes(struct fastrpc_channel_ctx *cctx)
+{
+	if (cctx->fdevice)
+		misc_deregister(&cctx->fdevice->miscdev);
+
+	if (cctx->secure_fdevice)
+		misc_deregister(&cctx->secure_fdevice->miscdev);
+
+	if(cctx->legacy_fdevice)
+		misc_deregister(&cctx->legacy_fdevice->miscdev);
+
+	if(cctx->legacy_secure_fdevice)
+		misc_deregister(&cctx->legacy_secure_fdevice->miscdev);
+
+	return;
+}
+/*
+ * Configures wake-up sources for FastRPC channel context.
+ *
+ * This function registers wake-up sources for various devices associated
+ * with the FastRPC channel context, enabling them to trigger interrupts
+ * or wake up the system from a low-power state when necessary.
+ *
+ * @param data Pointer to the FastRPC channel context structure.
+ */
+static void fastrpc_configure_wakeup_source(struct fastrpc_channel_ctx *data)
+{
+	mutex_lock(&data->wake_mutex);
+
+	/* Register wake-up source for non-secure fdevice, if present. */
+	if (data->fdevice) {
+		fastrpc_register_wakeup_source(
+			data->fdevice->miscdev.this_device,
+			FASTRPC_NON_SECURE_WAKE_SOURCE_CLIENT_NAME,
+			&data->wake_source);
+	}
+
+	/* Register wake-up source for secure fdevice, if present. */
+	if (data->secure_fdevice) {
+		fastrpc_register_wakeup_source(
+			data->secure_fdevice->miscdev.this_device,
+			FASTRPC_SECURE_WAKE_SOURCE_CLIENT_NAME,
+			&data->wake_source_secure);
+	}
+
+	mutex_unlock(&data->wake_mutex);
+	return;
+}
+
+/*
+ * Probe function for the fastrpc rpmsg device nodes.
+ *
+ * This function is called when fastrpc's rpmsg node for a remote channel
+ * is probed. It configures all channel related data structures in the
+ * driver.
+ *
+ * @param rpdev Pointer to the RPMSG device structure.
+ * @return 0 on success, negative error code on failure.
+ */
 static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 {
 	struct device *rdev = &rpdev->dev;
 	struct fastrpc_channel_ctx *data;
-	int i, err, domain_id = -1, vmcount;
-	const char *domain;
+	int i, err, vmcount;
+	struct fastrpc_domain *domain = NULL;
 	bool secure_dsp;
 	unsigned int vmids[FASTRPC_MAX_VMIDS];
 
 	dev_info(rdev, "%s started\n", __func__);
-
-	err = of_property_read_string(rdev->of_node, "label", &domain);
-	if (err) {
-		dev_info(rdev, "FastRPC Domain not specified in DT\n");
+	err = fastrpc_populate_domain_from_dt(rdev, &domain);
+	if (err)
 		return err;
-	}
-
-	for (i = 0; i <= CDSP_DOMAIN_ID; i++) {
-		if (!strcmp(domains[i], domain)) {
-			domain_id = i;
-			break;
-		}
-	}
-
-	if (domain_id < 0) {
-		dev_info(rdev, "FastRPC Invalid Domain ID %d\n", domain_id);
-		return -EINVAL;
-	}
 
 	if (of_reserved_mem_device_init_by_idx(rdev, rdev->of_node, 0))
 		dev_info(rdev, "no reserved DMA memory for FASTRPC\n");
@@ -122,86 +330,54 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	ida_init(&data->tgid_frpc_ida);
 	init_completion(&data->ssr_complete);
 	init_waitqueue_head(&data->ssr_wait_queue);
-	data->domain_id = domain_id;
+	data->domain_id = domain->id;
 	data->max_sess_per_proc = FASTRPC_MAX_SESSIONS_PER_PROCESS;
 	data->rpdev = rpdev;
+	data->domain = domain;
+	data->unsigned_support = false;
+	data->cpuinfo_todsp = FASTRPC_CPUINFO_DEFAULT;
 
 	err = of_platform_populate(rdev->of_node, NULL, NULL, rdev);
 	if (err)
 		goto populate_error;
 
-	switch (domain_id) {
-	case ADSP_DOMAIN_ID:
-	case MDSP_DOMAIN_ID:
-	case SDSP_DOMAIN_ID:
-		/* Unsigned PD offloading is only supported on CDSP*/
-		data->unsigned_support = false;
-		err = fastrpc_device_register(rdev, data, secure_dsp, domains[domain_id]);
-		if (err)
-			goto fdev_error;
-		data->cpuinfo_todsp = FASTRPC_CPUINFO_DEFAULT;
-		break;
-	case CDSP_DOMAIN_ID:
+	if (domain->type == FASTRPC_NSP) {
 		data->unsigned_support = true;
-		/* Create both device nodes so that we can allow both Signed and Unsigned PD */
-		err = fastrpc_device_register(rdev, data, true, domains[domain_id]);
-		if (err)
-			goto fdev_error;
-
-		err = fastrpc_device_register(rdev, data, false, domains[domain_id]);
-		if (err)
-			goto fdev_error;
 		data->cpuinfo_todsp = FASTRPC_CPUINFO_EARLY_WAKEUP;
-		break;
-	default:
-		err = -EINVAL;
-		goto fdev_error;
 	}
 
-	if (domain_id == ADSP_DOMAIN_ID) {
-		err = fastrpc_setup_service_locator(data, AUDIO_PDR_SERVICE_LOCATION_CLIENT_NAME,
-			AUDIO_PDR_ADSP_SERVICE_NAME, ADSP_AUDIOPD_NAME, 0);
+	/* Configure device nodes for DSP */
+	err = fastrpc_configure_device_nodes(data, rdev);
 		if (err)
 			goto fdev_error;
 
-		err = fastrpc_setup_service_locator(data, SENSORS_PDR_ADSP_SERVICE_LOCATION_CLIENT_NAME,
-			SENSORS_PDR_ADSP_SERVICE_NAME, ADSP_SENSORPD_NAME, 1);
+	/* Create sysfs directory for channel */
+	err = fastrpc_sysfs_domain_create(data);
 		if (err)
 			goto fdev_error;
 
-		err = fastrpc_setup_service_locator(data, OIS_PDR_ADSP_SERVICE_LOCATION_CLIENT_NAME,
-			OIS_PDR_ADSP_SERVICE_NAME, ADSP_OISPD_NAME, 2);
+	/* Configure service locators for DSP */
+	err = fastrpc_configure_service_locator(data);
 		if (err)
 			goto fdev_error;
-	} else if (domain_id == SDSP_DOMAIN_ID) {
-		err = fastrpc_setup_service_locator(data, SENSORS_PDR_SLPI_SERVICE_LOCATION_CLIENT_NAME,
-			SENSORS_PDR_SLPI_SERVICE_NAME, SLPI_SENSORPD_NAME, 0);
-		if (err)
-			goto fdev_error;
-	}
 
-	mutex_lock(&data->wake_mutex);
-	if(data->fdevice)
-		fastrpc_register_wakeup_source(data->fdevice->miscdev.this_device,
-			FASTRPC_NON_SECURE_WAKE_SOURCE_CLIENT_NAME, &data->wake_source);
-	if(data->secure_fdevice)
-		fastrpc_register_wakeup_source(data->secure_fdevice->miscdev.this_device,
-			FASTRPC_SECURE_WAKE_SOURCE_CLIENT_NAME, &data->wake_source_secure);
-	mutex_unlock(&data->wake_mutex);
+	/* Configure_wakeup_sources */
+	fastrpc_configure_wakeup_source(data);
 
+	/* Create default user for channel */
 	err = fastrpc_channel_default_user_create(data);
 	if (err)
 		goto fdev_error;
 
-	fastrpc_update_gctx(data, 1);
-
-	dev_info(rdev, "Opened rpmsg channel for %s", domain);
+	/* Update domain status and global ctx */
+	domain->status = DSP_STATUS_UP;
+	domain->cctx = data;
+	dev_info(rdev, "Opened rpmsg channel for %s", domain->name);
 	return 0;
 
 fdev_error:
 	if (data->default_user)
 		fastrpc_channel_default_user_delete(data);
-
 	kfree(data);
 
 populate_error:
@@ -213,18 +389,31 @@ populate_error:
 	return err;
 }
 
+/*
+ * Remove function for the fastrpc RPMSG device driver.
+ *
+ * This function is called when the RPMSG device is removed or shut down.
+ * It releases any resources allocated by the fastrpc driver and performs
+ * any necessary cleanup.
+ *
+ * @param rpdev Pointer to the RPMSG device structure.
+ */
 static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 {
 	struct fastrpc_channel_ctx *cctx = dev_get_drvdata(&rpdev->dev);
+	struct fastrpc_domain *domain = cctx->domain;
 	struct fastrpc_user *user, *n;
 	unsigned long flags;
 	int i = 0;
 
 	dev_info(cctx->dev, "%s started", __func__);
 
+	fastrpc_sysfs_domain_remove(cctx);
 	/* No invocations past this point */
 	spin_lock_irqsave(&cctx->lock, flags);
 	atomic_set(&cctx->teardown, 1);
+	domain->status = DSP_STATUS_DOWN;
+	domain->cctx = NULL;
 	cctx->staticpd_status = false;
 	spin_unlock_irqrestore(&cctx->lock, flags);
 	frpc_coredump(cctx);
@@ -234,13 +423,7 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 		fastrpc_notify_users(user);
 	}
 	spin_unlock_irqrestore(&cctx->lock, flags);
-
-	if (cctx->fdevice)
-		misc_deregister(&cctx->fdevice->miscdev);
-
-	if (cctx->secure_fdevice)
-		misc_deregister(&cctx->secure_fdevice->miscdev);
-
+	fastrpc_remove_device_nodes(cctx);
 	for (i = 0; i < FASTRPC_MAX_SPD; i++) {
 		if (cctx->spd[i].pdrhandle)
 			pdr_handle_release(cctx->spd[i].pdrhandle);
@@ -279,15 +462,15 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	}
 	mutex_unlock(&cctx->wake_mutex);
 
-	dev_info(cctx->dev, "Closing rpmsg channel for %s", domains[cctx->domain_id]);
+	dev_info(cctx->dev, "Closing rpmsg channel for %s", cctx->domain->name);
 	kfree(cctx->gidlist.gids);
 	of_platform_depopulate(&rpdev->dev);
 	fastrpc_mmap_remove_ssr(cctx, false);
 	cctx->dev = NULL;
 	cctx->rpdev = NULL;
+	cctx->domain = NULL;
 	// Wake up all process releases, if waiting for SSR to complete
 	complete_all(&cctx->ssr_complete);
-	fastrpc_update_gctx(cctx, 0);
 	fastrpc_channel_ctx_put(cctx);
 }
 

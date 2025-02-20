@@ -2061,6 +2061,8 @@ static int fastrpc_invoke_send(struct fastrpc_pool_ctx *sctx,
 
 	if (kernel == KERNEL_MSG_WITH_ZERO_PID)
 		msg->pid = 0;
+	if (kernel == KERNEL_MSG_WITH_ZERO_PID_ZERO_TID)
+		msg->tid = 0;
 
 	/* Last 2 ctx ID bits, to route glink msg to appropriate PD type on DSP */
 	msg->ctx = FASTRPC_PACK_PD_IN_CTXID(ctx->ctxid,
@@ -3687,7 +3689,7 @@ void fastrpc_free_user(struct fastrpc_user *fl)
 }
 
 /*
- * Free fastrpc user object of client
+ * Free fastrpc user object of client app/remote channel
  *
  * @arg1 : fastrpc_user (NULL for default channel user, non-NULL for user-apps)
  * @arg2 : channel context (NULL for user-apps, non-NULL for default user)
@@ -3960,7 +3962,10 @@ static int fastrpc_user_obj_create(struct file *filp,
 		return -ENOMEM;
 
 	if (filp) {
-		/* Released in fastrpc_device_release() */
+		/*
+		 * Increment refcount of channel object for new user.
+		 * Released in fastrpc_device_release().
+		 */
 		fastrpc_channel_ctx_get(cctx);
 
 		filp->private_data = fl;
@@ -4281,6 +4286,242 @@ static void fastrpc_notif_find_process(int domain, struct fastrpc_channel_ctx *c
 
 	fastrpc_queue_pd_status(user, domain, notif->status, user->sessionid);
 	fastrpc_file_put(user, true);
+}
+
+
+/*
+ * fastrpc_handle_dsp_root_request() - Handle reverse RPC request from root PD
+ * of DSP.
+ * @arg1: work struct.
+ *
+ * This function is invoked by a kernel worker thread to service a reverse RPC
+ * request made by root PD on DSP.
+ *
+ * The proxy object is used to make forward RPC calls to the DSP with requested
+ * data or error response.
+ *
+ * In case of failure to create the proxy object, the reverse RPC request
+ * times out on the DSP.
+ */
+
+void fastrpc_handle_dsp_root_request(struct work_struct *work)
+{
+	const unsigned int ROOT_RESPONSE_ARG_LENGTH = 2, ROOT_MEM_MSG_SIZE = 4,
+                       ROOT_ERROR_MSG_SIZE = 1;
+	struct fastrpc_enhanced_invoke ioctl = {0};
+	struct fastrpc_phy_page2 page = {0};
+	struct fastrpc_buf *pbuf = NULL;
+	struct kcomm_worker *kcomm_work =
+			container_of(work, struct kcomm_worker, work);
+	struct fastrpc_channel_ctx *cctx = kcomm_work->domain->cctx;
+	struct fastrpc_root_msg rm = {0};
+	struct fastrpc_smmu *smmucb = NULL;
+	struct fastrpc_invoke_args args[2] = {0};
+	struct fastrpc_user *default_user = cctx->kcomm_user.obj;
+	u32 *served_msg_index= &cctx->kcomm_user.served_msg_index;
+	int err = 0;
+	unsigned long flags = 0;
+	struct {
+		int dsp_tid;
+		int msg_type;
+		int data_len;
+		int data_struct_len;
+	} inargs = {0};
+
+	fastrpc_channel_ctx_get(cctx);
+	spin_lock_irqsave(&cctx->lock, flags);
+	if (atomic_read(&cctx->teardown)) {
+		/* If subsystem already going thru SSR, then fail root req immediately */
+		spin_unlock_irqrestore(&cctx->lock, flags);
+		goto cleanup;
+	}
+	/*
+	 * Update invoke count to block SSR handling thread from cleaning up
+	 * the channel resources, while it is still being used by this thread.
+	 */
+	fastrpc_channel_update_invoke_cnt(cctx, true);
+
+	smmucb = &default_user->sctx->smmucb[DEFAULT_SMMU_IDX];
+
+	/*
+	 * Copy over entire struct in case entry
+	 * in circular buffer is overwritten
+	 */
+	rm = cctx->kcomm_user.root_msg[*served_msg_index];
+	(*served_msg_index)++;
+	if (*served_msg_index > ROOT_REQUEST_BUFFER_SIZE - 1)
+		*served_msg_index = 0;
+	spin_unlock_irqrestore(&cctx->lock, flags);
+
+	if (rm.error) {
+		goto error_msg;
+	}
+
+	switch (rm.type) {
+		case ROOT_MEM_REQ_POOL:
+		case ROOT_MEM_REQ_HEAP:
+		{
+			uint32_t alloc_size = *(uint32_t *)rm.data;
+
+			/* The allocation size requested must be greater than 0 */
+			if (alloc_size == 0) {
+				rm.error = -EINVAL;
+				goto error_msg;
+			}
+			rm.error = fastrpc_buf_alloc(default_user,
+					smmucb, alloc_size, ROOT_MEM_BUF, &pbuf);
+			if (rm.error) {
+				goto error_msg;
+			}
+
+			/*
+			 * Buffer will be freed only in case of an SSR
+			 * when proxy object is deleted.
+			 */
+			spin_lock(&default_user->lock);
+			list_add_tail(&pbuf->node, &default_user->mmaps);
+			spin_unlock(&default_user->lock);
+
+			if (pbuf) {
+				if (rm.type == ROOT_MEM_REQ_POOL)
+					page.flags = DSP_MMAP_ADD_ROOT_POOL_MEM;
+				else
+					page.flags = DSP_MMAP_ADD_ROOT_HEAP_MEM;
+
+				page.addr = pbuf->phys;
+				page.size = pbuf->size;
+			}
+			inargs.dsp_tid = rm.dsp_tid;
+			inargs.msg_type = rm.type;
+			inargs.data_len = ROOT_MEM_MSG_SIZE;
+			inargs.data_struct_len = 1 * ROOT_MEM_MSG_SIZE;
+
+			args[0].ptr = (u64)(uintptr_t)&inargs;
+			args[0].length = sizeof(inargs);
+			args[0].fd = -1;
+			args[1].ptr = (u64)(uintptr_t)&page;
+			args[1].length = 1 * sizeof(page);
+			args[1].fd = -1;
+
+			ioctl.inv.handle = FASTRPC_INIT_HANDLE;
+			ioctl.inv.sc = FASTRPC_SCALARS(FASTRPC_RMID_KCOMM_REMOTE_CALL,
+						ROOT_RESPONSE_ARG_LENGTH , 0);
+			ioctl.inv.args = (__u64)args;
+			break;
+		}
+		case ROOT_ERROR_MSG: {
+error_msg:
+			inargs.dsp_tid = rm.dsp_tid;
+			inargs.msg_type = ROOT_ERROR_MSG;
+			inargs.data_len = ROOT_ERROR_MSG_SIZE;
+			inargs.data_struct_len = ROOT_ERROR_MSG_SIZE;
+
+			args[0].ptr = (u64)(uintptr_t)&inargs;
+			args[0].length = sizeof(inargs);
+			args[0].fd = -1;
+			args[1].ptr = (u64)(uintptr_t)&rm.error;
+			args[1].length = 1 * sizeof(rm.error);
+			args[1].fd = -1;
+			ioctl.inv.handle = FASTRPC_INIT_HANDLE;
+			ioctl.inv.sc = FASTRPC_SCALARS(FASTRPC_RMID_KCOMM_REMOTE_CALL,
+						ROOT_RESPONSE_ARG_LENGTH , 0);
+			ioctl.inv.args = (__u64)args;
+			dev_err(smmucb->dev,
+			"%s: root request failed: dsp-tid 0x%x req type %d, error 0x%llX\n",
+			__func__, rm.dsp_tid, rm.type, rm.error);
+			break;
+		}
+		default: {
+			dev_err(smmucb->dev,
+				"%s: root request type %d is not supported\n",
+				__func__, rm.type);
+			fastrpc_channel_update_invoke_cnt(cctx, false);
+			goto cleanup;
+		}
+	}
+	err = fastrpc_internal_invoke(default_user,
+                                      KERNEL_MSG_WITH_ZERO_PID_ZERO_TID, &ioctl);
+	if (err) {
+		dev_err(smmucb->dev,
+		"Error %d: %s: remote call to root failed for dsp tid 0x%x, req type %d\n",
+		err, __func__, rm.dsp_tid, rm.type);
+		if (pbuf) {
+			struct fastrpc_buf *buf = NULL, *b = NULL;
+
+			spin_lock(&default_user->lock);
+			list_for_each_entry_safe(buf, b, &default_user->mmaps, node) {
+				if (buf->phys == pbuf->phys) {
+					list_del(&buf->node);
+					break;
+				}
+			}
+			spin_unlock(&default_user->lock);
+			fastrpc_buf_free(pbuf, false);
+		}
+	}
+	fastrpc_channel_update_invoke_cnt(cctx, false);
+cleanup:
+	fastrpc_channel_ctx_put(cctx);
+	kfree(kcomm_work);
+	return;
+}
+
+/*
+ * fastrpc_queue_root_msg() - queue root request made by remote subsystem to
+ * worker thread.
+ * @arg1: channel context.
+ * @arg2: root request made by remote subsystem
+ * @arg3: error value in case of failure occurrence before queuing the message
+ *
+ * The function queues root message received from remote subsystem to a
+ * worker thread to further carry out message handling.
+ */
+
+static void fastrpc_queue_root_msg(struct fastrpc_channel_ctx *cctx,
+					struct root_request_msg *msg_req, int nerr)
+{
+	unsigned long flags = 0;
+	struct kcomm_worker *kcomm_work = NULL;
+	struct fastrpc_root_msg *root_msg =
+		&cctx->kcomm_user.root_msg[cctx->kcomm_user.queued_msg_index];
+	u32 *queued_msg_index = &cctx->kcomm_user.queued_msg_index;
+
+	if (msg_req->data_len > sizeof(u32) * ROOT_REQUEST_MAX_SIZE)
+		nerr = -EINVAL;
+
+	/* Add root request to circular buffer */
+	spin_lock_irqsave(&cctx->lock, flags);
+	root_msg->dsp_tid = msg_req->dsp_tid;
+
+	/* Send the same msg type in response to dsp */
+	if (nerr == 0)
+		root_msg->type = msg_req->msg_type;
+	else
+		root_msg->type = ROOT_ERROR_MSG;
+
+	root_msg->data = &msg_req->data[0];
+	root_msg->data_len = msg_req->data_len;
+	root_msg->error = nerr;
+	(*queued_msg_index)++;
+	if (*queued_msg_index > ROOT_REQUEST_BUFFER_SIZE - 1)
+		*queued_msg_index = 0;
+	spin_unlock_irqrestore(&cctx->lock, flags);
+
+	/*
+	 * On DSP side the request has a configured timeout value.
+	 * If work allocation fails then HLOS will discard the call
+	 * and on the DSP side the request will timeout.
+	 */
+	kcomm_work = (struct kcomm_worker *)kzalloc(sizeof(*kcomm_work),
+			GFP_ATOMIC);
+	if (!kcomm_work)
+		return;
+
+	kcomm_work->domain = cctx->domain;
+
+	/* Post handling of root-request to kernel worker thread */
+	INIT_WORK(&kcomm_work->work, fastrpc_handle_dsp_root_request);
+	schedule_work(&kcomm_work->work);
 }
 
 static int fastrpc_wait_on_notif_queue(
@@ -7641,9 +7882,11 @@ int fastrpc_handle_rpc_response(struct fastrpc_channel_ctx *cctx, void *data, in
 	struct fastrpc_invoke_rsp *rsp = data;
 	struct fastrpc_invoke_rspv2 *rspv2 = NULL;
 	struct dsp_notif_rsp *notif = (struct dsp_notif_rsp *)data;
+	struct root_request_msg *root_req = (struct root_request_msg *)data;
 	struct fastrpc_invoke_ctx *ctx;
 	unsigned long flags = 0, idr = 0;
 	u64 ctxid = 0;
+	int err = 0;
 	u32 rsp_flags = 0, early_wake_time = 0, version = 0;
 
 	if (len == sizeof(uint64_t)) {
@@ -7659,6 +7902,18 @@ int fastrpc_handle_rpc_response(struct fastrpc_channel_ctx *cctx, void *data, in
 		} else {
 			return -ENOENT;
 		}
+	}
+
+	if (root_req->ctx == FASTRPC_ROOT_CTX_RESERVED) {
+		if (root_req->req_type != ROOT_REQ_SIGNAL ||
+				len < sizeof(*root_req)) {
+			dev_err(cctx->dev,
+			"Error: root req has invalid request type or size ");
+			err = -ENOENT;
+		}
+
+		fastrpc_queue_root_msg(cctx, root_req, err);
+		return err;
 	}
 
 	if (len < sizeof(*rsp))

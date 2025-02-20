@@ -3389,7 +3389,7 @@ static int fastrpc_user_obj_free(struct file *file,
 		fl = (struct fastrpc_user *)file->private_data;
 		cctx = fl->cctx;
 	} else {
-		fl = (struct fastrpc_user *)cctx->default_user;
+		fl = (struct fastrpc_user *)cctx->kcomm_user.obj;
 		if (!fl)
 			return -EINVAL;
 
@@ -3551,7 +3551,7 @@ skip_user_cleanup:
 		 * reference to the channel-ctx object is removed. So there is no
 		 * need to update invoke count to synchronize with ssr callback.
 		 */
-		cctx->default_user = NULL;
+		cctx->kcomm_user.obj = NULL;
 	}
 	return 0;
 }
@@ -3676,7 +3676,7 @@ static int fastrpc_user_obj_create(struct file *filp,
 		if (err)
 			goto error;
 
-		cctx->default_user = fl;
+		cctx->kcomm_user.obj = fl;
 	}
 
 	return 0;
@@ -4466,7 +4466,7 @@ static int fastrpc_multidomain_ctx_dsp_send(struct fastrpc_channel_ctx *cctx,
 	invoke.inv.sc = FASTRPC_SCALARS(FASTRPC_RMID_INIT_MDCTX_MANAGE, 5, 0);
 	invoke.inv.args = (__u64)args;
 
-	err = fastrpc_internal_invoke(cctx->default_user,
+	err = fastrpc_internal_invoke(cctx->kcomm_user.obj,
 					KERNEL_MSG_WITH_ZERO_PID, &invoke);
 	spin_lock_irqsave(&cctx->lock, flags);
 	fastrpc_channel_update_invoke_cnt(cctx, false);

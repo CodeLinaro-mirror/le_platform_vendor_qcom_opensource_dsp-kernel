@@ -376,7 +376,7 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	return 0;
 
 fdev_error:
-	if (data->default_user)
+	if (data->kcomm_user.obj)
 		fastrpc_channel_default_user_delete(data);
 	kfree(data);
 

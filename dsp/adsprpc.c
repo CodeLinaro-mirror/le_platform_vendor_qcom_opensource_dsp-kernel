@@ -3534,6 +3534,8 @@ int fastrpc_internal_invoke(struct fastrpc_file *fl, uint32_t mode,
 			}
 		}
 		context_free(ctx);
+		/* ctx is freed, so assign NULL to perf_counter to avoid UAF */
+		perf_counter = NULL;
 		trace_fastrpc_msg("context_free: end");
 	}
 	if (!kernel && VALID_FASTRPC_CID(cid)) {

@@ -204,9 +204,6 @@ static void fastrpc_remove_device_nodes(struct fastrpc_channel_ctx *cctx)
 	if (cctx->fdevice)
 		misc_deregister(&cctx->fdevice->miscdev);
 
-	if (cctx->secure_fdevice)
-		misc_deregister(&cctx->secure_fdevice->miscdev);
-
 	if(cctx->legacy_fdevice)
 		misc_deregister(&cctx->legacy_fdevice->miscdev);
 
@@ -234,14 +231,6 @@ static void fastrpc_configure_wakeup_source(struct fastrpc_channel_ctx *data)
 			data->fdevice->miscdev.this_device,
 			FASTRPC_NON_SECURE_WAKE_SOURCE_CLIENT_NAME,
 			&data->wake_source);
-	}
-
-	/* Register wake-up source for secure fdevice, if present. */
-	if (data->secure_fdevice) {
-		fastrpc_register_wakeup_source(
-			data->secure_fdevice->miscdev.this_device,
-			FASTRPC_SECURE_WAKE_SOURCE_CLIENT_NAME,
-			&data->wake_source_secure);
 	}
 
 	mutex_unlock(&data->wake_mutex);
@@ -383,8 +372,6 @@ fdev_error:
 populate_error:
 	if (data->fdevice)
 		misc_deregister(&data->fdevice->miscdev);
-	if (data->secure_fdevice)
-		misc_deregister(&data->secure_fdevice->miscdev);
 
 	return err;
 }

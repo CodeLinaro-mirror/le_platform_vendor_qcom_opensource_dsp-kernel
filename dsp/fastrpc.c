@@ -6973,7 +6973,6 @@ int fastrpc_device_register(struct device *dev, struct fastrpc_channel_ctx *cctx
 					cctx->legacy_fdevice = fdev;
 		} else {
 			cctx->fdevice = fdev;
-			cctx->secure_fdevice = fdev;
 		}
 	}
 	return err;
@@ -7237,7 +7236,7 @@ static int fastrpc_add_domain_to_table(struct fastrpc_domain **domain,
 
 		/* Channel name will be generated as <dsp-type-name><physical-id> */
 		err = snprintf(entry->name, sizeof(entry->name), "%s%d", label, phy_id);
-		if (err < 0 || err != sizeof(entry->name)) {
+		if (err < 0 || err >= sizeof(entry->name)) {
 			err = -EFAULT;
 			pr_err("Error %d: %s failed to generate name for label %s phy_id %u",
 				err, __func__, label, phy_id);

@@ -834,9 +834,7 @@ struct fastrpc_channel_ctx {
 	struct kobject kobj_sysfs;
 	/* Flag to indicate if sysfs node has been created for channel */
 	bool sys_fs_init;
-	/* Secure device node for channel */
-	struct fastrpc_device_node *secure_fdevice;
-	/* Non-secure device node for channel */
+	/* Device node of channel using dynamic name */
 	struct fastrpc_device_node *fdevice;
 	/* Non secure device node using legacy device name */
 	struct fastrpc_device_node *legacy_fdevice;

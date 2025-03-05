@@ -18,6 +18,9 @@ struct fastrpc_channel_ctx *scctx = NULL;
 struct fastrpc_channel_ctx* get_current_channel_ctx(struct device *dev)
 {
 	int err = 0;
+	struct fastrpc_domain *domain = NULL;
+	int str_len = 0;
+
 	if (scctx)
 		return scctx;
 
@@ -26,6 +29,22 @@ struct fastrpc_channel_ctx* get_current_channel_ctx(struct device *dev)
 		dev_err(dev, "failed to get channel ctx\n");
 		return ERR_PTR(-ENOMEM);
 	}
+
+	/*
+	 * Currently only one NSP domain is supported for trusted driver.
+	 */
+	domain = kzalloc(sizeof(*domain), GFP_KERNEL);
+	if (IS_ERR_OR_NULL(domain)) {
+		dev_err(dev, "failed to allocate domain\n");
+		return ERR_PTR(-ENOMEM);
+	}
+	str_len = (sizeof(legacy_domains[CDSP_DOMAIN_ID]) > sizeof(domain->name))?
+		sizeof(domain->name): sizeof(legacy_domains[CDSP_DOMAIN_ID]);
+	memcpy(domain->name, legacy_domains[CDSP_DOMAIN_ID], str_len);
+	domain->id = CDSP_DOMAIN_ID;
+	domain->type = FASTRPC_NSP;
+	domain->cctx = scctx;
+	scctx->domain = domain;
 
 	err = of_property_read_u32(dev->of_node, "qcom,dsp-iova-format",
 			&scctx->iova_format);
@@ -419,6 +438,8 @@ int fastrpc_transport_init(void)
 	err = 0;
 bail:
 	if (err) {
+		kfree(scctx->domain);
+		scctx->domain = NULL;
 		kfree(scctx);
 		scctx = NULL;
 		pr_err("fastrpc_transport_init failed with err %d\n", err);

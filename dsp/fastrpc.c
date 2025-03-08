@@ -275,7 +275,12 @@ static int fastrpc_map_lookup(struct fastrpc_user *fl, int fd,
 
 	spin_lock(&fl->lock);
 		list_for_each_entry(map, &fl->maps, node) {
-			if (map->buf == buf)
+			/*
+			 * Retrieve the map if the DMA buffer and fd match. For
+			 * duplicated fds with the same DMA buffer, create separate
+			 * maps for each duplicated fd.
+			 */
+			if (map->buf == buf && map->fd == fd)
 				goto map_found;
 		}
 	goto error;

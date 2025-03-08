@@ -87,7 +87,8 @@ def define_vm_modules(target, variant):
             "dsp/fastrpc.c",
             "dsp/fastrpc_socket.c",
             "dsp/fastrpc_shared.h",
-            "dsp/fastrpc_trace.h"
+            "dsp/fastrpc_trace.h",
+            "dsp/fastrpc_sysfs.c"
         ],
         local_defines = [
             "DSP_TRACE_INCLUDE_PATH={}".format(trace_include_path),

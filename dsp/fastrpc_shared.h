@@ -253,6 +253,8 @@
 #define FASTRPC_DSPSIGNAL_GROUP_SIZE 256
 /* Macro to return PDR status */
 #define IS_PDR(fl) (fl->spd && fl->spd->pdrcount != fl->spd->prevpdrcount)
+/* Macro to return SSR status */
+#define IS_SSR(fl) (fl && fl->cctx && atomic_read(&fl->cctx->teardown))
 
 #define AUDIO_PDR_SERVICE_LOCATION_CLIENT_NAME   "audio_pdr_adsp"
 #define AUDIO_PDR_ADSP_SERVICE_NAME              "avs/audio"

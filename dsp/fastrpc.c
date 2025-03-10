@@ -226,7 +226,12 @@ static int fastrpc_map_lookup(struct fastrpc_user *fl, int fd,
 
 	spin_lock(&fl->lock);
 		list_for_each_entry(map, &fl->maps, node) {
-			if (map->buf == buf)
+			/*
+			 * Retrieve the map if the DMA buffer and fd match. For
+			 * duplicated fds with the same DMA buffer, create separate
+			 * maps for each duplicated fd.
+			 */
+			if (map->buf == buf && map->fd == fd)
 				goto map_found;
 		}
 	goto error;
@@ -5599,9 +5604,11 @@ void fastrpc_notify_users(struct fastrpc_user *user)
 		/*
 		 * After audio or ois PDR, skip notifying the pending kill call,
 		 * as the DSP guestOS may still be processing and might result
-		 * improper access issues.
+		 * improper access issues. But in case of SSR cleanup pending
+                 * kill calls as well.
 		 */
-		if (atomic_read(&fl->state) >= DSP_EXIT_START && IS_PDR(fl) &&
+		if (atomic_read(&fl->state) >= DSP_EXIT_START &&
+                        !IS_SSR(fl) && IS_PDR(fl) &&
 			fl->pd_type != SENSORS_STATICPD &&
 			ctx->msg.handle == FASTRPC_INIT_HANDLE)
 			continue;

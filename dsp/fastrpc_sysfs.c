@@ -17,10 +17,10 @@
 static ssize_t domain_name_show(struct kobject *kobj,
 	struct kobj_attribute *attr, char *buf)
 {
-	struct fastrpc_channel_ctx *cctx = container_of(kobj,
-		struct fastrpc_channel_ctx, kobj_sysfs);
+	struct fastrpc_domain *domain = container_of(kobj,
+		struct fastrpc_domain, kobj_sysfs);
 
-	return sysfs_emit(buf, "%s\n", cctx->domain->name);
+	return sysfs_emit(buf, "%s\n", domain->name);
 }
 
 /*
@@ -32,10 +32,10 @@ static ssize_t domain_name_show(struct kobject *kobj,
 static ssize_t domain_id_show(struct kobject *kobj,
 	struct kobj_attribute *attr, char *buf)
 {
-	struct fastrpc_channel_ctx *cctx = container_of(kobj,
-		struct fastrpc_channel_ctx, kobj_sysfs);
+	struct fastrpc_domain *domain = container_of(kobj,
+		struct fastrpc_domain, kobj_sysfs);
 
-	return sysfs_emit(buf, "%d\n", cctx->domain->id);
+	return sysfs_emit(buf, "%d\n", domain->id);
 }
 
 /*
@@ -47,10 +47,10 @@ static ssize_t domain_id_show(struct kobject *kobj,
 static ssize_t instance_id_show(struct kobject *kobj,
 	struct kobj_attribute *attr, char *buf)
 {
-	struct fastrpc_channel_ctx *cctx = container_of(kobj,
-		struct fastrpc_channel_ctx, kobj_sysfs);
+	struct fastrpc_domain *domain = container_of(kobj,
+		struct fastrpc_domain, kobj_sysfs);
 
-	return sysfs_emit(buf, "%d\n", cctx->domain->instance_id);
+	return sysfs_emit(buf, "%d\n", domain->instance_id);
 }
 
 /*
@@ -62,10 +62,10 @@ static ssize_t instance_id_show(struct kobject *kobj,
 static ssize_t domain_status_show(struct kobject *kobj,
 	struct kobj_attribute *attr, char *buf)
 {
-	struct fastrpc_channel_ctx *cctx = container_of(kobj,
-		struct fastrpc_channel_ctx, kobj_sysfs);
+	struct fastrpc_domain *domain = container_of(kobj,
+		struct fastrpc_domain, kobj_sysfs);
 
-	return sysfs_emit(buf, "%d\n", cctx->domain->status);
+	return sysfs_emit(buf, "%d\n", domain->status);
 }
 
 /*
@@ -77,10 +77,10 @@ static ssize_t domain_status_show(struct kobject *kobj,
 static ssize_t domain_type_show(struct kobject *kobj,
 	struct kobj_attribute *attr, char *buf)
 {
-	struct fastrpc_channel_ctx *cctx = container_of(kobj,
-		struct fastrpc_channel_ctx, kobj_sysfs);
+	struct fastrpc_domain *domain = container_of(kobj,
+		struct fastrpc_domain, kobj_sysfs);
 
-	return sysfs_emit(buf, "%d\n", cctx->domain->type);
+	return sysfs_emit(buf, "%d\n", domain->type);
 }
 
 /*
@@ -92,10 +92,10 @@ static ssize_t domain_type_show(struct kobject *kobj,
 static ssize_t domain_legacy_name_show(struct kobject *kobj,
 	struct kobj_attribute *attr, char *buf)
 {
-	struct fastrpc_channel_ctx *cctx = container_of(kobj,
-		struct fastrpc_channel_ctx, kobj_sysfs);
+	struct fastrpc_domain *domain = container_of(kobj,
+		struct fastrpc_domain, kobj_sysfs);
 
-	return sysfs_emit(buf, "%s\n", cctx->domain->legacy_name);
+	return sysfs_emit(buf, "%s\n", domain->legacy_name);
 }
 
 /*
@@ -107,10 +107,10 @@ static ssize_t domain_legacy_name_show(struct kobject *kobj,
 static ssize_t domain_legacy_id_show(struct kobject *kobj,
 	struct kobj_attribute *attr, char *buf)
 {
-	struct fastrpc_channel_ctx *cctx = container_of(kobj,
-		struct fastrpc_channel_ctx, kobj_sysfs);
+	struct fastrpc_domain *domain = container_of(kobj,
+		struct fastrpc_domain, kobj_sysfs);
 
-	return sysfs_emit(buf, "%d\n", cctx->domain->legacy_id);
+	return sysfs_emit(buf, "%d\n", domain->legacy_id);
 }
 
 /* Parent sysfs kobject for "/sys/kernel/fastrpc" */
@@ -181,19 +181,18 @@ static const struct kobj_type frpc_legacy_kobj_type = {
 /*
  * Creates a sysfs interface for the given fastrpc channel context.
  *
- * @param cctx The fastrpc channel context to create the sysfs interface for.
+ * @param domain Pointer to domain struct to create the sysfs interface for.
  *
  * @return 0 on success, a negative error code on failure.
  */
-int fastrpc_sysfs_domain_create(struct fastrpc_channel_ctx *cctx)
+int fastrpc_sysfs_domain_create(struct fastrpc_domain *domain)
 {
 	int err = 0;
-	struct device *dev = cctx->dev;
-	struct kobject *obj = &cctx->kobj_sysfs;
-	const char *name = cctx->domain->name;
+	struct kobject *obj = &domain->kobj_sysfs;
+	const char *name = domain->name;
 
 	if (!fastrpc_kset) {
-		dev_err(dev, "%s: parent kobj not initialized for %s\n",
+		pr_err("%s: parent kobj not initialized for %s\n",
 			__func__, name);
 		return -EINVAL;
 	}
@@ -207,7 +206,7 @@ int fastrpc_sysfs_domain_create(struct fastrpc_channel_ctx *cctx)
 	 * 		/sys/kernel/fastrpc/<dsp>/domain_id
 	 * 		/sys/kernel/fastrpc/<dsp>/status
 	 */
-	if (cctx->domain->legacy)
+	if (domain->legacy)
 		/*
 		 * If the domain is marked as legacy, intialize obj with
 		 * frpc_legacy_kobj_type which include legacy attr
@@ -222,7 +221,7 @@ int fastrpc_sysfs_domain_create(struct fastrpc_channel_ctx *cctx)
 		err = kobject_init_and_add(obj, &frpc_kobj_type, NULL, name);
 
 	if (err) {
-		dev_err(dev, "%s: failed to create sysfs group for %s\n",
+		pr_err("%s: failed to create sysfs group for %s\n",
 			__func__, name);
 		kobject_put(obj);
 		return err;
@@ -233,9 +232,7 @@ int fastrpc_sysfs_domain_create(struct fastrpc_channel_ctx *cctx)
 	 * files.
 	 */
 	kobject_uevent(obj, KOBJ_ADD);
-	cctx->sys_fs_init = 1;
-
-	dev_info(dev, "%s: created sysfs group for %s\n",
+	pr_info("%s: created sysfs group for %s\n",
 		__func__, name);
 	return 0;
 }
@@ -247,20 +244,17 @@ int fastrpc_sysfs_domain_create(struct fastrpc_channel_ctx *cctx)
  * associated with a specific channel context.
  * It takes a pointer to the channel context as an argument.
  *
- * @param cctx Pointer to the channel context to remove sysfs directory
+ * @param domain Pointer to the domain to remove sysfs directory
  */
-void fastrpc_sysfs_domain_remove(struct fastrpc_channel_ctx *cctx)
+void fastrpc_sysfs_domain_remove(struct fastrpc_domain *domain)
 {
-	struct device *dev = cctx->dev;
-	struct kobject *obj = &cctx->kobj_sysfs;
+	struct kobject *obj = &domain->kobj_sysfs;
 
-	if (cctx->sys_fs_init) {
-		/* Remove the domain sysfs node */
+	/* Remove the domain sysfs node */
+	if (obj->state_initialized)
 		kobject_put(obj);
-		cctx->sys_fs_init = 0;
-	}
-	dev_info(dev, "%s: removed sysfs group for %s\n",
-		__func__, cctx->domain->name);
+	pr_info("%s: removed sysfs group for %s\n",
+		__func__, domain->name);
 }
 
 /*

@@ -257,9 +257,6 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	unsigned int vmids[FASTRPC_MAX_VMIDS];
 
 	dev_info(rdev, "%s started\n", __func__);
-	err = fastrpc_populate_domain_from_dt(rdev, &domain);
-	if (err)
-		return err;
 
 	if (of_reserved_mem_device_init_by_idx(rdev, rdev->of_node, 0))
 		dev_info(rdev, "no reserved DMA memory for FASTRPC\n");
@@ -274,6 +271,10 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	data = kzalloc(sizeof(*data), GFP_KERNEL);
 	if (!data)
 		return -ENOMEM;
+
+	err = fastrpc_populate_domain_from_dt(rdev, &domain);
+	if (err)
+		return err;
 
 	err = fastrpc_init_privileged_gids(rdev, "qcom,fastrpc-gids", &data->gidlist);
 	if (err)
@@ -340,11 +341,6 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 		if (err)
 			goto fdev_error;
 
-	/* Create sysfs directory for channel */
-	err = fastrpc_sysfs_domain_create(data);
-		if (err)
-			goto fdev_error;
-
 	/* Configure service locators for DSP */
 	err = fastrpc_configure_service_locator(data);
 		if (err)
@@ -395,7 +391,6 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 
 	dev_info(cctx->dev, "%s started", __func__);
 
-	fastrpc_sysfs_domain_remove(cctx);
 	/* No invocations past this point */
 	spin_lock_irqsave(&cctx->lock, flags);
 	atomic_set(&cctx->teardown, 1);

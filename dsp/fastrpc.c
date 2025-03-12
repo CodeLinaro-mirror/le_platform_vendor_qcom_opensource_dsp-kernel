@@ -7279,10 +7279,6 @@ static int fastrpc_add_domain_to_table(struct fastrpc_domain **domain,
 			return err;
 		}
 
-		mutex_lock(hmut);
-		hash_add(g_frpc.fastrpc_domains_table, &entry->node, phy_id);
-		g_frpc.dsp_counter[type]++;
-
 		if (instance_id == 0 || (type == FASTRPC_NSP && instance_id == 1))  {
 			/*
 			 * For LPASS, SDSP types only the dsp with instance_id 0 is
@@ -7292,8 +7288,17 @@ static int fastrpc_add_domain_to_table(struct fastrpc_domain **domain,
 			*/
 			entry->legacy = true;
 		}
+		err = fastrpc_sysfs_domain_create(entry);
+		if (err) {
+			pr_err("Error %d: %s: failed to create sysfs node for %s",
+				err, __func__, entry->name);
+			return err;
+		}
 
+		mutex_lock(hmut);
 		entry->id = GENERATE_LOGICAL_DOMAIN_ID(type, g_frpc.dsp_counter[type]);
+		hash_add(g_frpc.fastrpc_domains_table, &entry->node, phy_id);
+		g_frpc.dsp_counter[type]++;
 		mutex_unlock(hmut);
 	} else {
 		if (entry->status != DSP_STATUS_DOWN) {
@@ -7363,6 +7368,7 @@ static void fastrpc_delete_domains_table(void)
 
 	mutex_lock(hmut);
 	hash_for_each(g_frpc.fastrpc_domains_table, i, domain, node) {
+		fastrpc_sysfs_domain_remove(domain);
 		hash_del(&domain->node);
 		kfree(domain);
 	}
@@ -7521,11 +7527,11 @@ module_init(fastrpc_init);
 
 static void fastrpc_exit(void)
 {
-	fastrpc_sysfs_deregister_kset();
 	platform_driver_unregister(&fastrpc_cb_driver);
 	idr_destroy(&g_frpc.mdctx_idr);
 	mutex_destroy(&g_frpc.gmut);
 	fastrpc_delete_domains_table();
+	fastrpc_sysfs_deregister_kset();
 	mutex_destroy(&g_frpc.hmut);
 	fastrpc_transport_deinit();
 #ifdef CONFIG_DEBUG_FS

@@ -3007,7 +3007,7 @@ static int fastrpc_alloc_rootheap_buf(struct fastrpc_channel_ctx *cctx,
 	struct fastrpc_buf *buf = NULL;
 	struct fastrpc_pool_ctx *sess = NULL;
 	struct fastrpc_smmu *smmucb = NULL;
-	const unsigned int ROOTHEAP_BUF_SIZE = (1024 * 1024),
+	const unsigned int ROOTHEAP_BUF_SIZE = (1280 * 1024),
 			NUM_ROOTHEAP_BUFS = 3;
 	int err = 0;
 	unsigned long flags = 0;

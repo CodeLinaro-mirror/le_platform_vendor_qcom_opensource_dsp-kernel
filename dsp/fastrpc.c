@@ -1238,6 +1238,18 @@ static int get_buffer_attr(struct dma_buf *buf, bool *exclusive_access)
 	int vmids_list_len = 0;
 	*exclusive_access = false;
 
+	/*
+	 * If buf lacks the Qualcomm extension of mem-buf,
+	 * No support for accesing by vm related function.
+	 * Make exclusive access as true to select non-secure smmu cb.
+	 * And bypass following vm related functions.
+	 */
+	if (!is_mem_buf_dma_buf(buf))
+	{
+		*exclusive_access = true;
+		return 0;
+	}
+
 	err = mem_buf_dma_buf_get_vmperm(buf, &vmids_list, &perms, &vmids_list_len);
 	if (err)
 		return err;

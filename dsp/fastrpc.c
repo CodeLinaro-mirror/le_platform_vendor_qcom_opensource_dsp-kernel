@@ -3579,13 +3579,11 @@ void fastrpc_free_user(struct fastrpc_user *fl)
 		fl->init_mem = NULL;
 	}
 
-	mutex_lock(&fl->remote_map_mutex);
 	mutex_lock(&fl->map_mutex);
 	// During process tear down free the map, even if refcount is non-zero
 	list_for_each_entry_safe(map, m, &fl->maps, node)
 		__fastrpc_free_map(map);
 	mutex_unlock(&fl->map_mutex);
-	mutex_unlock(&fl->remote_map_mutex);
 
 	fastrpc_buf_list_free(fl, &fl->mmaps, false);
 
@@ -3779,7 +3777,6 @@ skip_user_cleanup:
 	fastrpc_free_user(fl);
 
 	mutex_destroy(&fl->signal_create_mutex);
-	mutex_destroy(&fl->remote_map_mutex);
 	mutex_destroy(&fl->map_mutex);
 	kfree(fl);
 
@@ -3861,7 +3858,6 @@ static int fastrpc_user_obj_create(struct file *filp,
 	}
 
 	spin_lock_init(&fl->lock);
-	mutex_init(&fl->remote_map_mutex);
 	mutex_init(&fl->map_mutex);
 	spin_lock_init(&fl->dspsignals_lock);
 	mutex_init(&fl->signal_create_mutex);
@@ -3926,7 +3922,6 @@ static int fastrpc_user_obj_create(struct file *filp,
 
 	return 0;
 error:
-	mutex_destroy(&fl->remote_map_mutex);
 	mutex_destroy(&fl->map_mutex);
 	mutex_destroy(&fl->signal_create_mutex);
 	kfree(fl);
@@ -6126,14 +6121,10 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int cmd,
 		err = fastrpc_dmabuf_alloc(fl, argp);
 		break;
 	case FASTRPC_IOCTL_MMAP:
-		mutex_lock(&fl->remote_map_mutex);
 		err = fastrpc_req_mmap(fl, argp);
-		mutex_unlock(&fl->remote_map_mutex);
 		break;
 	case FASTRPC_IOCTL_MUNMAP:
-		mutex_lock(&fl->remote_map_mutex);
 		err = fastrpc_req_munmap(fl, argp);
-		mutex_unlock(&fl->remote_map_mutex);
 		break;
 	case FASTRPC_IOCTL_MEM_MAP:
 		err = fastrpc_req_mem_map(fl, argp);
@@ -6269,7 +6260,6 @@ long fastrpc_dev_map_dma(struct fastrpc_device *dev,
 	spin_unlock_irqrestore(&cctx->lock, irq_flags);
 
 	/* Map DMA buffer on SMMU device*/
-	mutex_lock(&fl->remote_map_mutex);
 	mutex_lock(&fl->map_mutex);
 	err = fastrpc_map_create(fl, -1, 0, p.map->buf,
 				p.map->size, p.map->attrs,
@@ -6318,7 +6308,6 @@ error:
 		fl->is_dma_invoke_pend = false;
 	}
 	if (is_cnt_updated) {
-		mutex_unlock(&fl->remote_map_mutex);
 		fastrpc_channel_update_invoke_cnt(cctx, false);
 	}
 	spin_unlock_irqrestore(&cctx->lock, irq_flags);
@@ -6384,8 +6373,6 @@ long fastrpc_dev_unmap_dma(struct fastrpc_device *dev,
 		is_cnt_updated = true;
 	}
 	spin_unlock_irqrestore(&cctx->lock, irq_flags);
-
-	mutex_lock(&fl->remote_map_mutex);
 	mutex_lock(&fl->map_mutex);
 	err = fastrpc_map_lookup(fl, -1, 0, 0, p.unmap->buf,
 				ADSP_MMAP_DMA_BUFFER, &map, false);
@@ -6427,7 +6414,6 @@ error:
 		fl->is_dma_invoke_pend = false;
 	}
 	if (is_cnt_updated) {
-		mutex_unlock(&fl->remote_map_mutex);
 		fastrpc_channel_update_invoke_cnt(cctx, false);
 	}
 	spin_unlock_irqrestore(&cctx->lock, irq_flags);

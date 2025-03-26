@@ -18,7 +18,15 @@ $(info within KBUILD file CONFIG_ARCH_NIOBE = $(CONFIG_ARCH_NIOBE))
 ccflags-y += -DCONFIG_QCOM_FASTRPC_TRUSTED=1
 endif
 
-frpc-trusted-adsprpc-y := dsp/fastrpc.o	\
-					 dsp/fastrpc_socket.o \
+ifeq ($(CONFIG_ARCH_SM6150), y)
+$(info within KBUILD file CONFIG_ARCH_SM6150 = $(CONFIG_ARCH_SM6150))
+KBUILD_CPPFLAGS += -DCONFIG_DSP_SM6150=1
+endif
 
-obj-m := frpc-trusted-adsprpc.o
+LINUXINCLUDE += -I$(DSP_ROOT)/include/linux
+LINUXINCLUDE += -I$(DSP_ROOT)/include/uapi
+
+frpc-adsprpc-y := dsp/fastrpc.o	\
+					 dsp/fastrpc_rpmsg.o \
+
+obj-m := frpc-adsprpc.o

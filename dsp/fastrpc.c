@@ -5034,6 +5034,42 @@ static int fastrpc_dspsignal_create(struct fastrpc_user *fl,
 	return err;
 }
 
+/* Unblock all dspsignals in pending state */
+static int fastrpc_dspsignal_cancel_all(struct fastrpc_user *fl)
+{
+	u32 i = 0, j = 0;
+	struct fastrpc_dspsignal *s = NULL;
+	struct fastrpc_dspsignal *group = NULL;
+	unsigned long irq_flags = 0;
+
+	dev_dbg(fl->cctx->dev, "%s: Cancel all signals for pid %d\n",
+			__func__, fl->tgid);
+
+	spin_lock_irqsave(&fl->dspsignals_lock, irq_flags);
+	for (i = 0; i < (FASTRPC_DSPSIGNAL_NUM_SIGNALS
+		/ FASTRPC_DSPSIGNAL_GROUP_SIZE); i++) {
+		group = fl->signal_groups[i];
+		if (!group)
+			continue;
+
+		for (j = 0; j < FASTRPC_DSPSIGNAL_GROUP_SIZE; j++) {
+			s = &group[j];
+			if (s->state == DSPSIGNAL_STATE_PENDING) {
+				s->state = DSPSIGNAL_STATE_CANCELED;
+				trace_fastrpc_dspsignal("cancel all",
+					(i * FASTRPC_DSPSIGNAL_GROUP_SIZE) + j,
+					s->state, 0);
+				complete_all(&s->comp);
+			}
+		}
+	}
+	spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
+
+	dev_dbg(fl->cctx->dev, "%s: All signals canceled for pid %d\n",
+			__func__, fl->tgid);
+	return 0;
+}
+
 static int fastrpc_dspsignal_destroy(struct fastrpc_user *fl,
 			      struct fastrpc_internal_dspsignal *fsig)
 {
@@ -5060,6 +5096,7 @@ static int fastrpc_dspsignal_destroy(struct fastrpc_user *fl,
 	}
 
 	s->state = DSPSIGNAL_STATE_UNUSED;
+	trace_fastrpc_dspsignal("destroy", signal_id, s->state, 0);
 	complete_all(&s->comp);
 
 	spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
@@ -6495,6 +6532,8 @@ void fastrpc_notify_users(struct fastrpc_user *user)
 			ctx->retval, ctx->pid, ctx->pid, ctx->sc);
 		complete(&ctx->work);
 	}
+
+	fastrpc_dspsignal_cancel_all(user);
 	spin_unlock(&user->lock);
 }
 

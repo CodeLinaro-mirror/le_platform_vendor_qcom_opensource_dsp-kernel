@@ -6449,7 +6449,7 @@ int fastrpc_driver_register(struct fastrpc_driver *frpc_driver)
 	return -ESRCH;
 
 process_found:
-	if(user->device->dev_close) {
+	if(atomic_read(&user->state) >= DSP_EXIT_START) {
 		spin_unlock_irqrestore(&cctx->lock, irq_flags);
 		pr_err("%s : process already exited", __func__);
 		return -ESRCH;

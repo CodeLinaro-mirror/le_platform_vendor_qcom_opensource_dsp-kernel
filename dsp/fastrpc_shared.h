@@ -830,10 +830,6 @@ struct fastrpc_channel_ctx {
 	u32 dsp_attributes[FASTRPC_MAX_DSP_ATTRIBUTES];
 	u32 lowest_capacity_core_count;
 	u32 qos_latency;
-	/* Channel sysfs object */
-	struct kobject kobj_sysfs;
-	/* Flag to indicate if sysfs node has been created for channel */
-	bool sys_fs_init;
 	/* Device node of channel using dynamic name */
 	struct fastrpc_device_node *fdevice;
 	/* Non secure device node using legacy device name */
@@ -909,6 +905,8 @@ struct fastrpc_domain {
 	 * using old legacy domain ids
 	 */
 	u32 legacy_id;
+	/* Sysfs object for domain */
+	struct kobject kobj_sysfs;
 	/* Channel context for domain */
 	struct fastrpc_channel_ctx *cctx;
 };
@@ -1212,11 +1210,11 @@ void fastrpc_free_user(struct fastrpc_user *fl);
 /*
  * Creates a sysfs interface for the given fastrpc channel context.
  *
- * @param cctx The fastrpc channel context to create the sysfs interface for.
+ * @param domain pointer to the domain info struct.
  *
  * @return 0 on success, a negative error code on failure.
  */
-int fastrpc_sysfs_domain_create(struct fastrpc_channel_ctx *cctx);
+int fastrpc_sysfs_domain_create(struct fastrpc_domain *domain);
 
 /*
  * Removes sysfs directory of a channel.
@@ -1225,9 +1223,9 @@ int fastrpc_sysfs_domain_create(struct fastrpc_channel_ctx *cctx);
  * associated with a specific channel context.
  * It takes a pointer to the channel context as an argument.
  *
- * @param cctx Pointer to the channel context to remove sysfs directory
+ * @param domain Pointer to the domain info struct
  */
-void fastrpc_sysfs_domain_remove(struct fastrpc_channel_ctx *cctx);
+void fastrpc_sysfs_domain_remove(struct fastrpc_domain *domain);
 
 /*
  * Populate fastrpc_domain from device tree node.

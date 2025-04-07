@@ -3581,8 +3581,10 @@ static int fastrpc_user_obj_free(struct file *file,
 		fastrpc_session_free(cctx, fl->sctx);
 	if (fl->secsctx)
 		fastrpc_session_free(cctx, fl->secsctx);
+	spin_lock_irqsave(&fl->dspsignals_lock, irq_flags);
 	for (i = 0; i < (FASTRPC_DSPSIGNAL_NUM_SIGNALS /FASTRPC_DSPSIGNAL_GROUP_SIZE); i++)
 		kfree(fl->signal_groups[i]);
+	spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
 
 #ifdef CONFIG_DEBUG_FS
 	debugfs_remove(fl->debugfs_file);

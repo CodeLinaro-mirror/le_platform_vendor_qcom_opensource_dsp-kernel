@@ -7331,9 +7331,9 @@ static int fastrpc_add_domain_to_table(struct fastrpc_domain **domain,
 		}
 
 		mutex_lock(hmut);
+		g_frpc.dsp_counter[type]++;
 		entry->id = GENERATE_LOGICAL_DOMAIN_ID(type, g_frpc.dsp_counter[type]);
 		hash_add(g_frpc.fastrpc_domains_table, &entry->node, phy_id);
-		g_frpc.dsp_counter[type]++;
 		mutex_unlock(hmut);
 	} else {
 		if (entry->status != DSP_STATUS_DOWN) {

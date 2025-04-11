@@ -844,6 +844,8 @@ struct fastrpc_channel_ctx {
 	/* Non-secure subsystem like CDSP will use regular client */
 	struct wakeup_source *wake_source;
 	struct mutex wake_mutex;
+	/* Set when ssr is force-triggered on a kernel rpc call timeout */
+	bool startshutdown;
 	bool secure;
 	bool unsigned_support;
 	u64 dma_mask;
@@ -868,6 +870,14 @@ struct fastrpc_channel_ctx {
 	u32 iova_format;
 	/* Default user object for making kernel-to-rootpd rpc calls */
 	struct fastrpc_user *default_user;
+};
+
+struct fastrpc_ssr_handler {
+	/* Worker thread to trigger SSR based on timeout */
+	struct work_struct ssr_work;
+	/* Remote-proc handle to trigger ssr */
+	void *rphandle;
+	int domain_id;
 };
 
 struct fastrpc_domain {
@@ -909,6 +919,8 @@ struct fastrpc_domain {
 	struct kobject kobj_sysfs;
 	/* Channel context for domain */
 	struct fastrpc_channel_ctx *cctx;
+	/* structure for handling SSR, when fastrpc framework hangs */
+	struct fastrpc_ssr_handler ssr_handler;
 };
 
 struct fastrpc_invoke_ctx {
@@ -944,6 +956,8 @@ struct fastrpc_invoke_ctx {
 	struct fastrpc_buf_overlap *olaps;
 	struct fastrpc_channel_ctx *cctx;
 	struct fastrpc_perf *perf;
+	/* Timer to trigger ssr callback on a kernel rpc call timeout */
+	struct timer_list ssr_timer;
 };
 
 struct fastrpc_device_node {
@@ -1126,6 +1140,10 @@ struct fastrpc_user {
 	bool set_session_info;
 	/* Various states throughout process life cycle */
 	atomic_t state;
+	/* Timeout in ms */
+	uint32_t timeout;
+	/* Flag to check if dsp timeout recovery is enabled */
+	bool dsp_recovery;
 };
 
 struct fastrpc_ctrl_latency {

@@ -110,6 +110,10 @@
 #define REMOTE_SCALARS_MAKE(method, in, out) \
 		REMOTE_SCALARS_MAKEX(0, method, in, out, 0, 0)
 
+/* Remote Method id table */
+#define FASTRPC_RMID_INIT_ATTACH		(0)
+#define FASTRPC_RMID_INIT_CREATE_WITH_NAME	(12)
+
 #ifdef VERIFY_PRINT_ERROR
 #define VERIFY_EPRINTF(format, ...) pr_err(format, ##__VA_ARGS__)
 #else
@@ -314,6 +318,7 @@ enum fastrpc_control_type {
 enum fastrpc_dsp_capability {
 	ASYNC_FASTRPC_CAP = 9,
 	DMA_HANDLE_REVERSE_RPC_CAP = 129,
+	DAEMON_NAME_SUPPORT = 134,   /* support passing daemon name to DSP */
 };
 
 struct smq_null_invoke {

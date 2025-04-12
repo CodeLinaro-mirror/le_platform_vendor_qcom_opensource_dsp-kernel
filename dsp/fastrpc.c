@@ -522,7 +522,8 @@ static int __fastrpc_buf_alloc(struct fastrpc_user *fl,
 	struct fastrpc_buf *buf;
 	struct timespec64 start_ts, end_ts;
 
-	if (!size)
+	/* Check if the size is valid (non-zero and within integer range) */
+	if (!size || size > INT_MAX)
 		return -EFAULT;
 	buf = kzalloc(sizeof(*buf), GFP_KERNEL);
 	if (!buf)

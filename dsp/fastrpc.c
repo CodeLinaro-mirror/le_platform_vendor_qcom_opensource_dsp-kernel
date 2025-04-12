@@ -5949,7 +5949,7 @@ static int fastrpc_req_mmap(struct fastrpc_user *fl, char __user *argp)
 	return 0;
 
 err_assign:
-	err = fastrpc_req_munmap_impl(fl, buf);
+	err = fastrpc_req_munmap_dsp(fl, buf->raddr, buf->size);
 	if (err) {
 		if (req.flags == ADSP_MMAP_REMOTE_HEAP_ADDR) {
 			spin_lock_irqsave(&fl->cctx->lock, flags);

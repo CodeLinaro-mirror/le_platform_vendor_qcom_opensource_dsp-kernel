@@ -483,3 +483,14 @@ void fastrpc_transport_deinit(void)
 	mutex_destroy(&frpc_socket->socket_mutex);
 }
 
+/**
+ * ssr_timer_callback() - Callback function for SSR timer.
+ * @timer: Pointer to the timer structure.
+ *
+ * This function is called when the SSR timer expires. It does not perform
+ * any operations for secure process.
+ */
+void ssr_timer_callback(struct timer_list *timer)
+{
+	return;
+}

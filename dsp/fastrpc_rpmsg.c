@@ -16,8 +16,10 @@
 #include "fastrpc_shared.h"
 #include <linux/soc/qcom/pdr.h>
 #include <linux/delay.h>
+#include <linux/remoteproc.h>
 
 void fastrpc_channel_ctx_put(struct fastrpc_channel_ctx *cctx);
+void fastrpc_channel_ctx_get(struct fastrpc_channel_ctx *cctx);
 void fastrpc_update_gctx(struct fastrpc_channel_ctx *cctx, int flag);
 void fastrpc_lowest_capacity_corecount(struct device *dev, struct fastrpc_channel_ctx *cctx);
 int fastrpc_init_privileged_gids(struct device *dev, char *prop_name,
@@ -33,6 +35,120 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx);
 struct fastrpc_channel_ctx* get_current_channel_ctx(struct device *dev)
 {
 	return dev_get_drvdata(dev->parent);
+}
+
+/*
+ * Callback function for kernel worker thread to trigger dsp ssr in case
+ * of a timeout of a kernel rpc call
+ */
+static void fastrpc_handle_ssr_request(struct work_struct *work)
+{
+	int rc = 0;
+	struct fastrpc_ssr_handler *ssr_handler =
+		container_of(work, struct fastrpc_ssr_handler, ssr_work);
+	void *rphandle = ssr_handler->rphandle;
+
+	if (!rphandle) {
+		pr_err("Error: %s: invalid rproc handle for domain %d\n",
+			__func__, ssr_handler->domain_id);
+		goto bail;
+	}
+
+	/* Shut down DSP */
+	rc = rproc_shutdown(rphandle);
+	if (rc) {
+		pr_err("Error: %s: rproc_shutdown failed with rc %d and rphandle %pK\n",
+			__func__, rc, rphandle);
+		goto bail;
+	}
+
+	/* Reboot DSP */
+	rc = rproc_boot(rphandle);
+	if (rc) {
+		pr_err("Error: %s: rproc_boot failed with rc %d and rphandle %pK\n",
+			__func__, rc, rphandle);
+		goto bail;
+	}
+	pr_info("%s : SSR completed successfully", __func__);
+
+bail:
+	return;
+}
+
+/*
+ * Callback function invoked when the timer for a kernel rpc call expires
+ *
+ * If kernel rpc call times out, it indicates that the dsp is potentially
+ * in an irrecoverable state as fastrpc on rootpd is unresponsive. So,
+ * trigger an ssr on the dsp
+ */
+
+void ssr_timer_callback(struct timer_list *timer)
+{
+	struct fastrpc_channel_ctx *cctx = NULL;
+	unsigned long flags;
+	void *rphandle = NULL;
+	struct fastrpc_ssr_handler *ssr_handler = NULL;
+	struct fastrpc_invoke_ctx *ctx =
+		container_of(timer, struct fastrpc_invoke_ctx, ssr_timer);
+
+	if (!ctx) {
+		pr_err("Error: %s: invoke ctx is null\n", __func__);
+		return;
+	}
+
+	cctx = ctx->fl->cctx;
+	if (!cctx) {
+		pr_err("Error: %s channel ctx is null for handle 0x%x, sc 0x%x, pid %d, tid %d\n",
+			__func__, ctx->handle, ctx->sc, ctx->tgid, ctx->pid);
+		return;
+	}
+
+	fastrpc_channel_ctx_get(cctx);
+	spin_lock_irqsave(&cctx->lock, flags);
+
+	/* Ensure that ssr is triggered only once for a channel */
+	if (cctx->startshutdown)
+		goto bail;
+	else
+		cctx->startshutdown = true;
+
+	if (cctx->rpdev && !atomic_read(&cctx->teardown)) {
+		/* Get remote processor handle associated with device */
+		rphandle = rproc_get_by_child(&cctx->rpdev->dev);
+		if (!rphandle) {
+			pr_err("Error: %s: rproc_get_by_child failed for domain %d\n",
+				__func__, cctx->domain_id);
+			goto bail;
+		}
+	} else {
+		pr_err("Error: %s: channel already down for domain %d, handle 0x%x, sc 0x%x, pid %d, tid %d\n",
+			__func__, cctx->domain_id, ctx->handle, ctx->sc,
+			ctx->tgid, ctx->pid);
+		goto bail;
+	}
+
+	ssr_handler = &cctx->domain->ssr_handler;
+	if (!ssr_handler) {
+		pr_err("Error: %s: failed to get ssr handler for domain %d\n",
+			__func__, cctx->domain_id);
+		goto bail;
+	}
+
+	ssr_handler->domain_id = cctx->domain_id;
+
+	spin_unlock_irqrestore(&cctx->lock, flags);
+	fastrpc_channel_ctx_put(cctx);
+
+	/* Launch kernel worker thread to trigger ssr */
+	ssr_handler->rphandle = rphandle;
+	INIT_WORK(&ssr_handler->ssr_work, fastrpc_handle_ssr_request);
+	schedule_work(&ssr_handler->ssr_work);
+	return;
+
+bail:
+	spin_unlock_irqrestore(&cctx->lock, flags);
+	fastrpc_channel_ctx_put(cctx);
 }
 
 /*

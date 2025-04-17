@@ -1207,6 +1207,7 @@ int fastrpc_transport_send(struct fastrpc_channel_ctx *cctx, void *rpc_msg, uint
 int fastrpc_transport_init(void);
 void fastrpc_transport_deinit(void);
 int fastrpc_handle_rpc_response(struct fastrpc_channel_ctx *cctx, void *data, int len);
+void ssr_timer_callback(struct timer_list *timer);
 
 /*
  * Registers a device with the FastRPC framework.

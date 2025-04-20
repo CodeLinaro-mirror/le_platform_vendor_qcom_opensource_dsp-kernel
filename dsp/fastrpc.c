@@ -226,7 +226,12 @@ static int fastrpc_map_lookup(struct fastrpc_user *fl, int fd,
 
 	spin_lock(&fl->lock);
 		list_for_each_entry(map, &fl->maps, node) {
-			if (map->buf == buf)
+			/*
+			 * Retrieve the map if the DMA buffer and fd match. For
+			 * duplicated fds with the same DMA buffer, create separate
+			 * maps for each duplicated fd.
+			 */
+			if (map->buf == buf && map->fd == fd)
 				goto map_found;
 		}
 	goto error;
@@ -444,7 +449,8 @@ static int __fastrpc_buf_alloc(struct fastrpc_user *fl,
 	struct fastrpc_buf *buf;
 	struct timespec64 start_ts, end_ts;
 
-	if (!size)
+	/* Check if the size is valid (non-zero and within integer range) */
+	if (!size || size > INT_MAX)
 		return -EFAULT;
 	buf = kzalloc(sizeof(*buf), GFP_KERNEL);
 	if (!buf)
@@ -520,7 +526,7 @@ static int fastrpc_buf_alloc(struct fastrpc_user *fl,
 			return ret;
 	}
 
-	return 0;
+	return ret;
 }
 
 /**
@@ -1301,6 +1307,7 @@ map_retry:
 		smmuidx++;
 		goto map_retry;
 	} else if (err) {
+		mutex_unlock(&smmucb->map_mutex);
 		goto map_err;
 	}
 
@@ -2687,6 +2694,7 @@ static int fastrpc_create_session_debugfs(struct fastrpc_user *fl)
 		if (!(fl->debugfs_file_create)) {
 			size = strlen(cur_comm) + strlen("_")
 				+ COUNT_OF(current->pid) + strlen("_")
+				+ COUNT_OF(fl->tgid_frpc) + strlen("_")
 				+ COUNT_OF(FASTRPC_DEV_MAX)
 				+ 1;
 
@@ -3481,6 +3489,7 @@ static int fastrpc_device_release(struct inode *inode, struct file *file)
 	mutex_destroy(&fl->signal_create_mutex);
 	mutex_destroy(&fl->remote_map_mutex);
 	mutex_destroy(&fl->map_mutex);
+	mutex_destroy(&fl->pm_qos_mutex);
 	spin_lock_irqsave(glock, irq_flags);
 	kfree(fl);
 
@@ -3520,6 +3529,7 @@ static int fastrpc_device_open(struct inode *inode, struct file *filp)
 	mutex_init(&fl->map_mutex);
 	spin_lock_init(&fl->dspsignals_lock);
 	mutex_init(&fl->signal_create_mutex);
+	mutex_init(&fl->pm_qos_mutex);
 	INIT_LIST_HEAD(&fl->pending);
 	INIT_LIST_HEAD(&fl->interrupted);
 	INIT_LIST_HEAD(&fl->maps);
@@ -3851,7 +3861,7 @@ static int fastrpc_manage_poll_mode(struct fastrpc_user *fl, u32 enable, u32 tim
 static int fastrpc_internal_control(struct fastrpc_user *fl,
 					struct fastrpc_internal_control *cp)
 {
-	int err = 0, ret = 0;
+	int err = 0;
 	struct fastrpc_channel_ctx *cctx = fl->cctx;
 	u32 latency = 0, cpu = 0;
 	unsigned long flags = 0;
@@ -3881,28 +3891,30 @@ static int fastrpc_internal_control(struct fastrpc_user *fl,
 		 * id 0. If DT property 'qcom,single-core-latency-vote' is enabled
 		 * then add voting request for only one core of cluster id 0.
 		 */
+		 mutex_lock(&fl->pm_qos_mutex);
 		 for (cpu = 0; cpu < cctx->lowest_capacity_core_count; cpu++) {
 			if (!fl->qos_request) {
-				ret = dev_pm_qos_add_request(
+				err = dev_pm_qos_add_request(
 						get_cpu_device(cpu),
 						&fl->dev_pm_qos_req[cpu],
 						DEV_PM_QOS_RESUME_LATENCY,
 						latency);
 			} else {
-				ret = dev_pm_qos_update_request(
+				err = dev_pm_qos_update_request(
 						&fl->dev_pm_qos_req[cpu],
 						latency);
 			}
-			if (ret < 0) {
+			if (err < 0) {
 				dev_err(fl->cctx->dev, "QoS with lat %u failed for CPU %d, err %d, req %d\n",
 					latency, cpu, err, fl->qos_request);
 				break;
 			}
 		}
-		if (ret >= 0) {
+		if (err >= 0) {
 			fl->qos_request = 1;
 			err = 0;
 		}
+		mutex_unlock(&fl->pm_qos_mutex);
 		break;
 	case FASTRPC_CONTROL_SMMU:
 		fl->sharedcb = cp->smmu.sharedcb;
@@ -5572,7 +5584,7 @@ int fastrpc_driver_register(struct fastrpc_driver *frpc_driver)
 	return -ESRCH;
 
 process_found:
-	if(user->device->dev_close) {
+	if(atomic_read(&user->state) >= DSP_EXIT_START) {
 		spin_unlock_irqrestore(&cctx->lock, irq_flags);
 		pr_err("%s : process already exited", __func__);
 		return -ESRCH;
@@ -5599,9 +5611,11 @@ void fastrpc_notify_users(struct fastrpc_user *user)
 		/*
 		 * After audio or ois PDR, skip notifying the pending kill call,
 		 * as the DSP guestOS may still be processing and might result
-		 * improper access issues.
+		 * improper access issues. But in case of SSR cleanup pending
+                 * kill calls as well.
 		 */
-		if (atomic_read(&fl->state) >= DSP_EXIT_START && IS_PDR(fl) &&
+		if (atomic_read(&fl->state) >= DSP_EXIT_START &&
+                        !IS_SSR(fl) && IS_PDR(fl) &&
 			fl->pd_type != SENSORS_STATICPD &&
 			ctx->msg.handle == FASTRPC_INIT_HANDLE)
 			continue;

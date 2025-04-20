@@ -253,6 +253,8 @@
 #define FASTRPC_DSPSIGNAL_GROUP_SIZE 256
 /* Macro to return PDR status */
 #define IS_PDR(fl) (fl->spd && fl->spd->pdrcount != fl->spd->prevpdrcount)
+/* Macro to return SSR status */
+#define IS_SSR(fl) (fl && fl->cctx && atomic_read(&fl->cctx->teardown))
 
 #define AUDIO_PDR_SERVICE_LOCATION_CLIENT_NAME   "audio_pdr_adsp"
 #define AUDIO_PDR_ADSP_SERVICE_NAME              "avs/audio"
@@ -870,6 +872,8 @@ struct fastrpc_user {
 	/*mutex for process maps synchronization*/
 	struct mutex map_mutex;
 	struct mutex signal_create_mutex;
+	/* mutex for qos request synchronization */
+	struct mutex pm_qos_mutex;
 	/* Compleation object for dma invocations by client driver*/
 	struct completion dma_invoke;
 	/* Completion objects and state for dspsignals */

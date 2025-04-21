@@ -459,11 +459,15 @@ enum fastrpc_remote_domains_id {
 
  /* Types of fastrpc DMA bufs sent to DSP */
  enum fastrpc_buf_type {
+	/* Header buf containing mapping info of arguments of rpc call */
 	METADATA_BUF,
-	COPYDATA_BUF,
+	/* Initial memory donated for creating user-pd */
 	INITMEM_BUF,
+	/* Buffers shared to user PD via SMMU */
 	USER_BUF,
+	/* Buffer to grow remote-heap on audio-pd */
 	REMOTEHEAP_BUF,
+	/* Buffer to grow rpc-heap on root-pd */
 	ROOTHEAP_BUF,
 };
 
@@ -804,6 +808,11 @@ struct heap_bufs {
 
 struct fastrpc_domain;
 
+struct fastrpc_kcomm_channel {
+	/* User object for daemon-independent communication to DSP */
+	struct fastrpc_user *obj;
+};
+
 struct fastrpc_channel_ctx {
 	int domain_id;
 	int sesscount;
@@ -870,8 +879,8 @@ struct fastrpc_channel_ctx {
 	wait_queue_head_t ssr_wait_queue;
 	/* Format to control where sid is prepended to iova */
 	u32 iova_format;
-	/* Default user object for making kernel-to-rootpd rpc calls */
-	struct fastrpc_user *default_user;
+	/* kcomm user object for making kernel-to-rootpd rpc calls */
+	struct fastrpc_kcomm_channel kcomm_user;
 };
 
 struct fastrpc_ssr_handler {

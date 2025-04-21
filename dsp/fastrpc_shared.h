@@ -1129,8 +1129,6 @@ struct fastrpc_user {
 	spinlock_t lock;
 	/* lock for dsp signals */
 	spinlock_t dspsignals_lock;
-	/* mutex for  remote mapping synchronization*/
-	struct mutex remote_map_mutex;
 	/*mutex for process maps synchronization*/
 	struct mutex map_mutex;
 	struct mutex signal_create_mutex;

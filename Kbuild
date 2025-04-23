@@ -19,6 +19,12 @@ KBUILD_CPPFLAGS += -DCONFIG_DSP_PINEAPPLE=1
 ccflags-y += -DCONFIG_DSP_PINEAPPLE=1
 endif
 
+ifeq ($(CONFIG_ARCH_NEO), y)
+$(info within KBUILD file CONFIG_ARCH_NEO = $(CONFIG_ARCH_NEO))
+KBUILD_CPPFLAGS += -DCONFIG_DSP_NEO=1
+ccflags-y += -DCONFIG_DSP_NEO=1
+endif
+
 LINUXINCLUDE += -I$(DSP_ROOT)/include/linux
 LINUXINCLUDE += -I$(DSP_ROOT)/include/uapi
 

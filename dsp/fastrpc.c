@@ -3169,21 +3169,21 @@ static int fastrpc_pack_root_sharedpage(struct fastrpc_user *fl,
 	struct fastrpc_phy_page *pages, u32 *pageslen)
 {
 	int err = 0;
+	u64 addr = fl->config.root_addr;
+	u32 size = fl->config.root_size;
 	struct fastrpc_smmu *smmucb = &fl->sctx->smmucb[DEFAULT_SMMU_IDX];
 
 	/* Allocate kernel buffer for rootPD shared page */
-	if (fl->config.root_addr &&
-			fl->config.root_size) {
-		err = fastrpc_buf_alloc(fl, smmucb,
-				fl->config.root_size, USER_BUF, &fl->proc_init_sharedbuf);
+	if (addr && size) {
+		err = fastrpc_buf_alloc(fl, smmucb, size, USER_BUF,
+					&fl->proc_init_sharedbuf);
 		if (err) {
 			dev_err(smmucb->dev, "failed to allocate buffer\n");
 			return err;
 		}
 		/* Copy contents from userspace buffer containing data for rootPD */
 		if (copy_from_user(fl->proc_init_sharedbuf->virt,
-				(void __user *)(uintptr_t) fl->config.root_addr,
-				fl->config.root_size)) {
+				(void __user *)(uintptr_t)addr, size)) {
 			err = -EFAULT;
 			goto err_sharedbuf_fail;
 		}
@@ -3217,6 +3217,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	struct fastrpc_pool_ctx *sctx = NULL;
 	int memlen;
 	int err = 0;
+	int user_fd = fl->config.user_fd, user_size = fl->config.user_size;
 	void *file = NULL;
 	struct {
 		int pgid;
@@ -3320,10 +3321,10 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	if (fl->pd_type == DEFAULT_UNUSED)
 		fl->pd_type = USERPD;
 
-	if(fl->config.user_fd != -1 && fl->config.user_size > 0) {
+	if (user_fd != -1 && user_size > 0) {
 		mutex_lock(&fl->map_mutex);
-		err = fastrpc_map_create(fl, fl->config.user_fd, 0, NULL,
-				fl->config.user_size, 0, 0, &configmap, true);
+		err = fastrpc_map_create(fl, user_fd, 0, NULL,
+				user_size, 0, 0, &configmap, true);
 		mutex_unlock(&fl->map_mutex);
 		if (err)
 			goto err_out;

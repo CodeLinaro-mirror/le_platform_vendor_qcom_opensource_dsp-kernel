@@ -621,3 +621,30 @@ int fastrpc_transport_init(void) {
 void fastrpc_transport_deinit(void) {
 	unregister_rpmsg_driver(&fastrpc_driver);
 }
+
+int fastrpc_reserve_dma_heap(struct fastrpc_tvm_dma_heap **tvm_dma_heap)
+{
+	return -EINVAL;
+}
+
+void fastrpc_unreserve_dma_heap(struct fastrpc_tvm_dma_heap *tvm_dma_heap)
+{
+	return;
+}
+
+inline int __fastrpc_dma_alloc(struct fastrpc_buf *buf)
+{
+	buf->virt = dma_alloc_coherent(buf->dev, buf->size,
+				(dma_addr_t *)&buf->phys, GFP_KERNEL);
+
+	return (buf->virt)? 0: -ENOMEM;
+}
+
+void __fastrpc_dma_buf_free(struct fastrpc_buf *buf)
+{
+	uint32_t sid_pos = (buf->smmucb ? buf->smmucb->sid_pos :
+							DSP_DEFAULT_BUS_WIDTH);
+
+	dma_free_coherent(buf->dev, buf->size, buf->virt,
+		IOVA_TO_PHYSADDR(buf->phys, sid_pos));
+}

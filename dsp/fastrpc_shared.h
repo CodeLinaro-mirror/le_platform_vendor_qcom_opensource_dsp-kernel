@@ -19,6 +19,7 @@
 #include <linux/soc/qcom/pdr.h>
 #include <linux/kobject.h>
 #include <linux/hashtable.h>
+#include <linux/iosys-map.h>
 #include "../include/uapi/misc/fastrpc.h"
 
 #if (KERNEL_VERSION(6, 3, 0) <= LINUX_VERSION_CODE)
@@ -535,6 +536,13 @@ static const char *fastrpc_dsp_labels[FASTRPC_MAX_DSP_TYPE] =
 	"sdsp"
 };
 
+struct fastrpc_tvm_dma_heap {
+	const char *name;          // Name of the dma heap
+	void *mem_pool;            // dma heap memory pool
+	struct dma_heap *dmaheap;  // dma heap
+	bool in_use;               // Flag to indicate if heap is being used
+};
+
 struct fastrpc_socket {
 	struct socket *sock;                   // Socket used to communicate with remote domain
 	struct sockaddr_qrtr local_sock_addr;  // Local socket address on kernel side
@@ -705,6 +713,12 @@ struct fastrpc_buf {
 	struct timespec64 alloc_time;
 	/* time counter to trace scm assign latency */
 	struct timespec64 scm_assign_time;
+	/* sg table for TVM's dma heap mapping */
+	struct sg_table *table;
+	/* dma buffer attach for TVM's dma heap mapping */
+	struct dma_buf_attachment *attach;
+	/* dma buffer virtual map on kernel */
+	struct iosys_map virt_map;
 };
 
 struct fastrpc_dma_buf_attachment {
@@ -1153,6 +1167,8 @@ struct fastrpc_user {
 	uint32_t timeout;
 	/* Flag to check if dsp timeout recovery is enabled */
 	bool dsp_recovery;
+	/* dma heap pool for TVM's dma memory allocations */
+	struct fastrpc_tvm_dma_heap *tvm_dma_heap;
 };
 
 struct fastrpc_ctrl_latency {
@@ -1283,5 +1299,63 @@ int fastrpc_sysfs_register_kset(void);
  * @return: None
  */
 void fastrpc_sysfs_deregister_kset(void);
+
+/*
+ * Reserve one of the TVM dma heap.
+ * Reserved is returned on tvm_dma_heap.
+ *
+ * @param tvm_dma_heap  TVM dma heap structure
+ *
+ * @return 0 on success, negative error code on failure.
+ */
+int fastrpc_reserve_dma_heap(struct fastrpc_tvm_dma_heap **tvm_dma_heap);
+
+/*
+ * Unreserve TVM dma heap.
+ *
+ * @param tvm_dma_heap  TVM dma heap structure to unreserve
+ *
+ * @return: None
+ */
+void fastrpc_unreserve_dma_heap(struct fastrpc_tvm_dma_heap *tvm_dma_heap);
+
+/*
+ * Allocate dma memory. Memory will be mapped to SMMU
+ * and to kernel address space.
+ *
+ * @param buf  fastrpc buffer structure
+ *
+ * @return 0 on success, negative error code on failure.
+ */
+inline int __fastrpc_dma_alloc(struct fastrpc_buf *buf);
+
+/*
+ * Free dma buffer and unmap from SMMU and kernel.
+ *
+ * @param buf  fastrpc buffer structure
+ *
+ * @return: None
+ */
+void __fastrpc_dma_buf_free(struct fastrpc_buf *buf);
+
+/*
+ * Map dma buffer to SMMU
+ *
+ * @param attach  smmu device
+ *
+ * @return 0 on success, negative error code on failure.
+ */
+struct sg_table *__dma_buf_map_attachment_wrap(struct dma_buf_attachment *attach);
+
+/*
+ * Unmap buffer from SMMU
+ *
+ * @param attach  smmu device
+ * @param table  sg table
+ *
+ * @return: None
+ */
+void __dma_buf_unmap_attachment_wrap(struct dma_buf_attachment *attach,
+	struct sg_table *table);
 
 #endif /* __FASTRPC_SHARED_H__ */

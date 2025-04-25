@@ -12,8 +12,197 @@
 #include "../include/uapi/misc/fastrpc.h"
 #include <linux/of_reserved_mem.h>
 #include "fastrpc_shared.h"
+#include <linux/qcom_tvm_heap.h>
+#include <linux/dma-heap.h>
 
 struct fastrpc_channel_ctx *scctx = NULL;
+
+/* Max dma heap pools for TVM memory */
+#define FASTRPC_MAX_TVM_DMA_HEAPS (6)
+
+/*
+ * DMA heap pool size for a session:
+ * - Init secure PD memory
+ * - 8 persistent headers
+ * - 10KB extra for any allocation needed
+ */
+#define TVM_DMA_HEAP_SIZE (INIT_FILELEN_MAX + \
+	FASTRPC_MAX_PERSISTENT_HEADERS*PAGE_SIZE + 10*1024)
+
+struct fastrpc_dma_heap_info {
+	struct mutex heap_mut;
+	struct fastrpc_tvm_dma_heap frpc_dma_heap[FASTRPC_MAX_TVM_DMA_HEAPS];
+};
+
+// Initialize dma heap's names
+static struct fastrpc_dma_heap_info g_frpc_dma_heaps =
+{
+	.frpc_dma_heap =
+	{
+		{.name = "qcom,dsp-heap0"},
+		{.name = "qcom,dsp-heap1"},
+		{.name = "qcom,dsp-heap2"},
+		{.name = "qcom,dsp-heap3"},
+		{.name = "qcom,dsp-heap4"},
+		{.name = "qcom,dsp-heap5"},
+	},
+};
+
+/*
+ * Iterate over list of dma heaps available to fastrpc and returns
+ * next unused dma heap.
+ *
+ * @return 0 on success, negative error code on failure.
+ */
+static struct fastrpc_tvm_dma_heap *get_frpc_dma_heap(void)
+{
+	int ii;
+	struct mutex *mut = &g_frpc_dma_heaps.heap_mut;
+	struct fastrpc_tvm_dma_heap *frpc_dma_heap = g_frpc_dma_heaps.frpc_dma_heap;
+
+	mutex_lock(mut);
+	for(ii = 0; ii < ARRAY_SIZE(g_frpc_dma_heaps.frpc_dma_heap); ++ii) {
+		if (!frpc_dma_heap[ii].in_use) {
+			frpc_dma_heap[ii].in_use = true;
+			mutex_unlock(mut);
+			return &frpc_dma_heap[ii];
+		}
+	}
+	mutex_unlock(mut);
+
+	return NULL;
+}
+
+/*
+ * Set TVM dma heap to unused.
+ *
+ * @param tvm_dma_heap  TVM dma heap to unreserve
+ *
+ * @return 0 on success, negative error code on failure.
+ */
+static void put_frpc_dma_heap(struct fastrpc_tvm_dma_heap *tvm_dma_heap)
+{
+	struct mutex *mut = &g_frpc_dma_heaps.heap_mut;
+
+	mutex_lock(mut);
+	tvm_dma_heap->in_use = false;
+	tvm_dma_heap->mem_pool = NULL;
+	tvm_dma_heap->dmaheap = NULL;
+	mutex_unlock(mut);
+}
+
+void fastrpc_unreserve_dma_heap(struct fastrpc_tvm_dma_heap *tvm_dma_heap)
+{
+	qcom_tvm_heap_remove_kernel_pool(tvm_dma_heap->mem_pool);
+	put_frpc_dma_heap(tvm_dma_heap);
+	return;
+}
+
+int fastrpc_reserve_dma_heap(struct fastrpc_tvm_dma_heap **tvm_dma_heap)
+{
+	int err = 0;
+	struct dma_heap *dmaheap = NULL;
+	void *tvm_mem_pool = NULL;
+	struct fastrpc_tvm_dma_heap *frpc_tvm_dma_heap = NULL;
+
+	frpc_tvm_dma_heap = get_frpc_dma_heap();
+	if (!frpc_tvm_dma_heap) {
+		err = -EAGAIN;
+		return err;
+	}
+
+	dmaheap = dma_heap_find(frpc_tvm_dma_heap->name);
+	if (!dmaheap) {
+		err = -ENOSR;
+		goto dma_find_err;
+	}
+
+	tvm_mem_pool = qcom_tvm_heap_add_kernel_pool(dmaheap, TVM_DMA_HEAP_SIZE);
+	if (IS_ERR_OR_NULL(tvm_mem_pool)) {
+		err = PTR_ERR(tvm_mem_pool);
+		goto dma_find_err;
+	}
+
+	frpc_tvm_dma_heap->mem_pool = tvm_mem_pool;
+	frpc_tvm_dma_heap->dmaheap = dmaheap;
+	*tvm_dma_heap = frpc_tvm_dma_heap;
+	return 0;
+
+dma_find_err:
+	put_frpc_dma_heap(frpc_tvm_dma_heap);
+	return err;
+}
+
+/*
+ * __fastrpc_dma_heap_alloc() - Allocates memory from dma heaps.
+ * In TVM driver dma heaps are predefined heaps that allow system to
+ * donate memory from HLOS to TVM for dma allocation, instead of allocating
+ * from carveout memory.
+ * After memory is donates from HLOS, it needs to be mapped to SMMU and kernel.
+ * @arg1: Fastrpc buffer
+ *
+ * Return: Returns 0 on success, error code on failure
+ */
+inline int __fastrpc_dma_alloc(struct fastrpc_buf *buf)
+{
+	struct dma_buf *dmabuf = NULL;
+	struct fastrpc_smmu *smmucb = NULL;
+	struct dma_buf_attachment *attach = NULL;
+	struct sg_table *table = NULL;
+	struct fastrpc_tvm_dma_heap *tvm_dma_heap = buf->fl->tvm_dma_heap;
+	int err = 0;
+
+	smmucb = buf->smmucb;
+
+	// Allocate dma buffer
+	dmabuf = dma_heap_buffer_alloc(tvm_dma_heap->dmaheap, buf->size,
+		O_CLOEXEC| O_RDWR, 0);
+	if (IS_ERR_OR_NULL(dmabuf)) {
+		err = PTR_ERR(dmabuf);
+		return err;
+	}
+
+	attach = dma_buf_attach(dmabuf, smmucb->dev);
+	if (IS_ERR_OR_NULL(attach)) {
+		err = PTR_ERR(attach);
+		goto attach_err;
+	}
+
+	// Map dma buffer to SMMU
+	table = __dma_buf_map_attachment_wrap(attach);
+	if (IS_ERR_OR_NULL(table)) {
+		err = PTR_ERR(table);
+		goto map_err;
+	}
+
+	// Map dma buffer to kernel address space
+	err = dma_buf_vmap_unlocked(dmabuf, &buf->virt_map);
+	if (err)
+		goto vmap_err;
+
+	buf->phys = sg_dma_address(table->sgl);
+	buf->dmabuf = dmabuf;
+	buf->table = table;
+	buf->attach = attach;
+	buf->virt = buf->virt_map.vaddr;
+
+	return 0;
+vmap_err:
+	__dma_buf_unmap_attachment_wrap(attach, table);
+map_err:
+	dma_buf_detach(dmabuf, attach);
+attach_err:
+	dma_heap_buffer_free(dmabuf);
+	return err;
+}
+
+void __fastrpc_dma_buf_free(struct fastrpc_buf *buf)
+{
+	dma_buf_vunmap_unlocked(buf->dmabuf, &buf->virt_map);
+	__dma_buf_unmap_attachment_wrap(buf->attach, buf->table);
+	dma_buf_detach(buf->dmabuf, buf->attach);
+	dma_heap_buffer_free(buf->dmabuf);
+}
 
 struct fastrpc_channel_ctx* get_current_channel_ctx(struct device *dev)
 {
@@ -405,6 +594,7 @@ int fastrpc_transport_init(void)
 	session_control->remote_server_online = false;
 	frpc_socket = &session_control->frpc_socket;
 	mutex_init(&frpc_socket->socket_mutex);
+	mutex_init(&g_frpc_dma_heaps.heap_mut);
 
 	sock = create_socket(session_control);
 	if (!sock) {
@@ -481,6 +671,7 @@ void fastrpc_transport_deinit(void)
 	frpc_socket->recv_buf = NULL;
 	frpc_socket->sock = NULL;
 	mutex_destroy(&frpc_socket->socket_mutex);
+	mutex_destroy(&g_frpc_dma_heaps.heap_mut);
 }
 
 /**

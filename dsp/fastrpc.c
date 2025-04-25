@@ -2458,7 +2458,7 @@ reject_session:
 
 static int fastrpc_get_process_gids(struct gid_list *gidlist)
 {
-	struct group_info *group_info = get_current_groups();
+	struct group_info *group_info = current_cred()->group_info;
 	int i, num_gids;
 	u32 *gids = NULL;
 

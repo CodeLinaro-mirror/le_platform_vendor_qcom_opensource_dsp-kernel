@@ -91,6 +91,7 @@ def define_vm_modules(target, variant):
             "//soc-repo:all_headers",
             "//soc-repo:{}/drivers/firmware/qcom/qcom-scm".format(kernel_build_variant),
             "//soc-repo:{}/drivers/soc/qcom/mem_buf/mem_buf_dev".format(kernel_build_variant),
+            "//soc-repo:{}/drivers/dma-buf/heaps/qcom_dma_heaps".format(kernel_build_variant),
             ] ,
         "//build/kernel/kleaf:socrepo_false": ["//msm-kernel:all_headers"],
     })

@@ -142,38 +142,50 @@ static inline struct fastrpc_channel_ctx
 	return domain ? domain->cctx : NULL;
 }
 
+void __dma_buf_unmap_attachment_wrap(struct dma_buf_attachment *attach,
+	struct sg_table *table)
+{
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,2,0))
+	dma_buf_unmap_attachment_unlocked(attach, table, DMA_BIDIRECTIONAL);
+#else
+	dma_buf_unmap_attachment(attach, table, DMA_BIDIRECTIONAL);
+#endif
+}
+
 static void dma_buf_unmap_attachment_wrap(struct fastrpc_map *map)
 {
 	trace_fastrpc_dma_unmap(map->fl->cctx->domain_id, map->phys,
 		map->size, map->fd);
+
+	__dma_buf_unmap_attachment_wrap(map->attach, map->table);
+}
+
+struct sg_table *__dma_buf_map_attachment_wrap(struct dma_buf_attachment *attach)
+{
+	struct sg_table *table;
+
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,2,0))
-	dma_buf_unmap_attachment_unlocked(map->attach, map->table,
+	table = dma_buf_map_attachment_unlocked(attach,
 		DMA_BIDIRECTIONAL);
 #else
-	dma_buf_unmap_attachment(map->attach, map->table,
+	table = dma_buf_map_attachment(attach,
 		DMA_BIDIRECTIONAL);
 #endif
+
+	return table;
 }
+
 static int dma_buf_map_attachment_wrap(struct fastrpc_map *map)
 {
 	int err = 0;
 	struct sg_table *table;
 
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,2,0))
-	table = dma_buf_map_attachment_unlocked(map->attach,
-		DMA_BIDIRECTIONAL);
+	table = __dma_buf_map_attachment_wrap(map->attach);
 	if (IS_ERR(table)) {
 		err = PTR_ERR(table);
 		return err;
 	}
-#else
-	table = dma_buf_map_attachment(map->attach,
-		DMA_BIDIRECTIONAL);
-	if (IS_ERR(table)) {
-		err = PTR_ERR(table);
-		return err;
-	}
-#endif
+
 	map->table = table;
 
 	return 0;
@@ -344,14 +356,12 @@ static bool fastrpc_get_persistent_buf(struct fastrpc_user *fl,
 	return found;
 }
 
-static void __fastrpc_dma_buf_free(struct fastrpc_buf *buf)
+static inline void fastrpc_dma_buf_free(struct fastrpc_buf *buf)
 {
-	uint32_t sid_pos = (buf->smmucb ? buf->smmucb->sid_pos :
-							DSP_DEFAULT_BUS_WIDTH);
-
 	trace_fastrpc_dma_free(buf->domain_id, buf->phys, buf->size);
-	dma_free_coherent(buf->dev, buf->size, buf->virt,
-		IOVA_TO_PHYSADDR(buf->phys, sid_pos));
+
+	__fastrpc_dma_buf_free(buf);
+
 	kfree(buf);
 }
 
@@ -361,13 +371,13 @@ static void __fastrpc_buf_free(struct fastrpc_buf *buf)
 
 	/* REMOTEHEAP_BUF is not mapped on SMMU device */
 	if (buf->type == REMOTEHEAP_BUF) {
-		__fastrpc_dma_buf_free(buf);
+		fastrpc_dma_buf_free(buf);
 	} else {
 		smmucb = buf->smmucb;
 		mutex_lock(&smmucb->map_mutex);
 		if (smmucb->dev) {
 			smmucb->allocatedbytes -= SMMU_ALIGN(buf->size);
-			__fastrpc_dma_buf_free(buf);
+			fastrpc_dma_buf_free(buf);
 		}
 		mutex_unlock(&smmucb->map_mutex);
 	}
@@ -495,10 +505,26 @@ static void fastrpc_rootheap_buf_list_free(struct fastrpc_channel_ctx *cctx)
 	} while (free);
 }
 
-static inline void __fastrpc_dma_alloc(struct fastrpc_buf *buf)
+static inline int fastrpc_dma_alloc(struct fastrpc_buf *buf)
 {
-	buf->virt = dma_alloc_coherent(buf->dev, buf->size,
-				(dma_addr_t *)&buf->phys, GFP_KERNEL);
+	struct fastrpc_smmu *smmucb = buf->smmucb;
+	int err = 0;
+
+	if (!buf->dev)
+		return -EINVAL;
+
+	err = __fastrpc_dma_alloc(buf);
+	if (err)
+		return err;
+
+	if (buf->type == REMOTEHEAP_BUF)
+		return 0;
+
+	smmucb->allocatedbytes += SMMU_ALIGN(buf->size);
+	RECONSTRUCT_IOVA_FROM_SID_PA((u64)smmucb->sid,
+		buf->phys, smmucb->sid_pos);
+
+	return 0;
 }
 
 static int __fastrpc_buf_alloc(struct fastrpc_user *fl,
@@ -507,6 +533,7 @@ static int __fastrpc_buf_alloc(struct fastrpc_user *fl,
 {
 	struct fastrpc_buf *buf;
 	struct timespec64 start_ts, end_ts;
+	int err = 0;
 
 	/* Check if the size is valid (non-zero and within integer range) */
 	if (!size || size > INT_MAX)
@@ -535,23 +562,16 @@ static int __fastrpc_buf_alloc(struct fastrpc_user *fl,
 		 * Do not acquire spinlock with IRQ disabled
 		 * as "dma_alloc_coherent" locks a mutex
 		 */
-		if (fl->cctx->dev)
-			__fastrpc_dma_alloc(buf);
+		err = fastrpc_dma_alloc(buf);
 	} else {
 		buf->dev = smmucb->dev;
 		buf->smmucb = smmucb;
 		mutex_lock(&smmucb->map_mutex);
-		if (smmucb->dev)
-			__fastrpc_dma_alloc(buf);
-		if (buf->virt) {
-			smmucb->allocatedbytes += SMMU_ALIGN(buf->size);
-			RECONSTRUCT_IOVA_FROM_SID_PA((u64)smmucb->sid,
-				buf->phys, smmucb->sid_pos);
-		}
+		err = fastrpc_dma_alloc(buf);
 		mutex_unlock(&smmucb->map_mutex);
 	}
 
-	if (!buf->virt) {
+	if (err) {
 		mutex_destroy(&buf->lock);
 		kfree(buf);
 		return -ENOMEM;
@@ -1252,11 +1272,10 @@ static int set_buffer_secure_type(struct fastrpc_map *map)
 	 *	- Since it is a secure environment by default, there are no explicit "secure" buffers
 	 *	- All buffers are marked "non-secure"
 	 */
-#if IS_ENABLED(CONFIG_QCOM_FASTRPC_TRUSTED)
-	map->secure = 0;
-#else
-	map->secure = (exclusive_access) ? 0 : 1;
-#endif
+	if (g_frpc.is_trusted_vm)
+		map->secure = 0;
+	else
+		map->secure = (exclusive_access) ? 0 : 1;
 
 	return err;
 }
@@ -3684,6 +3703,9 @@ static int fastrpc_user_obj_free(struct file *file,
 	debugfs_remove(fl->debugfs_file);
 #endif
 
+	if (g_frpc.is_trusted_vm)
+		fastrpc_unreserve_dma_heap(fl->tvm_dma_heap);
+
 skip_user_cleanup:
 	fastrpc_free_user(fl);
 
@@ -3748,6 +3770,7 @@ static int fastrpc_user_obj_create(struct file *filp,
 	struct fastrpc_device_node *fdevice;
 	struct fastrpc_user *fl = NULL;
 	unsigned long flags;
+	struct fastrpc_tvm_dma_heap *tvm_dma_heap = NULL;
 	int err;
 
 	if (filp) {
@@ -3818,6 +3841,14 @@ static int fastrpc_user_obj_create(struct file *filp,
 		spin_lock_irqsave(&cctx->lock, flags);
 		list_add_tail(&fl->user, &cctx->users);
 		spin_unlock_irqrestore(&cctx->lock, flags);
+
+		if (g_frpc.is_trusted_vm) {
+			err = fastrpc_reserve_dma_heap(&tvm_dma_heap);
+			if (err)
+				goto error;
+		}
+
+		fl->tvm_dma_heap = tvm_dma_heap;
 	} else {
 		/* No pid will be associated with the default user-object */
 		fl->tgid = fl->tgid_app = -1;

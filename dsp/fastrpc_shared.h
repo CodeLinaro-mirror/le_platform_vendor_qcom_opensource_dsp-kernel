@@ -243,6 +243,10 @@
 #define FASTRPC_CPUINFO_DEFAULT (0)
 #define FASTRPC_CPUINFO_EARLY_WAKEUP (1)
 
+/* Default root heap buffer size and count */
+#define FASTRPC_DEFAULT_ROOTHEAP_BUF_SIZE (0x140000)
+#define FASTRPC_DEFAULT_ROOTHEAP_BUF_COUNT (3)
+
 /* Position of priority in frpc tid for glink msg packet */
 #define PRIORITY_POS_IN_FRPC_TID 26
 
@@ -895,6 +899,10 @@ struct fastrpc_channel_ctx {
 	u32 iova_format;
 	/* kcomm user object for making kernel-to-rootpd rpc calls */
 	struct fastrpc_kcomm_channel kcomm_user;
+	/* Root heap buffer size */
+	unsigned int rootheap_buf_size;
+	/* Root heap buffer count */
+	unsigned int rootheap_buf_count;
 };
 
 struct fastrpc_ssr_handler {

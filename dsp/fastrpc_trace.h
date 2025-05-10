@@ -26,6 +26,7 @@
 #define TRACE_INCLUDE_FILE fastrpc_trace
 
 #include <linux/tracepoint.h>
+#include <linux/version.h>
 
 TRACE_EVENT(fastrpc_transport_send,
 
@@ -386,7 +387,11 @@ TRACE_EVENT(fastrpc_msg,
 		__get_str(buf)[sizeof(message) - 1] = '\0';
 #else
 		if (message)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0)
+			__assign_str(buf);
+#else
 			__assign_str_len(buf, message, (sizeof(message) - 1));
+#endif
 		else
 			memcpy(__get_str(buf), "(null)", sizeof("(null)"));
 #endif
@@ -414,7 +419,11 @@ TRACE_EVENT(fastrpc_dspsignal,
 		__get_str(buf)[sizeof(event) - 1] = '\0';
 #else
 		if (event)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0)
+			__assign_str(buf);
+#else
 			__assign_str_len(buf, event, (sizeof(event) - 1));
+#endif
 		else
 			memcpy(__get_str(buf), "(null)", sizeof("(null)"));
 #endif

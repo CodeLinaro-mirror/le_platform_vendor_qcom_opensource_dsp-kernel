@@ -68,3 +68,7 @@ define_modules("vienna", "consolidate", "no")
 define_modules("alor", "perf", "no")
 
 define_modules("alor", "consolidate", "no")
+
+define_modules("x1p42100", "perf", "no")
+
+define_modules("x1p42100", "consolidate", "no")

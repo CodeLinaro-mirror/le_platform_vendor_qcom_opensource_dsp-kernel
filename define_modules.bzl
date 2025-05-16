@@ -18,7 +18,10 @@ def define_modules(target, variant):
 
     ddk_module(
         name = "{}_frpc-adsprpc".format(kernel_build_variant),
-        kernel_build = "//msm-kernel:{}".format(kernel_build_variant),
+        kernel_build = select({
+            "//build/kernel/kleaf:microxr_kernel_build_true": "//:target_kernel_build",
+            "//build/kernel/kleaf:microxr_kernel_build_false": "//msm-kernel:{}".format(kernel_build_variant)
+        }),
         deps = ["//msm-kernel:all_headers"],
         srcs = [
             "dsp/adsprpc.c",
@@ -42,7 +45,10 @@ def define_modules(target, variant):
 
     ddk_module(
         name = "{}_cdsp-loader".format(kernel_build_variant),
-        kernel_build = "//msm-kernel:{}".format(kernel_build_variant),
+        kernel_build = select({
+            "//build/kernel/kleaf:microxr_kernel_build_true": "//:target_kernel_build",
+            "//build/kernel/kleaf:microxr_kernel_build_false": "//msm-kernel:{}".format(kernel_build_variant)
+        }),
         deps = ["//msm-kernel:all_headers"],
         srcs = ["dsp/cdsp-loader.c"],
         out = "cdsp-loader.ko",

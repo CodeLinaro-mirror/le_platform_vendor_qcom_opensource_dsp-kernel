@@ -5930,7 +5930,11 @@ static void fastrpc_genpool_free(struct fastrpc_smmu *smmucb)
 	}
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0)
+static void fastrpc_cb_remove(struct platform_device *pdev)
+#else
 static int fastrpc_cb_remove(struct platform_device *pdev)
+#endif
 {
 	struct fastrpc_channel_ctx *cctx = dev_get_drvdata(pdev->dev.parent);
 	struct fastrpc_smmu *smmucb = dev_get_drvdata(&pdev->dev),
@@ -5961,7 +5965,9 @@ static int fastrpc_cb_remove(struct platform_device *pdev)
 	}
 	spin_unlock_irqrestore(&cctx->lock, flags);
 	dev_info(&pdev->dev, "Successfully removed %s", pdev->dev.kobj.name);
-	return 0;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 10, 0)
+        return 0;
+#endif
 }
 
 static const struct of_device_id fastrpc_match_table[] = {

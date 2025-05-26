@@ -834,7 +834,7 @@ struct fastrpc_user {
 	 */
 	struct fastrpc_device *device;
 #ifdef CONFIG_DEBUG_FS
-	bool debugfs_file_create;
+	atomic_t debugfs_file_create;
 	struct dentry *debugfs_file;
 	char *debugfs_buf;
 #endif

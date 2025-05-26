@@ -1210,6 +1210,7 @@ static int fastrpc_map_create(struct fastrpc_user *fl, int fd,
 	int err = 0, sgl_index = 0;
 	struct device *dev = NULL;
 	struct fastrpc_smmu *smmucb = NULL;
+	struct fastrpc_pool_ctx *secsctx = NULL;
 	u32 smmuidx = DEFAULT_SMMU_IDX;
 
 	if (!fastrpc_map_lookup(fl, fd, va, len, buf, mflags, ppmap, take_ref))
@@ -1249,12 +1250,13 @@ static int fastrpc_map_create(struct fastrpc_user *fl, int fd,
 
 	if (map->secure && (!(attr & FASTRPC_ATTR_NOMAP || mflags == FASTRPC_MAP_FD_NOMAP))) {
 		if (!fl->secsctx) {
-			fl->secsctx = fastrpc_session_alloc(fl, true);
-			if (!fl->secsctx) {
+			secsctx = fastrpc_session_alloc(fl, true);
+			if (!secsctx) {
 				dev_err(fl->cctx->dev, "No secure session available\n");
 				err = -EBUSY;
 				goto attach_err;
 			}
+			fl->secsctx = secsctx;
 		}
 		sess = fl->secsctx;
 	} else {
@@ -2687,38 +2689,37 @@ static int fastrpc_create_session_debugfs(struct fastrpc_user *fl)
 	int domain_id = -1, size = 0;
 	struct dentry *debugfs_root = g_frpc.debugfs_root;
 
+	if (atomic_cmpxchg(&fl->debugfs_file_create, 0, 1))
+		return 0;
 	memcpy(cur_comm, current->comm, TASK_COMM_LEN);
 	cur_comm[TASK_COMM_LEN-1] = '\0';
 	if (debugfs_root != NULL && fl != NULL) {
 		domain_id = fl->cctx->domain_id;
-		if (!(fl->debugfs_file_create)) {
-			size = strlen(cur_comm) + strlen("_")
-				+ COUNT_OF(current->pid) + strlen("_")
-				+ COUNT_OF(fl->tgid_frpc) + strlen("_")
-				+ COUNT_OF(FASTRPC_DEV_MAX)
-				+ 1;
+		size = strlen(cur_comm) + strlen("_")
+			+ COUNT_OF(current->pid) + strlen("_")
+			+ COUNT_OF(fl->tgid_frpc) + strlen("_")
+			+ COUNT_OF(FASTRPC_DEV_MAX)
+			+ 1;
 
-			fl->debugfs_buf = kzalloc(size, GFP_KERNEL);
-			if (fl->debugfs_buf == NULL) {
-				return -ENOMEM;
-			}
-			/*
-			 * Use HLOS process name, HLOS PID, unique fastrpc PID
-			 * domain_id in debugfs filename to create unique file name
-			 */
-			snprintf(fl->debugfs_buf, size, "%.10s%s%d%s%d%s%d",
-				cur_comm, "_", current->pid, "_",
-				fl->tgid_frpc, "_", domain_id);
-			fl->debugfs_file = debugfs_create_file(fl->debugfs_buf, 0644,
-					debugfs_root, fl, &fastrpc_debugfs_fops);
-			if (IS_ERR_OR_NULL(fl->debugfs_file)) {
-				pr_warn("Error: %s: %s: failed to create debugfs file %s\n",
-						cur_comm, __func__, fl->debugfs_buf);
-				fl->debugfs_file = NULL;
-			}
-			kfree(fl->debugfs_buf);
-			fl->debugfs_file_create = true;
+		fl->debugfs_buf = kzalloc(size, GFP_KERNEL);
+		if (fl->debugfs_buf == NULL) {
+			return -ENOMEM;
 		}
+		/*
+		 * Use HLOS process name, HLOS PID, unique fastrpc PID
+		 * domain_id in debugfs filename to create unique file name
+		 */
+		snprintf(fl->debugfs_buf, size, "%.10s%s%d%s%d%s%d",
+			cur_comm, "_", current->pid, "_",
+			fl->tgid_frpc, "_", domain_id);
+		fl->debugfs_file = debugfs_create_file(fl->debugfs_buf, 0644,
+			debugfs_root, fl, &fastrpc_debugfs_fops);
+		if (IS_ERR_OR_NULL(fl->debugfs_file)) {
+			pr_warn("Error: %s: %s: failed to create debugfs file %s\n",
+					cur_comm, __func__, fl->debugfs_buf);
+			fl->debugfs_file = NULL;
+		}
+		kfree(fl->debugfs_buf);
 	}
 return 0;
 }
@@ -2733,6 +2734,7 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 	struct fastrpc_phy_page pages[1];
 	struct fastrpc_buf *buf = NULL;
 	struct fastrpc_smmu *smmucb = NULL;
+	struct fastrpc_pool_ctx *sctx = NULL;
 	u64 phys = 0, size = 0;
 	char *name;
 	int err = 0;
@@ -2761,12 +2763,13 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 	if (IS_ERR(name))
 		return PTR_ERR(name);
 
-	fl->sctx = fastrpc_session_alloc(fl, false);
-	if (!fl->sctx) {
+	sctx = fastrpc_session_alloc(fl, false);
+	if (!sctx) {
 		dev_err(fl->cctx->dev, "No session available\n");
 		err = -EBUSY;
 		goto err_name;
 	}
+	fl->sctx = sctx;
 
 	smmucb = &fl->sctx->smmucb[DEFAULT_SMMU_IDX];
 	is_oispd = !strcmp(name, "oispd");
@@ -3055,6 +3058,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	struct fastrpc_phy_page pages[NUM_PAGES_WITH_PROC_INIT_SHAREDBUF] = {0};
 	struct fastrpc_map *configmap = NULL;
 	struct fastrpc_buf *imem = NULL;
+	struct fastrpc_pool_ctx *sctx = NULL;
 	int memlen;
 	int err = 0;
 	int user_fd = fl->config.user_fd, user_size = fl->config.user_size;
@@ -3130,12 +3134,14 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	if (fl->is_unsigned_pd && fl->cctx->smmucb_pool)
 		fl->pd_type = USER_UNSIGNEDPD_POOL;
 
-	fl->sctx = fastrpc_session_alloc(fl, false);
-	if (!fl->sctx) {
+	sctx = fastrpc_session_alloc(fl, false);
+	if (!sctx) {
 		dev_err(fl->cctx->dev, "No session available\n");
 		err = -EBUSY;
 		goto err_out;
 	}
+	fl->sctx = sctx;
+
 	/* In case of privileged process update attributes */
 	fastrpc_check_privileged_process(fl, &init);
 
@@ -3668,17 +3674,19 @@ static int fastrpc_init_attach(struct fastrpc_user *fl, int pd)
 {
 	struct fastrpc_invoke_args args[1];
 	struct fastrpc_enhanced_invoke ioctl;
+	struct fastrpc_pool_ctx *sctx = NULL;
 	int err, tgid = fl->tgid_frpc;
 
 	if (!fl->is_secure_dev) {
 		dev_err(fl->cctx->dev, "untrusted app trying to attach to privileged DSP PD\n");
 		return -EACCES;
 	}
-	fl->sctx = fastrpc_session_alloc(fl, false);
-	if (!fl->sctx) {
+	sctx = fastrpc_session_alloc(fl, false);
+	if (!sctx) {
 		dev_err(fl->cctx->dev, "No session available\n");
 		return -EBUSY;
 	}
+	fl->sctx = sctx;
 
 	/*
 	 * Default value at fastrpc_device_open is set as DEFAULT_UNUSED.

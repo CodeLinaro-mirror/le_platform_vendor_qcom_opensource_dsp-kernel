@@ -3411,8 +3411,10 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	 * comparing current PID with the one stored during device open.
 	 */
 	fl->tgid_app = current->tgid;
-	if (fl->tgid_app != fl->tgid)
+	if (fl->tgid_app != fl->tgid) {
 		fl->untrusted_process = true;
+		snprintf(fl->name, sizeof(fl->name), "%s", current->comm);
+	}
 
 	if (init.attrs & FASTRPC_MODE_UNSIGNED_MODULE)
 		fl->is_unsigned_pd = true;
@@ -3995,6 +3997,7 @@ static int fastrpc_user_obj_create(struct file *filp,
 	if (filp) {
 		fl->tgid = fl->tgid_app = current->tgid;
 		fl->tgid_frpc = get_unique_hlos_process_id(cctx);
+		snprintf(fl->name, sizeof(fl->name), "%s", current->comm);
 
 		if (fl->tgid_frpc == -1) {
 			dev_err(cctx->dev, "too many fastrpc clients, max %u allowed\n",
@@ -4030,6 +4033,7 @@ static int fastrpc_user_obj_create(struct file *filp,
 		/* No pid will be associated with the default user-object */
 		fl->tgid = fl->tgid_app = -1;
 		fl->tgid_frpc = -1;
+		snprintf(fl->name, sizeof(fl->name), "%s", "default_user");
 
 		/*
 		 * RPC calls made with the channel's default user-object will
@@ -7636,7 +7640,8 @@ static void fastrpc_handle_signal_rpmsg(uint64_t msg, struct fastrpc_channel_ctx
 	fastrpc_file_put(fl, true);
 }
 
-int fastrpc_handle_rpc_response(struct fastrpc_channel_ctx *cctx, void *data, int len)
+int fastrpc_handle_rpc_response(struct fastrpc_channel_ctx *cctx, void *data,
+		int len, bool is_glink_wakeup)
 {
 	struct fastrpc_invoke_rsp *rsp = data;
 	struct fastrpc_invoke_rspv2 *rspv2 = NULL;
@@ -7705,6 +7710,21 @@ int fastrpc_handle_rpc_response(struct fastrpc_channel_ctx *cctx, void *data, in
 		}
 	}
 	fastrpc_notify_user_ctx(ctx, rsp->retval, rsp_flags, early_wake_time);
+
+	if (is_glink_wakeup && ctx->fl)
+		dev_info(cctx->dev,
+				"glink wakeup by(%s): domain(%d) pd_type(%d) "
+				"pid(%d: %d: %d) tid(%d) handle(0x%x) sc(0x%x)\n",
+					ctx->fl->name,
+					cctx->domain_id,
+					ctx->fl->pd_type,
+					ctx->fl->tgid,
+					ctx->fl->tgid_app,
+					ctx->fl->tgid_frpc,
+					ctx->pid,
+					ctx->handle,
+					ctx->sc);
+
 	spin_unlock_irqrestore(&cctx->lock, flags);
 	/*
 	 * The DMA buffer associated with the context cannot be freed in

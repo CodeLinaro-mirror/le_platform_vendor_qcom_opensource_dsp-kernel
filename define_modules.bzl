@@ -29,6 +29,7 @@ def define_modules(target, variant, build_loader):
             "//soc-repo:{}/drivers/firmware/qcom/qcom-scm".format(kernel_build_variant),
             "//soc-repo:{}/drivers/soc/qcom/mem_buf/mem_buf_dev".format(kernel_build_variant),
             "//soc-repo:{}/drivers/soc/qcom/pdr_interface".format(kernel_build_variant),
+            "//soc-repo:{}/drivers/rpmsg/qcom_glink".format(kernel_build_variant),
         ],
         "//build/kernel/kleaf:socrepo_false": ["//msm-kernel:all_headers"],
     })

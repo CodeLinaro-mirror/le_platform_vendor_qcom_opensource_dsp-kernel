@@ -30,7 +30,8 @@ void fastrpc_register_wakeup_source(struct device *dev,
 	const char *client_name, struct wakeup_source **device_wake_source);
 int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx, bool is_pdr);
 void fastrpc_queue_pd_status(struct fastrpc_user *fl, int domain, int status, int sessionid);
-void frpc_coredump(struct fastrpc_channel_ctx *cctx);
+void frpc_coredump(struct fastrpc_channel_ctx *cctx,
+	struct list_head *active_users_list);
 
 struct fastrpc_channel_ctx* get_current_channel_ctx(struct device *dev)
 {
@@ -503,8 +504,10 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	struct fastrpc_domain *domain = cctx->domain;
 	struct fastrpc_user *user, *n;
 	unsigned long flags;
-	int i = 0;
+	int i = 0, err;
+	struct list_head active_users_list;
 
+	INIT_LIST_HEAD(&active_users_list);
 	dev_info(cctx->dev, "%s started", __func__);
 
 	/* No invocations past this point */
@@ -513,11 +516,29 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	domain->status = DSP_STATUS_DOWN;
 	domain->cctx = NULL;
 	cctx->staticpd_status = false;
+
+	list_for_each_entry_safe(user, n, &cctx->users, user) {
+		err = fastrpc_file_get(user);
+		if (err) {
+			dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
+				__func__, user);
+			continue;
+		}
+
+		/*
+		 * Add active user-objects to a dedicated active_users_list to
+		 * avoid access to the objects which are in the device release
+		 * process. Utilize active_users_list for core dumps and
+		 * fastrpc_free_user.
+		 */
+		list_add_tail(&user->active_user_ssr, &active_users_list);
+	}
 	spin_unlock_irqrestore(&cctx->lock, flags);
-	frpc_coredump(cctx);
+	frpc_coredump(cctx, &active_users_list);
 	spin_lock_irqsave(&cctx->lock, flags);
-	list_for_each_entry_safe(user,  n, &cctx->users, user) {
-		fastrpc_queue_pd_status(user, cctx->domain_id, FASTRPC_DSP_SSR, user->sessionid);
+	list_for_each_entry_safe(user, n, &cctx->users, user) {
+		fastrpc_queue_pd_status(user, cctx->domain_id, FASTRPC_DSP_SSR,
+			user->sessionid);
 		fastrpc_notify_users(user);
 	}
 	spin_unlock_irqrestore(&cctx->lock, flags);
@@ -545,8 +566,11 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	 * be removed. So free all SMMU mappings of every process using this
 	 * channel to avoid any UAF later.
 	 */
-	list_for_each_entry_safe(user, n, &cctx->users, user) {
+	list_for_each_entry_safe(user, n, &active_users_list,
+		active_user_ssr) {
 		fastrpc_free_user(user);
+		list_del(&user->active_user_ssr);
+		fastrpc_file_put(user, true);
 	}
 
 	mutex_lock(&cctx->wake_mutex);

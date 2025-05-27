@@ -1170,6 +1170,11 @@ struct fastrpc_user {
 	bool dsp_recovery;
 	/* dma heap pool for TVM's dma memory allocations */
 	struct fastrpc_tvm_dma_heap *tvm_dma_heap;
+
+	/* Node for adding this user-object to active-users list during ssr */
+	struct list_head active_user_ssr;
+	struct kref refcount;
+	struct work_struct put_work;
 };
 
 struct fastrpc_ctrl_latency {
@@ -1358,5 +1363,32 @@ struct sg_table *__dma_buf_map_attachment_wrap(struct dma_buf_attachment *attach
  */
 void __dma_buf_unmap_attachment_wrap(struct dma_buf_attachment *attach,
 	struct sg_table *table);
+
+/*
+ * fastrpc_file_get - Take a reference on the fastrpc user object
+ *
+ * This function increments the reference count for the specified
+ * fastrpc user object if it is non-zero, ensuring safe access.
+ *
+ * @fl: Pointer to the fastrpc_user structure.
+ *
+ * @return: 0 on success, or a negative error code on failure.
+ */
+int fastrpc_file_get(struct fastrpc_user *fl);
+
+/*
+ * fastrpc_file_put - Release reference to the fastrpc user object
+ *
+ * This function decrements the reference count for the specified
+ * fastrpc user object. If the reference count drops to zero, the
+ * corresponding resources are released.
+ *
+ * @fl: Pointer to the fastrpc_user structure.
+ * @worker: If true, schedules the release callback in the worker thread,
+ * 			otherwise, decreases the reference count.
+ *
+ * @return: None
+ */
+void fastrpc_file_put(struct fastrpc_user *fl, bool worker);
 
 #endif /* __FASTRPC_SHARED_H__ */

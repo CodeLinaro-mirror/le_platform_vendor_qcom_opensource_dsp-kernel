@@ -162,6 +162,8 @@
 #define ADSP_MMAP_ADD_PAGES_LLC 0x3000
 /* Map persistent header buffer on DSP */
 #define ADSP_MMAP_PERSIST_HDR  0x4000
+/* Size of dbglogbuf to log map/unmap calls on DSP*/
+#define DBGLOGBUF_SIZE (1*1024*1024)
 
 
 /* Fastrpc attribute for no mapping of fd  */
@@ -218,10 +220,12 @@
  *     Page 2 : proc attrs debug buf
  *     Page 3 : rootheap buf
  *     Page 4 : proc_init shared buf
+ *     Page 5 : map debug log buf
  */
 #define NUM_PAGES_WITH_SHARED_BUF 2
 #define NUM_PAGES_WITH_ROOTHEAP_BUF 3
 #define NUM_PAGES_WITH_PROC_INIT_SHAREDBUF 4
+#define NUM_PAGES_WITH_MAP_DEBUG_BUF 5
 
 #define miscdev_to_fdevice(d) container_of(d, struct fastrpc_device_node, miscdev)
 
@@ -450,6 +454,7 @@ enum fastrpc_internal_attributes {
 	/* DMA handle reverse RPC support */
 	DMA_HANDLE_REVERSE_RPC_CAP = 129,
 	ROOTPD_RPC_HEAP_SUPPORT = 132,
+	DBGLOGBUF_SUPPORT = 134,
 };
 
 enum fastrpc_remote_domains_id {
@@ -470,6 +475,8 @@ enum fastrpc_remote_domains_id {
 	REMOTEHEAP_BUF,
 	/* Buffer to grow rpc-heap on root-pd */
 	ROOTHEAP_BUF,
+	/* Buffer to log DSP map/unmap debug info*/
+	MAP_DEBUG_BUF,
 };
 
 /* Types of RPC calls to DSP */
@@ -1098,6 +1105,8 @@ struct fastrpc_user {
 	struct fastrpc_static_pd *spd;
 	/* Pre-allocated buffer divided into N chunks */
 	struct fastrpc_buf *hdr_bufs;
+	/* dbglogbuf to log DSP map/unmap debug info */
+	struct fastrpc_buf *dbglogbuf;
 	/*
 	 * Unique device struct for each process, shared with
 	 * client drivers when attached to fastrpc driver.

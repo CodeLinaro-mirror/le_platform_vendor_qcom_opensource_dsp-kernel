@@ -25,9 +25,11 @@ struct fastrpc_channel_ctx *scctx = NULL;
  * - Init secure PD memory
  * - 8 persistent headers
  * - 10KB extra for any allocation needed
+ * - 1MB for debug log buffer
  */
 #define TVM_DMA_HEAP_SIZE (INIT_FILELEN_MAX + \
-	FASTRPC_MAX_PERSISTENT_HEADERS*PAGE_SIZE + 10*1024)
+	FASTRPC_MAX_PERSISTENT_HEADERS*PAGE_SIZE + 10*1024 +\
+	DBGLOGBUF_SIZE)
 
 struct fastrpc_dma_heap_info {
 	struct mutex heap_mut;

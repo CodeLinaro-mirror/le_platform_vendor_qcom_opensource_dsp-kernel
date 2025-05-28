@@ -422,6 +422,11 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	err = of_property_read_u32(rdev->of_node, "qcom,dsp-iova-format",
 			&data->iova_format);
 
+	err = of_property_read_u32(rdev->of_node, "qcom,rootheap-buffer-size",
+		&data->rootheap_buf_size);
+	err = of_property_read_u32(rdev->of_node, "qcom,rootheap-buffer-count",
+			&data->rootheap_buf_count);
+
 	kref_init(&data->refcount);
 	dev_set_drvdata(&rpdev->dev, data);
 	rdev->dma_mask = &data->dma_mask;

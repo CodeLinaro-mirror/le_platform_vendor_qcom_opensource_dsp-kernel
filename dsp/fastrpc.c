@@ -3245,10 +3245,14 @@ static int fastrpc_alloc_rootheap_buf(struct fastrpc_channel_ctx *cctx,
 	struct fastrpc_buf *buf = NULL;
 	struct fastrpc_pool_ctx *sess = NULL;
 	struct fastrpc_smmu *smmucb = NULL;
-	const unsigned int ROOTHEAP_BUF_SIZE = (1280 * 1024),
-			NUM_ROOTHEAP_BUFS = 3;
 	int err = 0;
 	unsigned long flags = 0;
+	const unsigned int ROOTHEAP_BUF_SIZE =
+		(cctx->rootheap_buf_size != 0) ? cctx->rootheap_buf_size :
+		FASTRPC_DEFAULT_ROOTHEAP_BUF_SIZE;
+	const unsigned int NUM_ROOTHEAP_BUFS =
+		(cctx->rootheap_buf_count != 0) ? cctx->rootheap_buf_count :
+		FASTRPC_DEFAULT_ROOTHEAP_BUF_COUNT;
 
 	/* Allocate buffer only if DSP supports growing of rootheap */
 	if (!cctx->dsp_attributes[ROOTPD_RPC_HEAP_SUPPORT] ||

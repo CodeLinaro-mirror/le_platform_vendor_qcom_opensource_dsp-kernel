@@ -685,3 +685,18 @@ void ssr_timer_callback(struct timer_list *timer)
 {
 	return;
 }
+
+/**
+ * fastrpc_is_device_crashing - Check if the device is about to crash
+ *
+ * This function does not execute any operations for secure process
+ * and always returns false.
+ *
+ * @cctx: Pointer to the fastrpc_channel_ctx structure.
+ *
+ * @return: false.
+ */
+bool fastrpc_is_device_crashing(struct fastrpc_channel_ctx *cctx)
+{
+	return false;
+}

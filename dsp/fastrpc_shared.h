@@ -903,6 +903,8 @@ struct fastrpc_channel_ctx {
 	unsigned int rootheap_buf_size;
 	/* Root heap buffer count */
 	unsigned int rootheap_buf_count;
+	/* Completion object for the threads to wait for device to crash */
+	struct completion rpmsg_remove_start;
 };
 
 struct fastrpc_ssr_handler {
@@ -1398,5 +1400,18 @@ int fastrpc_file_get(struct fastrpc_user *fl);
  * @return: None
  */
 void fastrpc_file_put(struct fastrpc_user *fl, bool worker);
+
+/*
+ * fastrpc_is_device_crashing - Determine if the device is about to crash
+ *
+ * This function obtains the remoteproc handle, checks its status, and
+ * determines whether the device is in a crashing state.
+ *
+ * @cctx: Pointer to the fastrpc_channel_ctx structure.
+ *
+ * @return: True if the remoteproc state indicates a crash with recovery
+ *			disabled, otherwise false.
+ */
+bool fastrpc_is_device_crashing(struct fastrpc_channel_ctx *cctx);
 
 #endif /* __FASTRPC_SHARED_H__ */

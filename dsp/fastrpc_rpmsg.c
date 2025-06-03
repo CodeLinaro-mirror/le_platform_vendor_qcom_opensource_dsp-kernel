@@ -441,6 +441,7 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	idr_init(&data->ctx_idr);
 	ida_init(&data->tgid_frpc_ida);
 	init_completion(&data->ssr_complete);
+	init_completion(&data->rpmsg_remove_start);
 	init_waitqueue_head(&data->ssr_wait_queue);
 	data->domain_id = domain->id;
 	data->max_sess_per_proc = FASTRPC_MAX_SESSIONS_PER_PROCESS;
@@ -539,6 +540,7 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 		list_add_tail(&user->active_user_ssr, &active_users_list);
 	}
 	spin_unlock_irqrestore(&cctx->lock, flags);
+	complete_all(&cctx->rpmsg_remove_start);
 	frpc_coredump(cctx, &active_users_list);
 	spin_lock_irqsave(&cctx->lock, flags);
 	list_for_each_entry_safe(user, n, &cctx->users, user) {
@@ -676,4 +678,19 @@ void __fastrpc_dma_buf_free(struct fastrpc_buf *buf)
 
 	dma_free_coherent(buf->dev, buf->size, buf->virt,
 		IOVA_TO_PHYSADDR(buf->phys, sid_pos));
+}
+
+bool fastrpc_is_device_crashing(struct fastrpc_channel_ctx *cctx)
+{
+	struct rproc *rphandle = NULL;
+	bool crash = false;
+
+	if (cctx->rpdev) {
+		rphandle = rproc_get_by_child(&cctx->rpdev->dev);
+		/* Mark device as crashing if SSR is disabled and rproc has crashed */
+		if (rphandle && rphandle->recovery_disabled &&
+			rphandle->state == RPROC_CRASHED)
+			crash = true;
+	}
+	return crash;
 }

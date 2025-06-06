@@ -3356,7 +3356,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	struct fastrpc_init_create init;
 	struct fastrpc_invoke_args args[FASTRPC_CREATE_PROCESS_NARGS] = {0};
 	struct fastrpc_enhanced_invoke ioctl;
-	struct fastrpc_phy_page pages[NUM_PAGES_WITH_PROC_INIT_SHAREDBUF] = {0};
+	struct fastrpc_phy_page pages[NUM_PAGES_WITH_MAP_DEBUG_BUF] = {0};
 	struct fastrpc_map *configmap = NULL;
 	struct fastrpc_buf *imem = NULL;
 	struct fastrpc_pool_ctx *sctx = NULL;
@@ -3491,6 +3491,27 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	if (err)
 		goto err_alloc;
 
+	/*
+	 * If dbglogbuf is supported on DSP, allocate 1MB buffer and send it to DSP
+	 * Process spawn should not fail if unable to alloc debug log buffer
+	 */
+	if (fl->cctx->dsp_attributes[DBGLOGBUF_SUPPORT]) {
+		err = fastrpc_smmu_buf_alloc(fl, DBGLOGBUF_SIZE,
+				MAP_DEBUG_BUF, &fl->dbglogbuf);
+		if (err) {
+			if (fl->dbglogbuf) {
+				fastrpc_buf_free(fl->dbglogbuf, false);
+				fl->dbglogbuf = NULL;
+			}
+			dev_err(fl->cctx->dev, "Error 0x%x: %s: Failed to allocate dbglogbuf buffer size %d\n",
+				err, __func__, DBGLOGBUF_SIZE);
+		} else {
+			pages[NUM_PAGES_WITH_MAP_DEBUG_BUF-1].addr = fl->dbglogbuf->phys;
+			pages[NUM_PAGES_WITH_MAP_DEBUG_BUF-1].size = fl->dbglogbuf->size;
+			inbuf.pageslen = NUM_PAGES_WITH_MAP_DEBUG_BUF;
+		}
+	}
+
 	fl->init_mem = imem;
 	args[0].ptr = (u64)(uintptr_t)&inbuf;
 	args[0].length = sizeof(inbuf);
@@ -3560,6 +3581,10 @@ err_alloc:
 		mutex_lock(&fl->map_mutex);
 		fastrpc_map_put(configmap);
 		mutex_unlock(&fl->map_mutex);
+	}
+	if (fl->dbglogbuf) {
+		fastrpc_buf_free(fl->dbglogbuf, false);
+		fl->dbglogbuf = NULL;
 	}
 err_out:
 	kfree(file);
@@ -3644,6 +3669,11 @@ void fastrpc_free_user(struct fastrpc_user *fl)
 	if (fl->pers_hdr_buf) {
 		fastrpc_buf_free(fl->pers_hdr_buf, false);
 		fl->pers_hdr_buf = NULL;
+	}
+
+	if (fl->dbglogbuf) {
+		fastrpc_buf_free(fl->dbglogbuf, false);
+		fl->dbglogbuf = NULL;
 	}
 
 	if (fl->hdr_bufs) {

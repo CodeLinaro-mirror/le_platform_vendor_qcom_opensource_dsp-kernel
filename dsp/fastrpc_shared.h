@@ -22,6 +22,7 @@
 #include <linux/hashtable.h>
 #include <linux/iosys-map.h>
 #include "../include/uapi/misc/fastrpc.h"
+#include "fastrpc_timeline.h"
 
 #if (KERNEL_VERSION(6, 3, 0) <= LINUX_VERSION_CODE)
 #include <linux/cpu.h>
@@ -260,6 +261,8 @@
  *     Page 5 : map debug log buf
  *     Page 6 : DSP RTOS memory donation
  *     Page 7 : preload buf
+ *     Page 8 : performance timeline buffer for userpsace
+ *     Page 9 : performance timeline buffer for rootpd
  */
 #define NUM_PAGES_WITH_SHARED_BUF 2
 #define NUM_PAGES_WITH_ROOTHEAP_BUF 3
@@ -273,6 +276,8 @@
  * Page 1 : Preload buf
  */
 #define ATTACH2_NUM_PAGES_WITH_PRELOAD_BUF 1
+#define NUM_PAGES_WITH_PERF_TIMLINE_DSP_U_SHAREDBUF 8
+#define NUM_PAGES_WITH_PERF_TIMLINE_DSP_K_SHAREDBUF 9
 
 #define miscdev_to_fdevice(d) container_of(d, struct fastrpc_device_node, miscdev)
 
@@ -1603,7 +1608,10 @@ struct fastrpc_user {
 	bool dsp_recovery;
 	/* dma heap pool for TVM's dma memory allocations */
 	struct fastrpc_tvm_dma_heap *tvm_dma_heap;
-
+	/* Timeline object holding kernel/dsp buffers and timeline info */
+	struct fastrpc_timeline *fastrpc_timeline_obj;
+	/* Used to init the version and num of events info of timeline */
+	struct fastrpc_timeline_arguments *timeline_init_args;
 	/* Node for adding this user-object to active-users list during ssr */
 	struct list_head active_user_ssr;
 	struct kref refcount;
@@ -1743,6 +1751,28 @@ int fastrpc_sysfs_register_kset(void);
 void fastrpc_sysfs_deregister_kset(void);
 
 /*
+ * fastrpc_buf_free - frees up a fastrpc_buf
+ * @param buf    pointer to a fastrpc_buf
+ * @param cache  buf to be cached or not
+ *
+ * @return: None
+ *
+ */
+void fastrpc_buf_free(struct fastrpc_buf *buf, bool cache);
+
+/**
+ * fastrpc_smmu_buf_alloc - Allocates memory on IOMMU CB
+ * @param fl        Fastrpc user file pointer
+ * @param size      Allocation buffer size
+ * @param buf_type  Allocation buffer type
+ * @param obuf      Output argument pointer to the fastrpc_buf
+ *
+ * Return: Returns 0 on success, error code on failure
+ */
+int fastrpc_smmu_buf_alloc(struct fastrpc_user *fl, u64 size,
+	u32 buf_type, struct fastrpc_buf **obuf);
+
+/**
  * Reserve one of the TVM dma heap.
  * Reserved is returned on tvm_dma_heap.
  *

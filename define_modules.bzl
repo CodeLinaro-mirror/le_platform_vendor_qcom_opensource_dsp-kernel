@@ -53,7 +53,10 @@ def define_modules(target, variant, build_loader):
             "dsp/fastrpc_rpmsg.c",
             "dsp/fastrpc_shared.h",
             "dsp/fastrpc_trace.h",
-            "dsp/fastrpc_sysfs.c"
+            "dsp/fastrpc_sysfs.c",
+            "dsp/fastrpc_timeline.c",
+            "dsp/fastrpc_timeline_shared.h",
+            "dsp/fastrpc_timeline.h"
         ],
         local_defines = ["DSP_TRACE_INCLUDE_PATH={}".format(trace_include_path)],
         out = "frpc-adsprpc.ko",
@@ -122,7 +125,10 @@ def define_vm_modules(target, variant):
             "dsp/fastrpc_socket.c",
             "dsp/fastrpc_shared.h",
             "dsp/fastrpc_trace.h",
-            "dsp/fastrpc_sysfs.c"
+            "dsp/fastrpc_sysfs.c",
+            "dsp/fastrpc_timeline.c",
+            "dsp/fastrpc_timeline_shared.h",
+            "dsp/fastrpc_timeline.h"
         ],
         local_defines = [
             "DSP_TRACE_INCLUDE_PATH={}".format(trace_include_path),

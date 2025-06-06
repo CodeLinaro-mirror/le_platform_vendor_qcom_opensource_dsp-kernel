@@ -26,5 +26,6 @@ endif
 frpc-trusted-adsprpc-y := dsp/fastrpc.o	\
 					 dsp/fastrpc_socket.o \
 					 dsp/fastrpc_sysfs.o \
+					 dsp/fastrpc_timeline.o \
 
 obj-m := frpc-trusted-adsprpc.o

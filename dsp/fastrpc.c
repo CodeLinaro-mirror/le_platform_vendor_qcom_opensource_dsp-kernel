@@ -1672,8 +1672,18 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 		list[i].num = ctx->args[i].length ? 1 : 0;
 		list[i].pgidx = i;
 		if (ctx->maps[i]) {
-			pages[i].addr = ctx->maps[i]->phys;
-			pages[i].size = ctx->maps[i]->size;
+			/* It is possible that map is created using mflag
+			 * is FASTRPC_MAP_LEGACY_DMA_HANDLE and take_ref
+			 * is false. Check if map is still exist or is
+			 * being freed as take_ref is false
+			 */
+			mutex_lock(&ctx->fl->map_mutex);
+			if (!fastrpc_map_lookup(ctx->fl, ctx->args[i].fd,
+				 0, 0, NULL, 0 , &ctx->maps[i], false)) {
+				pages[i].addr = ctx->maps[i]->phys;
+				pages[i].size = ctx->maps[i]->size;
+			}
+			mutex_unlock(&ctx->fl->map_mutex);
 		}
 		rpra[i].dma.fd = ctx->args[i].fd;
 		rpra[i].dma.len = ctx->args[i].length;
@@ -5930,7 +5940,11 @@ static void fastrpc_genpool_free(struct fastrpc_smmu *smmucb)
 	}
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0)
+static void fastrpc_cb_remove(struct platform_device *pdev)
+#else
 static int fastrpc_cb_remove(struct platform_device *pdev)
+#endif
 {
 	struct fastrpc_channel_ctx *cctx = dev_get_drvdata(pdev->dev.parent);
 	struct fastrpc_smmu *smmucb = dev_get_drvdata(&pdev->dev),
@@ -5961,7 +5975,9 @@ static int fastrpc_cb_remove(struct platform_device *pdev)
 	}
 	spin_unlock_irqrestore(&cctx->lock, flags);
 	dev_info(&pdev->dev, "Successfully removed %s", pdev->dev.kobj.name);
-	return 0;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 10, 0)
+        return 0;
+#endif
 }
 
 static const struct of_device_id fastrpc_match_table[] = {

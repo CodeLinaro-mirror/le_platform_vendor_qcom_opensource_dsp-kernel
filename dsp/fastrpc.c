@@ -1244,6 +1244,15 @@ static struct fastrpc_pool_ctx *fastrpc_session_alloc(
 		 *    session pd_type, else pd_type check is ignored
 		 */
 		isess = &cctx->session[i];
+
+		/*
+		 * If the extended-map context bank supports SID sharing, then
+		 * allow client-apps requesting extended mapping to share that
+		 * context bank.
+		 */
+		if (isess->pd_type == EXT_MAP_PD_TYPE && isess->sharedcb)
+			sharedcb = true;
+
 		if ((isess->usecount == 0 || isess->smmucount > 1) &&
 			isess->smmucb[DEFAULT_SMMU_IDX].valid &&
 			isess->secure == secure &&

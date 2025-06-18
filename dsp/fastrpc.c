@@ -163,8 +163,12 @@ static void __fastrpc_free_map(struct fastrpc_map *map)
 				goto free_map;
 			}
 		}
-		/* FASTRPC_MAP_FD_NOMAP is not mapped on SMMU CB device */
-		if (map->flags == FASTRPC_MAP_FD_NOMAP) {
+		/*
+		 * FASTRPC_MAP_FD_NOMAP and FASTRPC_ATTR_NOMAP
+		 * is not mapped on SMMU CB device
+		 */
+		if (map->attr & FASTRPC_ATTR_NOMAP ||
+			map->flags == FASTRPC_MAP_FD_NOMAP) {
 			__fastrpc_dma_map_free(map);
 		} else {
 			smmucb = map->smmucb;
@@ -1681,8 +1685,18 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 		list[i].num = ctx->args[i].length ? 1 : 0;
 		list[i].pgidx = i;
 		if (ctx->maps[i]) {
-			pages[i].addr = ctx->maps[i]->phys;
-			pages[i].size = ctx->maps[i]->size;
+			/* It is possible that map is created using mflag
+			 * is FASTRPC_MAP_LEGACY_DMA_HANDLE and take_ref
+			 * is false. Check if map is still exist or is
+			 * being freed as take_ref is false
+			 */
+			mutex_lock(&ctx->fl->map_mutex);
+			if (!fastrpc_map_lookup(ctx->fl, ctx->args[i].fd,
+				 0, 0, NULL, 0 , &ctx->maps[i], false)) {
+				pages[i].addr = ctx->maps[i]->phys;
+				pages[i].size = ctx->maps[i]->size;
+			}
+			mutex_unlock(&ctx->fl->map_mutex);
 		}
 		rpra[i].dma.fd = ctx->args[i].fd;
 		rpra[i].dma.len = ctx->args[i].length;

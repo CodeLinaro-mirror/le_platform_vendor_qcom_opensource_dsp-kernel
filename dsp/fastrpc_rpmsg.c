@@ -535,14 +535,18 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 		/*
 		 * Add active user-objects to a dedicated active_users_list to
 		 * avoid access to the objects which are in the device release
-		 * process. Utilize active_users_list for core dumps and
-		 * fastrpc_free_user.
+		 * process. Utilize active_users_list for core dumps.
 		 */
 		list_add_tail(&user->active_user_ssr, &active_users_list);
 	}
 	spin_unlock_irqrestore(&cctx->lock, flags);
 	complete_all(&cctx->rpmsg_remove_start);
 	frpc_coredump(cctx, &active_users_list);
+	list_for_each_entry_safe(user, n, &active_users_list,
+		active_user_ssr) {
+		list_del(&user->active_user_ssr);
+		fastrpc_file_put(user, true);
+	}
 	spin_lock_irqsave(&cctx->lock, flags);
 	list_for_each_entry_safe(user, n, &cctx->users, user) {
 		fastrpc_queue_pd_status(user, cctx->domain_id, FASTRPC_DSP_SSR,
@@ -574,12 +578,9 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	 * be removed. So free all SMMU mappings of every process using this
 	 * channel to avoid any UAF later.
 	 */
-	list_for_each_entry_safe(user, n, &active_users_list,
-		active_user_ssr) {
-		fastrpc_free_user(user);
-		list_del(&user->active_user_ssr);
-		fastrpc_file_put(user, true);
-	}
+	list_for_each_entry(user, &cctx->users, user) {
+ 		fastrpc_free_user(user);
+ 	}
 
 	mutex_lock(&cctx->wake_mutex);
 	if (cctx->wake_source) {

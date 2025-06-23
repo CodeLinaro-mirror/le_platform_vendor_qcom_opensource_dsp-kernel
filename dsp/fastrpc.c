@@ -1210,6 +1210,13 @@ static struct fastrpc_pool_ctx *fastrpc_session_alloc(
 		return session;
 
 	/*
+	 * No dedicated context bank exists for root PD on trusted VMs
+	 * Use the unsigned pool for root PD sessions.
+	 */
+	if (g_frpc.is_trusted_vm && pd_type == ROOT_PD)
+		pd_type = USER_UNSIGNEDPD_POOL;
+
+	/*
 	 * If PD type is configured for context banks in device tree,
 	 * use CPZ_USERPD, to allocate secure context bank type.
 	 */

@@ -314,8 +314,12 @@ static void __fastrpc_free_map(struct fastrpc_map *map)
 				goto free_map;
 			}
 		}
-		/* FASTRPC_MAP_FD_NOMAP is not mapped on SMMU CB device */
-		if (map->flags == FASTRPC_MAP_FD_NOMAP) {
+		/*
+		 * FASTRPC_MAP_FD_NOMAP and FASTRPC_ATTR_NOMAP
+		 * is not mapped on SMMU CB device
+		 */
+		if (map->attr & FASTRPC_ATTR_NOMAP ||
+			map->flags == FASTRPC_MAP_FD_NOMAP) {
 			__fastrpc_dma_map_free(map);
 		} else {
 			smmucb = map->smmucb;

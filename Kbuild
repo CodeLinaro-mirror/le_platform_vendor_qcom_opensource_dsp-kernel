@@ -49,6 +49,12 @@ KBUILD_CPPFLAGS += -DCONFIG_DSP_SERAPH=1
 ccflags-y += -DCONFIG_DSP_SERAPH=1
 endif
 
+ifeq ($(CONFIG_ARCH_ART), y)
+$(info within KBUILD file CONFIG_ARCH_ART = $(CONFIG_ARCH_ART))
+KBUILD_CPPFLAGS += -DCONFIG_DSP_ART=1
+ccflags-y += -DCONFIG_DSP_ART=1
+endif
+
 LINUXINCLUDE += -I$(DSP_ROOT)/include/linux
 LINUXINCLUDE += -I$(DSP_ROOT)/include/uapi
 

@@ -1135,6 +1135,8 @@ struct fastrpc_user {
 	int tgid_frpc;
 	/* Actual hlos pid of process offloading to dsp */
 	int tgid_app;
+	/* Process name of process offloading to dsp */
+	char name[TASK_COMM_LEN];
 	/* PD type of remote subsystem process */
 	u32 pd_type;
 	/* total cached buffers */
@@ -1244,7 +1246,8 @@ struct fastrpc_dspsignal {
 int fastrpc_transport_send(struct fastrpc_channel_ctx *cctx, void *rpc_msg, uint32_t rpc_msg_size);
 int fastrpc_transport_init(void);
 void fastrpc_transport_deinit(void);
-int fastrpc_handle_rpc_response(struct fastrpc_channel_ctx *cctx, void *data, int len);
+int fastrpc_handle_rpc_response(struct fastrpc_channel_ctx *cctx, void *data,
+				int len, bool is_glink_wakeup);
 void ssr_timer_callback(struct timer_list *timer);
 
 /*

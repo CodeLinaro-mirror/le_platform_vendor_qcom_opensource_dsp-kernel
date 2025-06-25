@@ -17,6 +17,7 @@
 #include <linux/soc/qcom/pdr.h>
 #include <linux/delay.h>
 #include <linux/remoteproc.h>
+#include <linux/rpmsg/qcom_glink.h>
 
 void fastrpc_channel_ctx_put(struct fastrpc_channel_ctx *cctx);
 void fastrpc_channel_ctx_get(struct fastrpc_channel_ctx *cctx);
@@ -605,8 +606,13 @@ static int fastrpc_rpmsg_callback(struct rpmsg_device *rpdev, void *data,
 				  int len, void *priv, u32 addr)
 {
 	struct fastrpc_channel_ctx *cctx = dev_get_drvdata(&rpdev->dev);
+	bool is_glink_wakeup = false;
 
-	return fastrpc_handle_rpc_response(cctx, data, len);
+#if IS_ENABLED(CONFIG_RPMSG_QCOM_GLINK_SMEM)
+	is_glink_wakeup = qcom_glink_is_wakeup(true);
+#endif
+
+	return fastrpc_handle_rpc_response(cctx, data, len, is_glink_wakeup);
 }
 
 static const struct of_device_id fastrpc_rpmsg_of_match[] = {

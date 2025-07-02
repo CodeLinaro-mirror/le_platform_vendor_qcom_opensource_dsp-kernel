@@ -2045,7 +2045,7 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx, struct list_head *active_us
 void fastrpc_lowest_capacity_corecount(struct device *dev, struct fastrpc_channel_ctx *cctx);
 
 int fastrpc_init_privileged_gids(struct device *dev, char *prop_name, struct gid_list *gidlist);
-int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx, bool is_pdr);
+int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx);
 int fastrpc_setup_service_locator(struct fastrpc_channel_ctx *cctx, char *client_name,
 				char *service_name, char *service_path, int spd_session);
 int fastrpc_npu_post_workinfo(struct fastrpc_channel_ctx *cctx,

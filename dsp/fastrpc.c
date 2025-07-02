@@ -3035,13 +3035,14 @@ static int fastrpc_remote_heap_unassign(struct fastrpc_channel_ctx *cctx, struct
 		if (err) {
 			dev_err(cctx->dev, "%s: Failed to assign memory with phys 0x%llx size 0x%llx err %d\n",
 				__func__, buf->phys, buf->size, err);
+			BUG_ON(1);
 			return err;
 		}
 	}
 	return 0;
 }
 
-int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx, bool is_pdr)
+int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx)
 {
 	struct fastrpc_buf *buf, *b, *match;
 	unsigned long flags;
@@ -3059,14 +3060,12 @@ int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx, bool is_pdr)
 		if (!match)
 			return 0;
 
-		if (is_pdr) {
-			err = fastrpc_remote_heap_unassign(cctx, match);
-			if (err) {
-				spin_lock_irqsave(&cctx->lock, flags);
-				list_add_tail(&match->node, &cctx->gmaps);
-				spin_unlock_irqrestore(&cctx->lock, flags);
-				return err;
-			}
+		err = fastrpc_remote_heap_unassign(cctx, match);
+		if (err) {
+			spin_lock_irqsave(&cctx->lock, flags);
+			list_add_tail(&match->node, &cctx->gmaps);
+			spin_unlock_irqrestore(&cctx->lock, flags);
+			return err;
 		}
 
 		__fastrpc_buf_free(match);
@@ -3582,7 +3581,7 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 		 * Remove any previous remote heap mappings in case process is trying
 		 * to reconnect after a PD restart on remote subsystem.
 		 */
-		err = fastrpc_mmap_remove_ssr(fl->cctx, true);
+		err = fastrpc_mmap_remove_ssr(fl->cctx);
 		if (err) {
 			pr_warn("%s: %s: failed to unmap remote heap (err %d)\n",
 				current->comm, __func__, err);
@@ -9509,9 +9508,18 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 	struct fastrpc_dump_info *dinfo;
 	struct fastrpc_buf *buf, *b;
 	struct fastrpc_map *map;
+	unsigned long flags;
+	struct list_head lgmaps_list;
 
-	list_for_each_entry_safe(buf, b, &cctx->gmaps, node)
+	INIT_LIST_HEAD(&lgmaps_list);
+
+	spin_lock_irqsave(&cctx->lock, flags);
+	list_for_each_entry_safe(buf, b, &cctx->gmaps, node) {
 		total_size += buf->size;
+		list_del(&buf->node);
+		list_add_tail(&buf->node, &lgmaps_list);
+	}
+	spin_unlock_irqrestore(&cctx->lock, flags);
 
 	list_for_each_entry_safe(user, n, active_users_list, active_user_ssr) {
 		total_size += DBG_FS_SIZE;
@@ -9548,12 +9556,11 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 	pos += NUM_DUMPED * sizeof(struct fastrpc_dump_info);
 	offset += NUM_DUMPED * sizeof(struct fastrpc_dump_info);
 
-	list_for_each_entry_safe(buf, b, &cctx->gmaps, node) {
+	list_for_each_entry_safe(buf, b, &lgmaps_list, node) {
 		err = fastrpc_remote_heap_unassign(cctx, buf);
-		if (err) {
-			list_del(&buf->node);
+		list_del(&buf->node);
+		if (err)
 			continue;
-		}
 		if ((dump + total_size) - pos >= buf->size) {
 			memcpy(pos, buf->virt, buf->size);
 			populate_dump_metadata(&dinfo[iter], offset, buf->size,
@@ -9566,6 +9573,7 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 			err = -EFAULT;
 			goto bail;
 		}
+		__fastrpc_buf_free(buf);
 	}
 	scm_done = true;
 
@@ -9680,11 +9688,12 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 	dev_coredumpv(dev, dump, total_size, GFP_KERNEL);
 bail:
 	if (!scm_done) {
-		list_for_each_entry_safe(buf, b, &cctx->gmaps, node) {
+		list_for_each_entry_safe(buf, b, &lgmaps_list, node) {
 			err = fastrpc_remote_heap_unassign(cctx, buf);
-			if (err) {
-				list_del(&buf->node);
-			}
+			list_del(&buf->node);
+			if (err)
+				continue;
+			__fastrpc_buf_free(buf);
 		}
 	}
 	if (err)

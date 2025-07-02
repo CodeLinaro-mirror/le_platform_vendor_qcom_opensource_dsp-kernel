@@ -590,10 +590,8 @@ int fastrpc_transport_init(void)
 	struct frpc_transport_session_control *session_control = NULL;
 	struct workqueue_struct *wq = NULL;
 
-	if (!scctx) {
-		err = -ENOMEM;
-		goto bail;
-	}
+	if (!scctx)
+		return -ENOMEM;
 
 	session_control = &scctx->session_control;
 	session_control->remote_server_online = false;

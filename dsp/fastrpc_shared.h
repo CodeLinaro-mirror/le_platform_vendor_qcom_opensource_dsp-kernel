@@ -146,8 +146,6 @@
 #define FASTRPC_MAX_CACHE_BUF_SIZE (8*1024*1024)
 /* Max no. of persistent headers pre-allocated per user process */
 #define FASTRPC_MAX_PERSISTENT_HEADERS    (8)
-/* Process status notifications from DSP will be sent with this unique context */
-#define FASTRPC_NOTIF_CTX_RESERVED 0xABCDABCD
 #define FASTRPC_UNIQUE_ID_CONST 1000
 
 /* Add memory to static PD pool, protection thru XPU */
@@ -162,9 +160,22 @@
 #define ADSP_MMAP_ADD_PAGES_LLC 0x3000
 /* Map persistent header buffer on DSP */
 #define ADSP_MMAP_PERSIST_HDR  0x4000
+/* Map buffer in case of root mem request for DSP pool */
+#define DSP_MMAP_ADD_ROOT_POOL_MEM  0x7000
+/* Map buffer in case of root mem request for DSP heap */
+#define DSP_MMAP_ADD_ROOT_HEAP_MEM  0x8000
+
 /* Size of dbglogbuf to log map/unmap calls on DSP*/
 #define DBGLOGBUF_SIZE (1*1024*1024)
 
+/* Maximum size of data requested by root PD of DSP in u32 chunks */
+#define ROOT_REQUEST_MAX_SIZE 4
+
+/*
+ * Maximum size of circular buffer to handle
+ * incoming requests from root PD
+ */
+#define ROOT_REQUEST_BUFFER_SIZE 10
 
 /* Fastrpc attribute for no mapping of fd  */
 #define FASTRPC_ATTR_NOMAP (16)
@@ -412,6 +423,16 @@
 #define GENERATE_LOGICAL_DOMAIN_ID(type, counter) \
 	((type * 1000) + counter)
 
+enum fastrpc_reserved_ctx {
+	/*
+         * Process status notifications from DSP
+         * will be sent with this unique context
+         */
+	FASTRPC_NOTIF_CTX_RESERVED	= 0xABCDABCD,
+	/* Root request from DSP will be sent with this unique context */
+	FASTRPC_ROOT_CTX_RESERVED	= 0xAABBCCDD,
+};
+
 /*
  * Process types on remote subsystem
  * Always add new PD types at the end, before MAX_PD_TYPE
@@ -450,6 +471,7 @@ enum fastrpc_process_method_ids {
 	FASTRPC_RMID_INIT_MEM_UNMAP     = 11,
 	FASTRPC_RMID_INIT_MDCTX_MANAGE  = 12,
 	FASTRPC_RMID_INIT_PROCESS_DUMP  = 13,
+	FASTRPC_RMID_KCOMM_REMOTE_CALL  = 14,
 	FASTRPC_RMID_INIT_MAX,
 };
 
@@ -479,6 +501,8 @@ enum fastrpc_remote_domains_id {
 	REMOTEHEAP_BUF,
 	/* Buffer to grow rpc-heap on root-pd */
 	ROOTHEAP_BUF,
+	/* Buffer used by root PD on DSP */
+	ROOT_MEM_BUF,
 	/* Buffer to log DSP map/unmap debug info*/
 	MAP_DEBUG_BUF,
 };
@@ -488,15 +512,27 @@ enum fastrpc_msg_type {
 	USER_MSG = 0,
 	KERNEL_MSG_WITH_ZERO_PID,
 	KERNEL_MSG_WITH_NONZERO_PID,
+	KERNEL_MSG_WITH_ZERO_PID_ZERO_TID,
 };
 
 enum fastrpc_response_flags {
+	/* normal job completion response */
 	NORMAL_RESPONSE = 0,
+	/* early response, cpu will poll on memory for actual completion */
 	EARLY_RESPONSE = 1,
+	/* user hint before completion with estimated completion time */
 	USER_EARLY_SIGNAL = 2,
+	/*
+	 * Completion signal from dsp no later than a specific timeout after
+	 * early response.
+	 */
 	COMPLETE_SIGNAL = 3,
+	/* status notification response of DSP User PD */
 	STATUS_RESPONSE = 4,
+	/* process updates poll memory instead of glink response */
 	POLL_MODE = 5,
+	/* request signal sent by Root PD from DSP subsystem */
+	ROOT_REQ_SIGNAL = 6,
 };
 
 /* To maintain the dsp map current state */
@@ -573,6 +609,13 @@ struct frpc_transport_session_control {
 struct fastrpc_phy_page {
 	u64 addr;		/* physical address */
 	u64 size;		/* size of contiguous region */
+};
+
+struct fastrpc_phy_page2 {
+	u64 addr;		/* physical address */
+	u64 size;		/* size of contiguous region */
+	u64 flags;		/* dsp map flags */
+	u64 reserved;		/* reserved for future use case */
 };
 
 struct fastrpc_invoke_buf {
@@ -658,6 +701,32 @@ struct fastrpc_invoke_rspv2 {
 	u32 version;		/* version number */
 };
 
+/* Message flag sent to remote subsystem */
+enum root_req_type {
+	ROOT_MEM_REQ_POOL,	/* memory request made for DSP root pools */
+	ROOT_MEM_REQ_HEAP,	/* memory request made for DSP root heap */
+	ROOT_ERROR_MSG,		/* error message */
+};
+
+/* root message request received from remote subsystem */
+struct root_request_msg {
+	u64 ctx;				/* response context */
+	enum fastrpc_response_flags req_type;	/* Request type */
+	enum root_req_type msg_type;		/* Message type */
+	u32 dsp_tid;				/* DSP thread tid */
+	u32 data[ROOT_REQUEST_MAX_SIZE];	/* root requested data */
+	u32 data_len;				/* data len */
+};
+
+/* root message response sent to remote subsystem */
+struct fastrpc_root_msg {
+	u32 dsp_tid;			/* DSP thread tid */
+	enum root_req_type type;	/* request type */
+	u32 *data;			/* request data */
+	u32 data_len;			/* length of data */
+	u64 error;			/* error while handling response */
+};
+
 struct fastrpc_tx_msg {
 	struct fastrpc_msg msg;	/* Msg sent to remote subsystem */
 	int rpmsg_send_err;	/* rpmsg error */
@@ -691,6 +760,7 @@ union rsp {
 	struct fastrpc_invoke_rsp rsp;
 	struct fastrpc_invoke_rspv2 rsp2;
 	struct dsp_notif_rsp rsp3;
+	struct root_request_msg rsp4;
 };
 
 struct fastrpc_buf_overlap {
@@ -833,9 +903,25 @@ struct heap_bufs {
 
 struct fastrpc_domain;
 
+struct kcomm_worker {
+	/*
+	 * Domain information to determine
+	 * which DSP initiated the root request
+	 */
+	struct fastrpc_domain *domain;
+	/* work struct to queue reqeust to worker thread */
+	struct work_struct work;
+};
+
 struct fastrpc_kcomm_channel {
 	/* User object for daemon-independent communication to DSP */
 	struct fastrpc_user *obj;
+	/* Circular buffer for keeping track of root req received from DSP */
+	struct fastrpc_root_msg root_msg[ROOT_REQUEST_BUFFER_SIZE];
+	/* Index to track queued messages in root_msg buffer */
+	u32 queued_msg_index;
+	/* Index to track messages getting served or already served in root_msg buffer */
+	u32 served_msg_index;
 };
 
 struct fastrpc_channel_ctx {

@@ -7813,7 +7813,7 @@ void fastrpc_register_wakeup_source(struct device *dev,
 {
 	struct wakeup_source *wake_source = NULL;
 
-	wake_source = wakeup_source_register(dev, client_name);
+	wake_source = wakeup_source_register(NULL, client_name);
 	if (IS_ERR_OR_NULL(wake_source)) {
 		dev_err(dev, "wakeup_source_register failed for dev %s, client %s with err %ld\n",
 		dev_name(dev), client_name, PTR_ERR(wake_source));

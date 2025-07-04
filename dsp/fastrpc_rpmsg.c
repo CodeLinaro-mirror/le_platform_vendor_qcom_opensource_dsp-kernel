@@ -525,19 +525,26 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	cctx->staticpd_status = false;
 
 	list_for_each_entry_safe(user, n, &cctx->users, user) {
-		err = fastrpc_file_get(user);
-		if (err) {
-			dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
-				__func__, user);
-			continue;
-		}
-
 		/*
-		 * Add active user-objects to a dedicated active_users_list to
-		 * avoid access to the objects which are in the device release
-		 * process. Utilize active_users_list for core dumps.
+		 * Ensure atomic_read(&user->state) == DSP_CREATE_COMPLETE before
+		 * taking a reference which make sure the process state remains stable
+		 * during teardown. All state change occurs under the same lock.
 		 */
-		list_add_tail(&user->active_user_ssr, &active_users_list);
+		if (atomic_read(&user->state) == DSP_CREATE_COMPLETE) {
+			err = fastrpc_file_get(user);
+			if (err) {
+				dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
+					__func__, user);
+				continue;
+			}
+
+			/*
+			 * Add active user-objects to a dedicated active_users_list to
+			 * avoid access to the objects which are in the device release
+			 * process. Utilize active_users_list for core dumps.
+			 */
+			list_add_tail(&user->active_user_ssr, &active_users_list);
+		}
 	}
 	spin_unlock_irqrestore(&cctx->lock, flags);
 	complete_all(&cctx->rpmsg_remove_start);

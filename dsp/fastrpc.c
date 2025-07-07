@@ -3836,6 +3836,19 @@ static int fastrpc_user_obj_free(struct fastrpc_user *user,
 			__func__, err, current->comm, fl->tgid_app, fl->tgid_frpc);
 		BUG_ON(1);
 	}
+
+	/*
+	 * Stop resource cleanup by waiting if error is -EIO,
+	 * channel context teardown is not occurring, and device is about to crash.
+	 */
+	if (err == -EIO && !atomic_read(&cctx->teardown)
+		&& fastrpc_is_device_crashing(cctx)) {
+		pr_info("%s process %s is waiting, err %d  (tgid %d, tgid_frpc %d)\n",
+			__func__, current->comm, err, fl->tgid_app, fl->tgid_frpc);
+		/* Wait for rpmsg removal to start or a device crash */
+		wait_for_completion(&cctx->rpmsg_remove_start);
+	}
+
 	atomic_set(&fl->state, DSP_EXIT_COMPLETE);
 
 	spin_lock_irqsave(&cctx->lock, flags);

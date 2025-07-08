@@ -3918,7 +3918,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 
 	sctx = fastrpc_session_alloc(fl, false, fl->pd_type);
 	if (!sctx) {
-		dev_err(fl->cctx->dev, "No session available\n");
+		dev_warn_ratelimited(fl->cctx->dev, "No session available\n");
 		err = -EBUSY;
 		goto err_out;
 	}

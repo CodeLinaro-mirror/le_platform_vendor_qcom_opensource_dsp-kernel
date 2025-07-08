@@ -6643,15 +6643,10 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int cmd,
 
 	if (process_init && !err) {
 		err = fastrpc_device_create(fl);
-		if (err)
-			atomic_set(&fl->state, DEFAULT_PROC_STATE);
-		else {
-			atomic_set(&fl->state, DSP_CREATE_COMPLETE);
-			if (IS_DYNAMIC_PD(fl->pd_type))
-				fastrpc_sysfs_notify_pids(cctx->domain);
+		if (!err && IS_DYNAMIC_PD(fl->pd_type)) {
+			fastrpc_sysfs_notify_pids(cctx->domain);
 		}
 	}
-
 	spin_lock_irqsave(&cctx->lock, flags);
 	fastrpc_channel_update_invoke_cnt(cctx, false);
 	spin_unlock_irqrestore(&cctx->lock, flags);
@@ -7057,6 +7052,7 @@ static int fastrpc_device_create(struct fastrpc_user *fl)
 	frpc_dev->fl = fl;
 	frpc_dev->handle = fl->tgid_frpc;
 	fl->device = frpc_dev;
+	atomic_set(&fl->state, DSP_CREATE_COMPLETE);
 	return err;
 }
 

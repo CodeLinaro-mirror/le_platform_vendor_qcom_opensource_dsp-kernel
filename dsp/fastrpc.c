@@ -424,7 +424,7 @@ static bool fastrpc_get_persistent_buf(struct fastrpc_user *fl,
 	 * Persistent header buffer can be used only if
 	 * metadata length is less than 1 page size.
 	 */
-	if (!fl->num_pers_hdrs || buf_type != METADATA_BUF || size > PAGE_SIZE) {
+	if (!fl->num_pers_hdrs || buf_type != METADATA_BUF || size > PAGE4K_SIZE) {
 		spin_unlock(&fl->lock);
 		return found;
 	}
@@ -1788,7 +1788,7 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 
 		if (ctx->maps[i]) {
 			struct vm_area_struct *vma = NULL;
-			u64 addr = (u64)ctx->args[i].ptr & PAGE_MASK, vm_start = 0,
+			u64 addr = (u64)ctx->args[i].ptr & PAGE4K_MASK, vm_start = 0,
 			vm_end = 0;
 
 			PERF(ctx->fl->profile, GET_COUNTER(perf_counter, PERF_MAP),
@@ -1826,10 +1826,10 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 				pages[i].addr += offset;
 			}
 
-			pg_start = addr >> PAGE_SHIFT;
-			pg_end = ((ctx->args[i].ptr + len - 1) & PAGE_MASK) >>
-				  PAGE_SHIFT;
-			pages[i].size = (pg_end - pg_start + 1) * PAGE_SIZE;
+			pg_start = addr >> PAGE4K_SHIFT;
+			pg_end = ((ctx->args[i].ptr + len - 1) & PAGE4K_MASK) >>
+				PAGE4K_SHIFT;
+			pages[i].size = (pg_end - pg_start + 1) * PAGE4K_SIZE;
 			PERF_END);
 		} else {
 			PERF(ctx->fl->profile, GET_COUNTER(perf_counter, PERF_COPY),
@@ -1851,11 +1851,11 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 			pages[i].addr = ctx->buf->phys -
 					ctx->olaps[oix].offset +
 					(pkt_size - rlen);
-			pages[i].addr = pages[i].addr &	PAGE_MASK;
+			pages[i].addr = pages[i].addr &	PAGE4K_MASK;
 
-			pg_start = (rpra[i].buf.pv & PAGE_MASK) >> PAGE_SHIFT;
-			pg_end = ((rpra[i].buf.pv + len - 1) & PAGE_MASK) >> PAGE_SHIFT;
-			pages[i].size = (pg_end - pg_start + 1) * PAGE_SIZE;
+			pg_start = (rpra[i].buf.pv & PAGE4K_MASK) >> PAGE4K_SHIFT;
+			pg_end = ((rpra[i].buf.pv + len - 1) & PAGE4K_MASK) >> PAGE4K_SHIFT;
+			pages[i].size = (pg_end - pg_start + 1) * PAGE4K_SIZE;
 			args = args + mlen;
 			rlen -= mlen;
 			PERF_END);
@@ -2094,7 +2094,7 @@ static int fastrpc_invoke_send(struct fastrpc_pool_ctx *sctx,
 	msg->handle = handle;
 	msg->sc = ctx->sc;
 	msg->addr = ctx->buf ? ctx->buf->phys : 0;
-	msg->size = roundup(ctx->msg_sz, PAGE_SIZE);
+	msg->size = roundup(ctx->msg_sz, PAGE4K_SIZE);
 	// fastrpc_context_get(ctx);
 
 	ret = fastrpc_transport_send(cctx, (void *)msg, sizeof(*msg));
@@ -2551,7 +2551,7 @@ static int fastrpc_create_persistent_headers(struct fastrpc_user *fl)
 	 * on concurrency info passed by user. Upper limit enforced.
 	 */
 	num_pers_hdrs = FASTRPC_MAX_PERSISTENT_HEADERS;
-	hdr_buf_alloc_len = num_pers_hdrs * PAGE_SIZE;
+	hdr_buf_alloc_len = num_pers_hdrs * PAGE4K_SIZE;
 
 	err = fastrpc_smmu_buf_alloc(fl, hdr_buf_alloc_len,
 			METADATA_BUF, &pers_hdr_buf);
@@ -2577,9 +2577,9 @@ static int fastrpc_create_persistent_headers(struct fastrpc_user *fl)
 	for (i = 0; i < num_pers_hdrs; i++) {
 		buf = &fl->hdr_bufs[i];
 		buf->fl = fl;
-		buf->virt = (void *)(virtb + (i * PAGE_SIZE));
-		buf->phys = pers_hdr_buf->phys + (i * PAGE_SIZE);
-		buf->size = PAGE_SIZE;
+		buf->virt = (void *)(virtb + (i * PAGE4K_SIZE));
+		buf->phys = pers_hdr_buf->phys + (i * PAGE4K_SIZE);
+		buf->size = PAGE4K_SIZE;
 		buf->type = pers_hdr_buf->type;
 		buf->in_use = false;
 	}

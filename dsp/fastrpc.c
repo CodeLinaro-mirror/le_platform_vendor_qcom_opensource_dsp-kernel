@@ -4046,7 +4046,7 @@ static int fastrpc_user_obj_create(struct file *filp,
 	fl->cctx = cctx;
 	fl->config.user_fd = -1;
 	fl->pd_type = DEFAULT_UNUSED;
-	fl->dsp_recovery = true;
+	fl->dsp_recovery = false;
 
 	if (filp) {
 		fl->tgid = fl->tgid_app = current->tgid;

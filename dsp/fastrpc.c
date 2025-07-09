@@ -1342,6 +1342,7 @@ static int get_buffer_attr(struct dma_buf *buf, bool *exclusive_access)
 	int vmids_list_len = 0;
 	*exclusive_access = false;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 	/*
 	 * If buf lacks the Qualcomm extension of mem-buf,
 	 * No support for accesing by vm related function.
@@ -1353,6 +1354,7 @@ static int get_buffer_attr(struct dma_buf *buf, bool *exclusive_access)
 		*exclusive_access = true;
 		return 0;
 	}
+#endif
 
 	err = mem_buf_dma_buf_get_vmperm(buf, &vmids_list, &perms, &vmids_list_len);
 	if (err)

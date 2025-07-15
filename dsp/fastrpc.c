@@ -1821,6 +1821,22 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 				PAGE4K_SHIFT;
 			pages[i].size = (pg_end - pg_start + 1) * PAGE4K_SIZE;
 			PERF_END);
+			/*
+			 * Check for page range overflow and validate page
+			 * range is not greater than map buffer range.
+			 * This prevents potential buffer overflow
+			 * and memory corruption that could be exploited.
+			 */
+			if (pages[i].addr > (ULLONG_MAX - pages[i].size) ||
+			   (pages[i].addr + pages[i].size) >
+					(ctx->maps[i]->phys + ctx->maps[i]->size)) {
+				err = -EFAULT;
+				dev_err(dev,
+					"Invalid buffer addr 0x%llx len 0x%llx IPA 0x%llx size 0x%llx fd %d\n",
+					ctx->args[i].ptr, len, ctx->maps[i]->phys,
+					ctx->maps[i]->size, ctx->maps[i]->fd);
+				goto bail;
+			}
 		} else {
 			PERF(ctx->fl->profile, GET_COUNTER(perf_counter, PERF_COPY),
 			if (ctx->olaps[oix].offset == 0) {

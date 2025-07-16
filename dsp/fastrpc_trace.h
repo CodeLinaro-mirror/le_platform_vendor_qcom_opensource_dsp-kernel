@@ -59,6 +59,44 @@ TRACE_EVENT(fastrpc_transport_send,
 		__entry->sc, __entry->addr, __entry->size)
 );
 
+TRACE_EVENT(fastrpc_transport_send_ipcmsg,
+
+	TP_PROTO(int type, int cid, uint64_t smq_ctx,
+		uint64_t ctx, uint32_t handle,
+		uint32_t sc, uint64_t addr, uint64_t size, uint32_t priority),
+
+	TP_ARGS(type, cid, smq_ctx, ctx, handle, sc, addr, size, priority),
+
+	TP_STRUCT__entry(
+		__field(int, type)
+		__field(int, cid)
+		__field(u64, smq_ctx)
+		__field(u64, ctx)
+		__field(u32, handle)
+		__field(u32, sc)
+		__field(u64, addr)
+		__field(u64, size)
+		__field(u32, priority)
+	),
+
+	TP_fast_assign(
+		__entry->type = type;
+		__entry->cid = cid;
+		__entry->smq_ctx = smq_ctx;
+		__entry->ctx = ctx;
+		__entry->handle = handle;
+		__entry->sc = sc;
+		__entry->addr = addr;
+		__entry->size = size;
+		__entry->priority = priority;
+	),
+
+	TP_printk("to cid %d: type %d, smq_ctx 0x%llx, ctx 0x%llx, handle 0x%x, sc 0x%x, addr 0x%llx, size %llu, priority %u",
+		__entry->cid, __entry->type, __entry->smq_ctx, __entry->ctx,
+		__entry->handle, __entry->sc, __entry->addr, __entry->size,
+		__entry->priority)
+);
+
 TRACE_EVENT(fastrpc_transport_response,
 
 	TP_PROTO(int cid, uint64_t ctx, int retval,
@@ -85,6 +123,36 @@ TRACE_EVENT(fastrpc_transport_response,
 	TP_printk("from cid %d: ctx 0x%llx, retval 0x%x, rsp_flags %u, early_wake_time %u",
 		__entry->cid, __entry->ctx, __entry->retval,
 		__entry->rsp_flags, __entry->early_wake_time)
+);
+
+TRACE_EVENT(fastrpc_transport_responsev4_err,
+
+	TP_PROTO(int cid, uint64_t ctx, int retval,
+		uint32_t payload_size, uint32_t Refsize, uint32_t Version),
+
+	TP_ARGS(cid, ctx, retval, payload_size, Refsize, Version),
+
+	TP_STRUCT__entry(
+		__field(int, cid)
+		__field(u64, ctx)
+		__field(int, retval)
+		__field(u32, payload_size)
+		__field(u32, Refsize)
+		__field(u32, Version)
+	),
+
+	TP_fast_assign(
+		__entry->cid = cid;
+		__entry->ctx = ctx;
+		__entry->retval = retval;
+		__entry->payload_size = payload_size;
+		__entry->Refsize = Refsize;
+		__entry->Version = Version;
+	),
+
+	TP_printk("from cid %d: ctx 0x%llx, retval 0x%x, Payload size %u, Refsize %u Version %u",
+		__entry->cid, __entry->ctx, __entry->retval,
+		__entry->payload_size,__entry->Refsize, __entry->Version)
 );
 
 TRACE_EVENT(fastrpc_context_interrupt,

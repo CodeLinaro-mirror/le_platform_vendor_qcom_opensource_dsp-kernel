@@ -431,6 +431,30 @@
 #define GENERATE_LOGICAL_DOMAIN_ID(type, counter) \
 	((type * 1000) + counter)
 
+/* Size of respose v1 packet */
+#define SIZE_RSPV1 		sizeof(struct fastrpc_invoke_rsp)
+
+/* Size of respose v2 packet */
+#define SIZE_RSPV2 		sizeof(struct fastrpc_invoke_rspv2)
+
+/* Size of respose v3 packet */
+#define SIZE_RSPV3 		sizeof(struct dsp_notif_rsp)
+
+/* Size of fastrpc_ipcmsg packet */
+#define SIZE_FASTRPC_IPCMSG		sizeof(struct fastrpc_ipcmsg)
+
+/* Size of dspsignal rsp packet */
+#define SIZE_DSPSIGNAL	sizeof(uint64_t)
+
+/* Size of root request msg */
+#define SIZE_ROOT_REQ_MSG	sizeof(struct root_request_msg)
+
+/* Max TX version supported for fastrpc_ipcmsg */
+#define KERNEL_MAX_IPC_TX_VER (MAX_TX_DATATYPE_VAL - 1)
+
+/* Max RX version supported for fastrpc_ipcmsg */
+#define KERNEL_MAX_IPC_RX_VER (MAX_RX_DATATYPE_VAL - 1)
+
 enum fastrpc_reserved_ctx {
 	/*
          * Process status notifications from DSP
@@ -489,6 +513,7 @@ enum fastrpc_internal_attributes {
 	DMA_HANDLE_REVERSE_RPC_CAP = 129,
 	ROOTPD_RPC_HEAP_SUPPORT = 132,
 	DBGLOGBUF_SUPPORT = 134,
+	FASTRPC_IPCMSG_SUPPORT = 135,
 };
 
 enum fastrpc_remote_domains_id {
@@ -559,6 +584,24 @@ enum fastrpc_dump_type {
 	CMA = 0,
 	DEBUGFS = 1,
 	INIT_MEM = 2,
+};
+
+/* Enumeration for V2 TX payload data types */
+enum tx_payload_datatype {
+	/* Used for IPC TX request */
+	IPCMSG_TX_PRIORITY_REQ = 1,
+
+	/* Don't add any data below MAX_TX_DATATYPE_VAL */
+	MAX_TX_DATATYPE_VAL,
+};
+
+/* Enumeration for V4 RX payload data types */
+enum rx_payload_datatype {
+	/* This is used when there is version mismatch in Tx message */
+	TX_IPCMSG_VER_ERROR = 1,
+
+	/* Don't add any data below MAX_RX_DATATYPE_VAL */
+	MAX_RX_DATATYPE_VAL,
 };
 
 struct fastrpc_dump_info{
@@ -696,17 +739,66 @@ struct fastrpc_msg {
 	u64 size;		/* size of contiguous region */
 };
 
+/* Response v1 packet */
 struct fastrpc_invoke_rsp {
 	u64 ctx;		/* invoke caller context */
 	int retval;		/* invoke return value */
 };
 
+/* Response v2 packet */
 struct fastrpc_invoke_rspv2 {
 	u64 ctx;		/* invoke caller context */
 	int retval;		/* invoke return value */
 	u32 flags;		/* early response flags */
 	u32 early_wake_time;	/* user hint in us */
 	u32 version;		/* version number */
+};
+
+/* DSP notification response packet */
+struct dsp_notif_rsp {
+	u64 ctx;		  /* response context */
+	u32 type;        /* Notification type */
+	int pid;		      /* user process pid */
+	u32 status;	  /* userpd status notification */
+};
+
+/* Tx msg V2 Request structure */
+struct transport_req {
+	/* Tx message v2 */
+	struct fastrpc_msg msg;
+	/* Handle priority of the invoke msg */
+	uint32_t priority;
+	/* Reserved for future use */
+	uint32_t reserved[3];
+};
+
+/* Req message version mismatch error response payload */
+struct transport_err_rsp {
+	/* User provided context */
+	uint64_t userCtx;
+	/* Error status */
+	uint32_t retVal;
+	/* Maximum request payload version supported by DSP */
+	uint32_t maxVersionSupported;
+	/* Reserved for future use */
+	uint32_t reserved[2];
+};
+
+/* Common structure for Tx and Rx */
+struct fastrpc_ipcmsg {
+	/* Type of payload packet being set */
+	uint32_t type;
+
+	/* Size of payload packet */
+	uint32_t size;
+
+	/* Union of structs used for tx and rx msgs */
+	union {
+		/* Glink Request Tx payload. Enum: IPCMSG_TX_PRIORITY_REQ */
+		struct transport_req req;
+		/* Glink msg version mismatch Rx payload. Enum: TX_IPCMSG_VER_ERROR*/
+		struct transport_err_rsp err_rsp;
+	}payload;
 };
 
 /* Message flag sent to remote subsystem */
@@ -757,18 +849,13 @@ struct fastrpc_rpmsg_log {
 	spinlock_t rx_lock;
 };
 
-struct dsp_notif_rsp {
-	u64 ctx;		  /* response context */
-	u32 type;        /* Notification type */
-	int pid;		      /* user process pid */
-	u32 status;	  /* userpd status notification */
-};
-
+/* Union of structs used for response */
 union rsp {
 	struct fastrpc_invoke_rsp rsp;
 	struct fastrpc_invoke_rspv2 rsp2;
 	struct dsp_notif_rsp rsp3;
 	struct root_request_msg rsp4;
+	struct fastrpc_ipcmsg rsp5;
 };
 
 struct fastrpc_buf_overlap {
@@ -1342,8 +1429,8 @@ struct fastrpc_dspsignal {
 int fastrpc_transport_send(struct fastrpc_channel_ctx *cctx, void *rpc_msg, uint32_t rpc_msg_size);
 int fastrpc_transport_init(void);
 void fastrpc_transport_deinit(void);
-int fastrpc_handle_rpc_response(struct fastrpc_channel_ctx *cctx, void *data,
-				int len, bool is_glink_wakeup);
+int fastrpc_handle_rpc_response(struct fastrpc_channel_ctx *cctx,
+	union rsp *data, int len, bool is_glink_wakeup);
 void ssr_timer_callback(struct timer_list *timer);
 
 /*

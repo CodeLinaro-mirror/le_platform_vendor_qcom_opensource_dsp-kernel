@@ -2050,29 +2050,12 @@ static int fastrpc_invoke_send(struct fastrpc_pool_ctx *sctx,
 	struct fastrpc_channel_ctx *cctx;
 	struct fastrpc_user *fl = ctx->fl;
 	struct fastrpc_msg *msg = &ctx->msg;
+	struct fastrpc_ipcmsg *ipcmsg = NULL;
 	int ret;
 
 	cctx = fl->cctx;
 	msg->pid = fl->tgid_frpc;
 	msg->tid = current->pid;
-	if (priority) {
-		/**
-		 * RPC calls from same hlos thread made at different priorities need to be
-		 * enqueued to different dsp threads. So, fastrpc driver will need to send
-		 * modified tid's for different priorities.
-		 *
-		 * This is done by encoding the priority with the actual tid.
-		 * If any of the priority bits are set in the base TID,
-		 * then fail the call immediately as those bits cannot be overwritten.
-		 */
-		if (!VALIDATE_PRIORITY_BITS_IN_TID(msg->tid)) {
-			dev_err(fl->cctx->dev, "Error: %s: priority bits in tid %d are non-zero (prio %u)",
-				__func__, msg->tid, priority);
-			return -EFAULT;
-		}
-		msg->tid = GENERATE_FRPC_TID_WITH_PRIORITY(msg->tid, priority);
-	}
-
 	if (kernel == KERNEL_MSG_WITH_ZERO_PID)
 		msg->pid = 0;
 	if (kernel == KERNEL_MSG_WITH_ZERO_PID_ZERO_TID)
@@ -2087,16 +2070,51 @@ static int fastrpc_invoke_send(struct fastrpc_pool_ctx *sctx,
 	msg->size = roundup(ctx->msg_sz, PAGE4K_SIZE);
 	// fastrpc_context_get(ctx);
 
-	ret = fastrpc_transport_send(cctx, (void *)msg, sizeof(*msg));
-	trace_fastrpc_transport_send(cctx->domain_id, (uint64_t)ctx, msg->ctx,
-			msg->handle, msg->sc, msg->addr, msg->size);
+	/*
+	 * If DSP supports new fastrpc_ipcmsg format, then send message
+	 * with IPCMSG_TX_PRIORITY_REQ type and struct transport_req
+	 * payload. Priority is passed as part of the payload.
+	 */
+	if (fl->cctx->dsp_attributes[FASTRPC_IPCMSG_SUPPORT]) {
+		ipcmsg = kzalloc(sizeof(*ipcmsg), GFP_KERNEL);
+		if (!ipcmsg) {
+			dev_err(fl->cctx->dev,
+				"Error: %s: failed to allocate memory for msgv3 packet",
+				__func__);
+			return -ENOMEM;
+		}
+		ipcmsg->type = IPCMSG_TX_PRIORITY_REQ;
+		ipcmsg->payload.req.msg = *msg;
+		ipcmsg->payload.req.priority = priority;
+		ipcmsg->size = sizeof(ipcmsg->payload.req);
+		ret = fastrpc_transport_send(cctx, (void *)ipcmsg,
+			sizeof(*ipcmsg));
+		trace_fastrpc_transport_send_ipcmsg(ipcmsg->type, cctx->domain_id,
+			(uint64_t)ctx, msg->ctx, msg->handle, msg->sc, msg->addr,
+			msg->size, ipcmsg->payload.req.priority);
+		/* Free the allocated ipcmsg struct */
+		if (ipcmsg)
+			kfree(ipcmsg);
+	} else {
+		/*
+		 * If DSP does not support new fastrpc_ipcmsg struct,
+		 * then send message using older fastrpc_msg struct,
+		 * handle priority is encoded into bits [31-26] of tid
+		 */
+		if (!VALIDATE_PRIORITY_BITS_IN_TID(msg->tid)) {
+			dev_err(fl->cctx->dev, "Error: %s: priority bits in tid %d are non-zero (prio %u)",
+				__func__, msg->tid, priority);
+			return -EFAULT;
+		}
+		msg->tid = GENERATE_FRPC_TID_WITH_PRIORITY(msg->tid, priority);
 
-	// if (ret)
-		// fastrpc_context_put(ctx);
+		ret = fastrpc_transport_send(cctx, (void *)msg, sizeof(*msg));
+		trace_fastrpc_transport_send(cctx->domain_id, (uint64_t)ctx,
+			msg->ctx, msg->handle, msg->sc, msg->addr, msg->size);
+	}
+
 	fastrpc_update_txmsg_buf(cctx, msg, ret, get_timestamp_in_ns());
-
 	return ret;
-
 }
 
 static int poll_for_remote_response(struct fastrpc_invoke_ctx *ctx, u32 timeout)
@@ -7914,65 +7932,95 @@ static void fastrpc_handle_signal_rpmsg(uint64_t msg, struct fastrpc_channel_ctx
 	fastrpc_file_put(fl, true);
 }
 
-int fastrpc_handle_rpc_response(struct fastrpc_channel_ctx *cctx, void *data,
-		int len, bool is_glink_wakeup)
+/*
+ * fastrpc_handle_ipcmsg_rsp - Handle fastrpc_ipcmsg message response from DSP.
+ * @cctx: DSP Channel context.
+ * @rsp: IPC message response.
+ *
+ * This function handles fastrpc_ipcmsg format from DSP base on the
+ * type of request.
+ *
+ * Return: 0 on success, error code on failure.
+ */
+static int fastrpc_handle_ipcmsg_rsp(struct fastrpc_channel_ctx *cctx,
+	struct fastrpc_ipcmsg *rsp)
 {
-	struct fastrpc_invoke_rsp *rsp = data;
-	struct fastrpc_invoke_rspv2 *rspv2 = NULL;
-	struct dsp_notif_rsp *notif = (struct dsp_notif_rsp *)data;
-	struct root_request_msg *root_req = (struct root_request_msg *)data;
-	struct fastrpc_invoke_ctx *ctx;
+	u32 type = rsp->type, payload_size = rsp->size, version = 0;
+	struct transport_err_rsp err_rsp = rsp->payload.err_rsp;
+	int err = 0;
+
+	switch (type) {
+		case TX_IPCMSG_VER_ERROR :
+			if (payload_size != sizeof(err_rsp)) {
+				err = -EINVAL;
+				dev_err(cctx->dev,
+					"Error %d: %s: Incorrect payload size %u for rspv4 type %d Expected size %zu",
+					err, __func__, payload_size, type,
+					sizeof(err_rsp));
+			} else {
+				err = -EINVAL;
+				version = err_rsp.maxVersionSupported;
+				dev_err(cctx->dev,
+					"Error %d: %s: IPC message version mismatch, Max DSP RX supported version %u Kernel TX version %u",
+					err, __func__, version,
+					KERNEL_MAX_IPC_TX_VER);
+				trace_fastrpc_transport_responsev4_err(
+					cctx->domain_id, err_rsp.userCtx, err_rsp.retVal,
+					payload_size, sizeof(err_rsp), version);
+			}
+			break;
+
+		default:
+			err = -EINVAL;
+			dev_err(cctx->dev,
+					"Error %d: %s: Unsupported DSP TX message type %u, Kernel max RX ver type %u",
+					err, __func__, type,
+					KERNEL_MAX_IPC_RX_VER);
+			break;
+	}
+	return err;
+}
+
+/*
+ * fastrpc_handle_legacy_rsp - Handle legacy response from DSP.
+ * @cctx: DSP Channel context.
+ * @data: Response data.
+ * @is_v1: Flag indicating if the response is in version 1 format.
+ * @is_glink_wakeup: Flag indicating if the response is a glink wakeup.
+ *
+ * This function handles legacy response format from DSP
+ * based on the type of request.
+ *
+ * Return: 0 on success, error code on failure.
+ */
+static int fastrpc_handle_legacy_rsp(struct fastrpc_channel_ctx *cctx,
+	void *data, bool is_v1, bool is_glink_wakeup)
+{
+	struct fastrpc_invoke_rsp rsp = {0};
+	struct fastrpc_invoke_rspv2 rspv2 = {0};
+	struct fastrpc_invoke_ctx *ctx = NULL;
+	u32 rsp_flags = 0, early_wake_time = 0, version = 0;
 	unsigned long flags = 0, idr = 0;
 	u64 ctxid = 0;
-	int err = 0;
-	u32 rsp_flags = 0, early_wake_time = 0, version = 0;
 
-	if (len == sizeof(uint64_t)) {
-		trace_fastrpc_transport_response(cctx->domain_id, *((uint64_t *)data), 0, 0, 0);
-		fastrpc_handle_signal_rpmsg(*((uint64_t *)data), cctx);
-		return 0;
+	if (is_v1)
+		rsp = *((struct fastrpc_invoke_rsp *)(data));
+	else {
+		rspv2 = *((struct fastrpc_invoke_rspv2 *)(data));
+		rsp.ctx = rspv2.ctx;
+		rsp.retval = rspv2.retval;
+		early_wake_time = rspv2.early_wake_time;
+		rsp_flags = rspv2.flags;
+		version = rspv2.version;
 	}
 
-	if (notif->ctx == FASTRPC_NOTIF_CTX_RESERVED) {
-		if (notif->type == STATUS_RESPONSE && len >= sizeof(*notif)) {
-			fastrpc_notif_find_process(cctx->domain_id, cctx, notif);
-			return 0;
-		} else {
-			return -ENOENT;
-		}
-	}
-
-	if (root_req->ctx == FASTRPC_ROOT_CTX_RESERVED) {
-		if (root_req->req_type != ROOT_REQ_SIGNAL ||
-				len < sizeof(*root_req)) {
-			dev_err(cctx->dev,
-			"Error: root req has invalid request type or size ");
-			err = -ENOENT;
-		}
-
-		fastrpc_queue_root_msg(cctx, root_req, err);
-		return err;
-	}
-
-	if (len < sizeof(*rsp))
-		return -EINVAL;
-
-	if (len >= sizeof(*rspv2)) {
-		rspv2 = data;
-		if (rspv2) {
-			early_wake_time = rspv2->early_wake_time;
-			rsp_flags = rspv2->flags;
-			version = rspv2->version;
-		}
-	}
-
-	fastrpc_update_rxmsg_buf(cctx, rsp->ctx, rsp->retval,
+	fastrpc_update_rxmsg_buf(cctx, rsp.ctx, rsp.retval,
 		rsp_flags, early_wake_time, version, get_timestamp_in_ns());
-	trace_fastrpc_transport_response(cctx->domain_id, rsp->ctx,
-			rsp->retval, rsp_flags, early_wake_time);
+	trace_fastrpc_transport_response(cctx->domain_id, rsp.ctx,
+			rsp.retval, rsp_flags, early_wake_time);
 
-	idr = FASTRPC_GET_IDR_FROM_CTXID(rsp->ctx);
-	ctxid = FASTRPC_GET_CTXID_FROM_RSP_CTX(rsp->ctx);
+	idr = FASTRPC_GET_IDR_FROM_CTXID(rsp.ctx);
+	ctxid = FASTRPC_GET_CTXID_FROM_RSP_CTX(rsp.ctx);
 
 	spin_lock_irqsave(&cctx->lock, flags);
 	ctx = idr_find(&cctx->ctx_idr, idr);
@@ -7986,18 +8034,18 @@ int fastrpc_handle_rpc_response(struct fastrpc_channel_ctx *cctx, void *data,
 		spin_unlock_irqrestore(&cctx->lock, flags);
 		dev_info(cctx->dev,
 			"Warning: rsp ctxid 0x%llx mismatch with local ctxid 0x%llx (full rsp ctx 0x%llx)",
-				ctxid, ctx->ctxid, rsp->ctx);
+				ctxid, ctx->ctxid, rsp.ctx);
 		return 0;
 	}
 
-	if (rspv2) {
-		if (rspv2->version != FASTRPC_RSP_VERSION2) {
-			dev_err(cctx->dev, "Incorrect response version %d\n", rspv2->version);
+	if (rspv2.version != FASTRPC_RSP_VERSION2) {
+			dev_err(cctx->dev, "Incorrect response version %d\n",
+				rspv2.version);
 			spin_unlock_irqrestore(&cctx->lock, flags);
 			return -EINVAL;
-		}
 	}
-	fastrpc_notify_user_ctx(ctx, rsp->retval, rsp_flags, early_wake_time);
+
+	fastrpc_notify_user_ctx(ctx, rsp.retval, rsp_flags, early_wake_time);
 
 	if (is_glink_wakeup && ctx->fl)
 		dev_info(cctx->dev,
@@ -8014,14 +8062,95 @@ int fastrpc_handle_rpc_response(struct fastrpc_channel_ctx *cctx, void *data,
 					ctx->sc);
 
 	spin_unlock_irqrestore(&cctx->lock, flags);
-	/*
-	 * The DMA buffer associated with the context cannot be freed in
-	 * interrupt context so schedule it through a worker thread to
-	 * avoid a kernel BUG.
-	 */
-	// schedule_work(&ctx->put_work);
-
 	return 0;
+}
+/*
+ * fastrpc_handle_rpc_response - Handle RPC response from DSP.
+ * @cctx			: DSP Channel context.
+ * @data			: Response data.
+ * @len 			: Response data length.
+ * @is_glink_wakeup : glink wakeup
+ *
+ * This function handles RPC response from DSP and notifies the user context
+ * about the response.
+ *
+ * Return: 0 on success, error code on failure.
+ */
+int fastrpc_handle_rpc_response(struct fastrpc_channel_ctx *cctx,
+	union rsp *data, int len, bool is_glink_wakeup)
+{
+	struct dsp_notif_rsp *notif = NULL;
+	struct root_request_msg *root_req = NULL;
+	int err = 0;
+
+	switch (len) {
+		/* rspv1 msg*/
+		case SIZE_RSPV1 :
+			err = fastrpc_handle_legacy_rsp(cctx,
+				(void *)(&data->rsp), true, is_glink_wakeup);
+			break;
+
+		/* Both rspv2 and rspv3(notif response) have same size */
+		case SIZE_RSPV2 :
+		{
+			struct fastrpc_invoke_rspv2 *rspv2 = &data->rsp2;
+			if (rspv2->ctx == FASTRPC_NOTIF_CTX_RESERVED) {
+				notif = &data->rsp3;
+				if (notif->type == STATUS_RESPONSE &&
+					len >= sizeof(*notif))
+					fastrpc_notif_find_process(
+						cctx->domain_id, cctx, notif);
+				else
+					err = -ENOENT;
+			} else {
+				err = fastrpc_handle_legacy_rsp(cctx,
+					(void *)(&data->rsp), false, is_glink_wakeup);
+			}
+			break;
+		}
+
+		/* DSP signal response */
+		case SIZE_DSPSIGNAL:
+			trace_fastrpc_transport_response(cctx->domain_id,
+				*((uint64_t *)data), 0, 0, 0);
+			fastrpc_handle_signal_rpmsg(*((uint64_t *)data), cctx);
+			break;
+
+		/* Root request message */
+		case SIZE_ROOT_REQ_MSG:
+			root_req = &data->rsp4;
+			if (root_req->ctx == FASTRPC_ROOT_CTX_RESERVED) {
+				if (root_req->req_type == ROOT_REQ_SIGNAL &&
+						len >= sizeof(*root_req)) {
+					fastrpc_queue_root_msg(cctx, root_req, 0);
+				} else {
+					err = -EINVAL;
+					dev_err(cctx->dev, "Error: %s: Invalid root request type or size",
+						__func__);
+				}
+			}
+			break;
+
+		/* fastrpc_ipcmsg response */
+		case SIZE_FASTRPC_IPCMSG:
+			err = fastrpc_handle_ipcmsg_rsp(cctx, &data->rsp5);
+			break;
+
+		default:
+			err = -EBADMSG;
+			dev_err(cctx->dev,
+				"Error %d: %s: Unsupported response packet size %d",
+				err, __func__, len);
+			break;
+	}
+
+	if (err != 0) {
+		dev_err(cctx->dev,
+			"Error %d: %s: Failed to handle response packet size %d",
+			err, __func__, len);
+	}
+
+	return err;
 }
 
 /*

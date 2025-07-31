@@ -34,7 +34,7 @@
 #include "fastrpc_shared.h"
 #include <linux/platform_device.h>
 #include <linux/types.h>
-
+#include <linux/version.h>
 #define CREATE_TRACE_POINTS
 #include "fastrpc_trace.h"
 
@@ -2197,9 +2197,13 @@ static int fastrpc_wait_for_response(struct fastrpc_invoke_ctx *ctx,
 
 		if (is_timer_set) {
 			// Delete timer after ssr callback is completed
+			#if (KERNEL_VERSION(6, 15, 0) > LINUX_VERSION_CODE)
 			if (!del_timer_sync(&ctx->ssr_timer))
+				 interrupted = -ETIME;
+			#else
+			if (!timer_delete_sync(&ctx->ssr_timer))
 				interrupted = -ETIME;
-
+			#endif
 			dev_dbg(cctx->dev,
 				"%s: deleted timer for domain %d, handle 0x%x, sc 0x%x, pid %d, tid %d\n",
 				__func__, cctx->domain_id, ctx->handle,

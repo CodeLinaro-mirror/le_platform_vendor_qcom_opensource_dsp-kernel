@@ -61,7 +61,6 @@
 #define SESSION_ID_MASK (1 << SESSION_ID_INDEX)
 #define MAX_FRPC_TGID 64
 #define COPY_BUF_WARN_LIMIT (512*1024)
-#define SMMU_4K 0x1000
 #define SMMU_1M 0x100000ULL
 #define SMMU_2M 0x200000ULL
 #define SMMU_1G 0x40000000ULL
@@ -72,7 +71,7 @@
 /*
  * Align the size to next IOMMU page size
  * for example 1MB gets aligned to 2MB, as
- * IOMMU has only 3 page sizes 4K, 2M and 1G
+ * IOMMU has only 4 page sizes 4K, 16K 2M and 1G
  */
 #define SMMU_ALIGN(size) ({		\
 	u64 align_size = 0;		\
@@ -81,7 +80,7 @@
 	else if (size > SMMU_2M)	\
 		align_size = SMMU_2M;	\
 	else				\
-		align_size = SMMU_4K;	\
+		align_size = PAGE_SIZE;	\
 	ALIGN(size, align_size);	\
 })
 
@@ -90,6 +89,15 @@
  * Used to log messages on this SMMU device
  */
 #define DEFAULT_SMMU_IDX	0
+
+/* Macro for 4k Page Size */
+#define PAGE4K_SIZE 4096
+
+/* Macro for 4k Page Mask */
+#define PAGE4K_MASK ~(PAGE4K_SIZE - 1)
+
+/* Macro for 4k Page Shift */
+#define PAGE4K_SHIFT 12
 
 /*
  * Fastrpc context ID bit-map:

@@ -4324,17 +4324,16 @@ static void fastrpc_notif_find_process(int domain, struct fastrpc_channel_ctx *c
 
 	spin_lock_irqsave(&cctx->lock, irq_flags);
 	list_for_each_entry(user, &cctx->users, user) {
-		err = fastrpc_file_get(user);
-		if (err) {
-			dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
-				__func__, user);
-			continue;
-		}
 		if (user->tgid_frpc == notif->pid) {
+			err = fastrpc_file_get(user);
+			if (err) {
+				dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
+					__func__, user);
+				break;
+			}
 			is_process_found = true;
 			break;
 		}
-		fastrpc_file_put(user, true);
 	}
 	spin_unlock_irqrestore(&cctx->lock, irq_flags);
 
@@ -7152,16 +7151,15 @@ int fastrpc_driver_register(struct fastrpc_driver *frpc_driver)
 
 		spin_lock_irqsave(&cctx->lock, irq_flags);
 		list_for_each_entry(user, &cctx->users, user) {
-			err = fastrpc_file_get(user);
-			if (err) {
-				dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
-					__func__, user);
-				continue;
-			}
 			if (user->tgid_frpc == frpc_driver->handle) {
+				err = fastrpc_file_get(user);
+				if (err) {
+					dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
+						__func__, user);
+					break;
+				}
 				goto process_found;
 			}
-			fastrpc_file_put(user, false);
 		}
 		spin_unlock_irqrestore(&cctx->lock, irq_flags);
 	}
@@ -7229,19 +7227,11 @@ static void fastrpc_notify_pdr_drivers(struct fastrpc_channel_ctx *cctx,
 {
 	struct fastrpc_user *fl;
 	unsigned long flags;
-	int err;
 
 	spin_lock_irqsave(&cctx->lock, flags);
 	list_for_each_entry(fl, &cctx->users, user) {
-		err = fastrpc_file_get(fl);
-		if (err) {
-			dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
-				__func__, fl);
-			continue;
-		}
 		if (fl->servloc_name && !strcmp(servloc_name, fl->servloc_name))
 			fastrpc_notify_users(fl);
-		fastrpc_file_put(fl, false);
 	}
 	spin_unlock_irqrestore(&cctx->lock, flags);
 }
@@ -7891,17 +7881,16 @@ static void fastrpc_handle_signal_rpmsg(uint64_t msg, struct fastrpc_channel_ctx
 
 	spin_lock_irqsave(&cctx->lock, irq_flags);
 	list_for_each_entry(fl, &cctx->users, user) {
-		err = fastrpc_file_get(fl);
-		if (err) {
-			dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
-				__func__, fl);
-			continue;
-		}
-		if (fl->tgid_frpc == pid && atomic_read(&fl->state) < DSP_EXIT_START) {
+		if (fl->tgid_frpc == pid) {
+			err = fastrpc_file_get(fl);
+			if (err) {
+				dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
+					__func__, fl);
+				break;
+			}
 			process_found = true;
 			break;
 		}
-		fastrpc_file_put(fl, true);
 	}
 	spin_unlock_irqrestore(&cctx->lock, irq_flags);
 

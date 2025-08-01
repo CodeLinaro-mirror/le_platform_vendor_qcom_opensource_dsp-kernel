@@ -72,3 +72,7 @@ define_modules("alor", "consolidate", "no")
 define_modules("x1p42100", "perf", "no")
 
 define_modules("x1p42100", "consolidate", "no")
+
+define_modules("art", "perf", "no")
+
+define_modules("art", "consolidate", "no")

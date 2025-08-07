@@ -2186,11 +2186,9 @@ static int fastrpc_wait_for_response(struct fastrpc_invoke_ctx *ctx,
 		if (is_timer_set) {
 			// Delete timer after ssr callback is completed
 			#if (KERNEL_VERSION(6, 15, 0) > LINUX_VERSION_CODE)
-			if (!del_timer_sync(&ctx->ssr_timer))
-				 interrupted = -ETIME;
+			del_timer_sync(&ctx->ssr_timer);
 			#else
-			if (!timer_delete_sync(&ctx->ssr_timer))
-				interrupted = -ETIME;
+			timer_delete_sync(&ctx->ssr_timer);
 			#endif
 			dev_dbg(cctx->dev,
 				"%s: deleted timer for domain %d, handle 0x%x, sc 0x%x, pid %d, tid %d\n",

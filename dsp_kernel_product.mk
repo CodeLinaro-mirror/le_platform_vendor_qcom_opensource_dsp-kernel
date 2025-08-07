@@ -16,9 +16,9 @@ SOONG_CONFIG_NAMESPACES += qtidspplatform
 
 # Soong Keys
 
+ifeq (,$(wildcard $(QCPATH)/adsprpc))
 ifneq ($(filter hwaddress,$(SANITIZE_TARGET)),)
 SOONG_CONFIG_qtidspplatform_hwasan:= true
-$(warning "using SOONG_CONFIG_qtidisplay_hwasan")
 endif
 
 ifeq ($(BUILD_dspplatform_TECHPACK_SOURCE), true)
@@ -26,7 +26,7 @@ SOONG_CONFIG_qtidspplatform_hy11:= true
 SOONG_CONFIG_qtidspplatform_hy22:= true
 SOONG_CONFIG_qtidspplatform_hy33:= true
 endif
-
+endif
 ifeq ($(TARGET_KERNEL_DLKM_DISABLE), true)
   ifeq ($(TARGET_KERNEL_DLKM_FASTRPC_OVERRIDE), false)
     FASTRPC_DLKM_ENABLED := false

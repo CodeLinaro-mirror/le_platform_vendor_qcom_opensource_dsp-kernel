@@ -3647,8 +3647,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	}
 
 #ifdef CONFIG_DEBUG_FS
-	if (fl != NULL)
-		fastrpc_create_session_debugfs(fl);
+	fastrpc_create_session_debugfs(fl);
 #endif
 	/* remove buffer on success as no longer required */
 	if (fl->proc_init_sharedbuf) {
@@ -4707,7 +4706,7 @@ static int fastrpc_get_notif_response(
 	 */
 	if (legacy_domains) {
 		domain = fastrpc_lookup_domain_in_table(notif->domain, false);
-		if (domain->legacy)
+		if (domain && domain->legacy)
 			notif->domain = domain->legacy_id;
 	}
 
@@ -4788,9 +4787,6 @@ static int fastrpc_internal_control(struct fastrpc_user *fl,
 	struct fastrpc_channel_ctx *cctx = fl->cctx;
 	u32 latency = 0, cpu = 0;
 
-	if (!fl) {
-		return -EBADF;
-	}
 	if (!cp) {
 		return -EINVAL;
 	}

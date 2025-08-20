@@ -8022,6 +8022,56 @@ int fastrpc_handle_rpc_response(struct fastrpc_channel_ctx *cctx, void *data,
 }
 
 /*
+ * Retrieves legacy information for a given fastrpc_domain.
+ *
+ * This function maps the domain's type to its corresponding legacy name
+ * and ID, based on the following table:
+ *
+ *   Domain Type       | Legacy Name              | Legacy ID
+ *   ------------------|--------------------------|---------------
+ *   SDSP              | domains[SDSP_DOMAIN_ID]  | SDSP_DOMAIN_ID
+ *   LPASS             | domains[ADSP_DOMAIN_ID]  | ADSP_DOMAIN_ID
+ *   NSP(instance 0)   | domains[CDSP_DOMAIN_ID]  | CDSP_DOMAIN_ID
+ *   NSP(instance 1)   | domains[CDSP1_DOMAIN_ID] | CDSP1_DOMAIN_ID
+ *
+ * @param domain Pointer to the fastrpc_domain structure to retrieve
+ * legacy info
+ *
+ * @return 0 on success, or a negative error code on failure
+ *
+ * Error codes:
+ *   -EINVAL: Invalid domain type
+ */
+static int fastrpc_retrieve_legacy_info(struct fastrpc_domain *domain)
+{
+	int err = 0;
+
+	switch (domain->type) {
+	case FASTRPC_SDSP:
+		domain->legacy_name = (char *)legacy_domains[SDSP_DOMAIN_ID];
+		domain->legacy_id = SDSP_DOMAIN_ID;
+		break;
+	case FASTRPC_LPASS:
+		domain->legacy_name = (char *)legacy_domains[ADSP_DOMAIN_ID];
+		domain->legacy_id = ADSP_DOMAIN_ID;
+		break;
+	case FASTRPC_NSP:
+		if (domain->instance_id == 0) {
+			domain->legacy_name = (char *)legacy_domains[CDSP_DOMAIN_ID];
+			domain->legacy_id = CDSP_DOMAIN_ID;
+		} else if (domain->instance_id == 1) {
+			domain->legacy_name = (char *)legacy_domains[CDSP1_DOMAIN_ID];
+			domain->legacy_id = CDSP1_DOMAIN_ID;
+		}
+		break;
+	default:
+		err = -EINVAL;
+		break;
+	}
+	return err;
+}
+
+/*
  * Add entry for domain in hash-table or update status of existing entry.
  *
  * @param domain  Pointer to the fastrpc domain structure to be added.
@@ -8050,8 +8100,10 @@ static int fastrpc_add_domain_to_table(struct fastrpc_domain **domain,
 		 * phy_id, instance_id, type, logical_id, name
 		 */
 		entry = kzalloc(sizeof(*entry), GFP_KERNEL);
-		if (!entry)
-			return -ENOMEM;
+		if (!entry) {
+			err = -ENOMEM;
+			goto bail;
+		}
 		entry->phy_id = phy_id;
 		entry->instance_id = instance_id;
 		entry->type = type;
@@ -8062,7 +8114,7 @@ static int fastrpc_add_domain_to_table(struct fastrpc_domain **domain,
 			err = -EFAULT;
 			pr_err("Error %d: %s failed to generate name for label %s phy_id %u",
 				err, __func__, label, phy_id);
-			return err;
+			goto bail;
 		}
 
 		if (instance_id == 0 || (type == FASTRPC_NSP && instance_id == 1))  {
@@ -8073,12 +8125,19 @@ static int fastrpc_add_domain_to_table(struct fastrpc_domain **domain,
 			 *                to handle legacy cdsp and cdsp1 domains
 			*/
 			entry->legacy = true;
+			err = fastrpc_retrieve_legacy_info(entry);
+			if (err) {
+				pr_err("Error %d: %s failed to retrieve legacy info for %s",
+					err, __func__, entry->name);
+				goto bail;
+			}
 		}
+
 		err = fastrpc_sysfs_domain_create(entry);
 		if (err) {
 			pr_err("Error %d: %s: failed to create sysfs node for %s",
 				err, __func__, entry->name);
-			return err;
+			goto bail;
 		}
 
 		mutex_lock(hmut);
@@ -8100,7 +8159,11 @@ static int fastrpc_add_domain_to_table(struct fastrpc_domain **domain,
 		}
 	}
 	*domain = entry;
-	return 0;
+bail:
+	if (err)
+		kfree(entry);
+
+	return err;
 }
 
 /*

@@ -814,6 +814,7 @@ static void fastrpc_context_free(struct kref *ref)
 	for (i = 0; i < ctx->nbufs; i++)
 		fastrpc_map_put(ctx->maps[i]);
 	mutex_unlock(&ctx->fl->map_mutex);
+	trace_fastrpc_msg("fastrpc_context_free: free_maps");
 
 	if (ctx->buf)
 		fastrpc_buf_free(ctx->buf, true);
@@ -1887,6 +1888,8 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 			PERF_END);
 		}
 	}
+	trace_fastrpc_get_args((uint64_t)ctx,
+		ctx->ctxid, ctx->handle, ctx->sc);
 
 	for (i = ctx->nbufs; i < ctx->nscalars; ++i) {
 		list[i].num = ctx->args[i].length ? 1 : 0;

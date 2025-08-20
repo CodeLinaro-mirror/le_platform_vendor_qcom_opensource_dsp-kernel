@@ -397,6 +397,31 @@ TRACE_EVENT(fastrpc_context_free,
 		__entry->smq_ctx, __entry->ctx, __entry->handle, __entry->sc)
 );
 
+TRACE_EVENT(fastrpc_get_args,
+
+	TP_PROTO(uint64_t smq_ctx, uint64_t ctx,
+		uint32_t handle, uint32_t sc),
+
+	TP_ARGS(smq_ctx, ctx, handle, sc),
+
+	TP_STRUCT__entry(
+		__field(u64, smq_ctx)
+		__field(u64, ctx)
+		__field(u32, handle)
+		__field(u32, sc)
+	),
+
+	TP_fast_assign(
+		__entry->smq_ctx = smq_ctx;
+		__entry->ctx = ctx;
+		__entry->handle = handle;
+		__entry->sc = sc;
+	),
+
+	TP_printk("for: smq_ctx 0x%llx, ctx 0x%llx, handle 0x%x, sc 0x%x",
+		__entry->smq_ctx, __entry->ctx, __entry->handle, __entry->sc)
+);
+
 TRACE_EVENT(fastrpc_perf_counters,
 
 	TP_PROTO(uint32_t handle, uint32_t sc,

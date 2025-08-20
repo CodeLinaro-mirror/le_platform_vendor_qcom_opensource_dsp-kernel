@@ -7604,6 +7604,9 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 		dev_err(dev, "32-bit DMA enable failed\n");
 		return rc;
 	}
+	/* Set larger segment size to allow smmu to map > 4GB */
+	dma_set_max_seg_size(dev, DMA_BIT_MASK(32));
+
 #ifdef CONFIG_DEBUG_FS
 	if (debugfs_root && !g_frpc.debugfs_global_file) {
 		debugfs_global_file = debugfs_create_file("global", 0644,

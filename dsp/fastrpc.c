@@ -2233,6 +2233,9 @@ static int fastrpc_wait_for_response(struct fastrpc_invoke_ctx *ctx,
 				}
 
 				atomic_set(&fl->state, DSP_EXIT_COMPLETE);
+				if (IS_DYNAMIC_PD(fl->pd_type))
+					fastrpc_sysfs_notify_pids(cctx->domain);
+
 				interrupted = -ETIME;
 			} else if (timeleft < 0) {
 				/* RPC call interrupted */
@@ -3844,6 +3847,8 @@ static int fastrpc_user_obj_free(struct fastrpc_user *user,
 	}
 
 	atomic_set(&fl->state, DSP_EXIT_COMPLETE);
+	if (IS_DYNAMIC_PD(fl->pd_type))
+		fastrpc_sysfs_notify_pids(cctx->domain);
 
 	spin_lock_irqsave(&cctx->lock, flags);
 	locked = true;
@@ -6624,8 +6629,11 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int cmd,
 		err = fastrpc_device_create(fl);
 		if (err)
 			atomic_set(&fl->state, DEFAULT_PROC_STATE);
-		else
+		else {
 			atomic_set(&fl->state, DSP_CREATE_COMPLETE);
+			if (IS_DYNAMIC_PD(fl->pd_type))
+				fastrpc_sysfs_notify_pids(cctx->domain);
+		}
 	}
 
 	spin_lock_irqsave(&cctx->lock, flags);
@@ -8333,6 +8341,84 @@ int fastrpc_populate_domain_from_dt(struct device *rdev,
 			err, __func__, label, type, instance_id);
 		return err;
 	}
+	return err;
+}
+
+int fastrpc_get_domain_pid_info(struct fastrpc_domain *domain, char **out_buf,
+				int *len_written)
+{
+	struct fastrpc_channel_ctx *cctx = NULL;
+	struct fastrpc_user *fl = NULL;
+	unsigned long flags;
+	int *pids = NULL;
+	int pid_count = 0, total_len = 0, err = 0, i = 0;
+	char *pid_buf = NULL;
+
+	*out_buf = NULL;
+	*len_written = 0;
+
+	pids = kcalloc(FASTRPC_MAX_SESS_PER_DOMAIN,
+			sizeof(int), GFP_KERNEL);
+	if (!pids)
+		return -ENOMEM;
+
+	cctx = domain->cctx;
+	if (!cctx) {
+		err = -EINVAL;
+		goto bail;
+	}
+
+	spin_lock_irqsave(&cctx->lock, flags);
+	list_for_each_entry(fl, &cctx->users, user) {
+		/* Only include pids of apps with dynamic type remote sessions on DSP */
+		if (!IS_DYNAMIC_PD(fl->pd_type) ||
+			atomic_read(&fl->state) != DSP_CREATE_COMPLETE)
+			continue;
+
+		if (pid_count >= FASTRPC_MAX_SESS_PER_DOMAIN) {
+			/* Too many PIDs */
+			err = -ENOSPC;
+			goto bail_unlock;
+		}
+
+		pids[pid_count++] = fl->tgid_app;
+
+		/* Add length of PID + 1 for comma (if not first) */
+		total_len += snprintf(NULL, 0, "%d", fl->tgid_app) + 1;
+	}
+
+	/* Exit if no pids with active sessions */
+	if (pid_count == 0)
+		goto bail_unlock;
+
+	/* Add +1 to total length for null terminator */
+	total_len++;
+
+	pid_buf = kzalloc(total_len, GFP_ATOMIC);
+	if (!pid_buf) {
+		err = -ENOMEM;
+		goto bail_unlock;
+	}
+
+	for (i = 0; i < pid_count; i++) {
+		if (i > 0) {
+			*len_written += snprintf(pid_buf + *len_written,
+						total_len - *len_written, ",");
+		}
+		*len_written += snprintf(pid_buf + *len_written,
+						total_len - *len_written, "%d", pids[i]);
+	}
+
+	/* Add newline character */
+	snprintf(pid_buf + *len_written, total_len - *len_written, "\n");
+	*len_written += 1;
+
+	*out_buf = pid_buf;
+
+bail_unlock:
+	spin_unlock_irqrestore(&cctx->lock, flags);
+bail:
+	kfree(pids);
 	return err;
 }
 

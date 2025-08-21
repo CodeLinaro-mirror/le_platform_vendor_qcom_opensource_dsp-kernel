@@ -113,6 +113,31 @@ static ssize_t domain_legacy_id_show(struct kobject *kobj,
 	return sysfs_emit(buf, "%d\n", domain->legacy_id);
 }
 
+/*
+ * Callback function whenever user app reads
+ * /sys/kernel/fastrpc/nsp_info/pids_remote_sessions
+ *
+ * Returns comma-separated list of hlos pids of apps
+ * with active remote sessions on given domain
+ */
+static ssize_t domain_pid_info_show(struct kobject *kobj,
+	struct kobj_attribute *attr, char *buf)
+{
+	char *pid_info_buf = NULL;
+	int len_written = 0, ret = 0;
+	struct fastrpc_domain *domain = container_of(kobj,
+		struct fastrpc_domain, kobj_sysfs);
+
+	ret = fastrpc_get_domain_pid_info(domain, &pid_info_buf, &len_written);
+	if (ret)
+		return ret;
+
+	sysfs_emit(buf, "%s", pid_info_buf);
+	kfree(pid_info_buf);
+
+	return len_written;
+}
+
 /* Parent sysfs kobject for "/sys/kernel/fastrpc" */
 static struct kset *fastrpc_kset = NULL;
 
@@ -131,6 +156,8 @@ static struct kobj_attribute legacy_name_attr = __ATTR(legacy_name, 0444,
 	domain_legacy_name_show, NULL);
 static struct kobj_attribute legacy_id_attr = __ATTR(legacy_id, 0444,
 	domain_legacy_id_show, NULL);
+static struct kobj_attribute pids_remote_sessions_attr = __ATTR(pids_remote_sessions, 0444,
+	domain_pid_info_show, NULL);
 
 /* Define default attribute list for a domain */
 static struct attribute *dsp_attrs[] = {
@@ -139,6 +166,7 @@ static struct attribute *dsp_attrs[] = {
 	&status_attr.attr,
 	&type_attr.attr,
 	&instance_id_attr.attr,
+	&pids_remote_sessions_attr.attr,
 	NULL, /* Null terminator for the attribute array */
 };
 
@@ -160,6 +188,7 @@ static struct attribute *dsp_with_legacy_attrs[] = {
 	&instance_id_attr.attr,
 	&legacy_name_attr.attr,
 	&legacy_id_attr.attr,
+	&pids_remote_sessions_attr.attr,
 	NULL, /* Null terminator for the attribute array */
 };
 
@@ -257,13 +286,21 @@ void fastrpc_sysfs_domain_remove(struct fastrpc_domain *domain)
 		__func__, domain->name);
 }
 
-/*
- * fastrpc_sysfs_register_kset - Register the fastrpc kset
- *
- * Creates a kset to create a parent directory "fastrpc" under /sys/kernel.
- *
- * Return: 0 on success, -ENOMEM on failure
- */
+void fastrpc_sysfs_notify_pids(struct fastrpc_domain *domain)
+{
+	if (!domain || !domain->cctx)
+		return;
+
+	/*
+	 * Notify sysfs that the 'pids_remote_sessions' attribute has changed.
+	 * This triggers a uevent that userspace can listen to, indicating
+	 * a change in sysfs attribute.
+	 */
+	sysfs_notify(&domain->kobj_sysfs, NULL,
+		pids_remote_sessions_attr.attr.name);
+	return;
+}
+
 int fastrpc_sysfs_register_kset(void)
 {
 	/* Create kset to create a parent directory fastrpc under /sys/kernel */
@@ -276,13 +313,6 @@ int fastrpc_sysfs_register_kset(void)
 	return 0;
 }
 
-/*
- * fastrpc_sysfs_deregister_kset - Deregister the fastrpc kset from sysfs
- *
- * This function deregisters the fastrpc kset from the sysfs file system.
- *
- * @return: None
- */
 void fastrpc_sysfs_deregister_kset(void)
 {
 	/* Delete the parent kset */

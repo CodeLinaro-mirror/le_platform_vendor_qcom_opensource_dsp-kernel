@@ -568,7 +568,9 @@ static int fastrpc_rpmsg_callback(struct rpmsg_device *rpdev, void *data,
 	is_glink_wakeup = qcom_glink_is_wakeup(true);
 #endif
 
-	return fastrpc_handle_rpc_response(cctx, data, len, is_glink_wakeup);
+	return fastrpc_handle_rpc_response(cctx, (union rsp *)data, len,
+		is_glink_wakeup);
+
 }
 
 static const struct of_device_id fastrpc_rpmsg_of_match[] = {

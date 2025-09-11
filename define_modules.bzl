@@ -1,6 +1,7 @@
 # TODO
 # Add ddk module definition for frpc-trusted driver
-load("//build/bazel_common_rules/dist:dist.bzl", "copy_to_dist_dir")
+load("@rules_pkg//pkg:install.bzl", "pkg_install")
+load("@rules_pkg//pkg:mappings.bzl", "pkg_files", "strip_prefix")
 
 load(
     "//build/kernel/kleaf:kernel.bzl",
@@ -69,14 +70,17 @@ def define_modules(target, variant, build_loader):
             out = "cdsp-loader.ko",
         )
 
-    copy_to_dist_dir(
+    pkg_files(
+        name = kernel_build_variant + "_dist_files",
+        srcs = data,
+        visibility = ["//visibility:private"],
+        strip_prefix = strip_prefix.files_only(),
+    )
+
+    pkg_install(
         name = "{}_dsp-kernel_dist".format(kernel_build_variant),
-        data = data,
-        dist_dir = "out/target/product/{}/dlkm/lib/modules/".format(target),
-        flat = True,
-        wipe_dist_dir = False,
-        allow_duplicate_filenames = False,
-        mode_overrides = {"**/*": "644"},
+        srcs = [":{}_dist_files".format(kernel_build_variant)],
+        destdir = "out/target/product/{}/dlkm/lib/modules/".format(target),
     )
 
 def define_vm_modules(target, variant):
@@ -126,14 +130,15 @@ def define_vm_modules(target, variant):
         ],
     )
 
-    copy_to_dist_dir(
+    pkg_files(
+        name = kernel_build_variant + "_dist_files",
+        srcs = [":{}_frpc-trusted-adsprpc".format(kernel_build_variant)],
+        visibility = ["//visibility:private"],
+        strip_prefix = strip_prefix.files_only(),
+    )
+
+    pkg_install(
         name = "{}_dsp-kernel_dist".format(kernel_build_variant),
-        data = [
-            ":{}_frpc-trusted-adsprpc".format(kernel_build_variant),
-        ],
-        dist_dir = "out/target/product/{}/dlkm/lib/modules/".format(target),
-        flat = True,
-        wipe_dist_dir = False,
-        allow_duplicate_filenames = False,
-        mode_overrides = {"**/*": "644"},
+        srcs = [":{}_dist_files".format(kernel_build_variant)],
+        destdir = "out/target/product/{}/dlkm/lib/modules/".format(target),
     )

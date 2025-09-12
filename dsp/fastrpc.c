@@ -1976,6 +1976,12 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 	outbufs = REMOTE_SCALARS_OUTBUFS(ctx->sc);
 	metalen = fastrpc_get_meta_size(ctx);
 	pkt_size = fastrpc_get_payload_size(ctx, metalen);
+	outbufslen = sizeof(struct fastrpc_remote_buf) * outbufs;
+	ctx->outbufs = kzalloc(outbufslen, GFP_KERNEL);
+	if (!ctx->outbufs) {
+		err = -ENOMEM;
+		goto bail;
+	}
 	if (!pkt_size) {
 		dev_err(dev, "invalid payload size for handle 0x%x, sc 0x%x\n",
 			ctx->handle, ctx->sc);
@@ -2096,6 +2102,11 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 				goto bail;
 			}
 
+			if (i >= inbufs) {
+				int j = i - inbufs;
+				ctx->outbufs[j].buf.pv = args - ctx->olaps[oix].offset;
+				ctx->outbufs[j].buf.len = len;
+			}
 			rpra[i].buf.pv = args - ctx->olaps[oix].offset;
 			pages[i].addr = ctx->buf->phys -
 					ctx->olaps[oix].offset +
@@ -2152,13 +2163,6 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 		rpra[i].dma.len = ctx->args[i].length;
 		rpra[i].dma.offset = (u64) ctx->args[i].ptr;
 	}
-	outbufslen = sizeof(struct fastrpc_remote_buf) * outbufs;
-	ctx->outbufs = kzalloc(outbufslen, GFP_KERNEL);
-	if (!ctx->outbufs) {
-		err = -ENOMEM;
-		goto bail;
-	}
-	memcpy(ctx->outbufs, rpra + inbufs, outbufslen);
 
 bail:
 	if (err)

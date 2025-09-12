@@ -3882,10 +3882,23 @@ static int fastrpc_user_obj_free(struct fastrpc_user *user,
 		atomic_set(&fl->spd->is_attached, 0);
 
 	err = fastrpc_release_current_dsp_process(fl);
+
+	/*
+	 * Handle GLINK timeout during PD kill.
+	 * If SSR is active (shutdown started), wait for remote subsystem
+	 * to stop. Otherwise, trigger BUG_ON to prevent PD mapping
+	 * removal and avoid SMMU fault.
+	 */
 	if (err == -ETIMEDOUT) {
-		pr_err("%s failed with err %d for process %s (tgid %d, tgid_frpc %d)\n",
-			__func__, err, current->comm, fl->tgid_app, fl->tgid_frpc);
-		BUG_ON(1);
+		if (!cctx->startshutdown) {
+			pr_err("%s failed with err %d for process %s (tgid %d, tgid_frpc %d)\n",
+				__func__, err, current->comm, fl->tgid_app, fl->tgid_frpc);
+			BUG_ON(1);
+		} else if (!atomic_read(&cctx->teardown)) {
+			pr_info("%s process %s is waiting, err %d  (tgid %d, tgid_frpc %d)\n",
+			__func__, current->comm, err, fl->tgid_app, fl->tgid_frpc);
+			wait_for_completion(&cctx->rpmsg_remove_start);
+		}
 	}
 
 	/*

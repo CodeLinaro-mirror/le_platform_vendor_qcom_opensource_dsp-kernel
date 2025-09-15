@@ -3423,6 +3423,7 @@ err_sharedbuf_fail:
 	return err;
 }
 
+#ifdef VERBOSE_LOG
 /**
  * Write formatted seq_file buffer content to fastrpc user
  * log buffer.
@@ -3564,6 +3565,7 @@ bail:
 		atomic_set(&user->log_buf.state, LOG_BUF_STATE_COMPLETED);
 	}
 }
+#endif
 
 static int fastrpc_init_create_process(struct fastrpc_user *fl,
 					char __user *argp)
@@ -3897,10 +3899,12 @@ void fastrpc_free_user(struct fastrpc_user *fl)
 		fl->hdr_bufs = NULL;
 	}
 
+#ifdef VERBOSE_LOG
 	if (fl->log_buf.buffer) {
 		kfree(fl->log_buf.buffer);
 		fl->log_buf.buffer = NULL;
 	}
+#endif
 
 	fastrpc_buf_list_free(fl, &fl->cached_bufs, true);
 
@@ -4266,12 +4270,14 @@ static int fastrpc_user_obj_create(struct file *filp,
 		list_add_tail(&fl->user, &cctx->users);
 		spin_unlock_irqrestore(&cctx->lock, flags);
 
+#ifdef VERBOSE_LOG
 		fl->log_buf.buffer = kzalloc(LOG_BUF_SIZE, GFP_KERNEL);
 		if (!fl->log_buf.buffer) {
 			err = -ENOMEM;
 			goto error;
 		}
 		atomic_set(&fl->log_buf.state, LOG_BUF_STATE_DEFAULT);
+#endif
 	} else {
 		/* No pid will be associated with the default user-object */
 		fl->tgid = fl->tgid_app = -1;
@@ -5753,14 +5759,15 @@ static int fastrpc_invoke_dspsignal(struct fastrpc_user *fl, struct fastrpc_inte
 	return err;
 }
 
+#ifdef VERBOSE_LOG
 /**
  * Retrieve kernel log data from ring buffer
  *
  * Copies available log entries from the ring buffer to the user-provided
  * buffer in the ioctl payload.
  *
- * @param[in] Â klog   : Pointer to ioctl kernel log structure
- * @param[in] Â fl   : Pointer to fastrpc user
+ * @param[in]  klog   : Pointer to ioctl kernel log structure
+ * @param[in]  fl   : Pointer to fastrpc user
  *
  * @return 0 on success, error code on failure
  */
@@ -5786,6 +5793,7 @@ bail:
 	atomic_set(&fl->log_buf.state, LOG_BUF_STATE_DEFAULT);
 	return err;
 }
+#endif
 
 static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 {
@@ -5799,7 +5807,9 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 	struct fastrpc_ioctl_mdctx_manage ctxm = {0};
 	struct fastrpc_ioctl_remote_proc_state_dump proc = {0};
 	struct fastrpc_internal_proc_timeout rpc = {0};
+#ifdef VERBOSE_LOG
 	struct fastrpc_ioctl_kernel_log klog = {0};
+#endif
 	u32 multisession, size = 0;
 	u64 *perf_kernel;
 	bool legacy_domains = true;
@@ -5898,12 +5908,14 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 			return -EFAULT;
 		err = fastrpc_set_dsp_recovery_mode(fl, recovery);
 		break;
+#ifdef VERBOSE_LOG
 	case FASTRPC_INVOKE_RETRIEVE_KERNEL_LOG:
 		if (copy_from_user(&klog, (void __user *)(uintptr_t)invoke.invparam,
 				sizeof(klog)))
 			return -EFAULT;
 		err = fastrpc_retrieve_kernel_logs(&klog, fl);
 		break;
+#endif
 	default:
 		err = -ENOTTY;
 		break;
@@ -6619,9 +6631,10 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int cmd,
 		err = -ENOTTY;
 		break;
 	}
-
+#ifdef VERBOSE_LOG
 	if (process_init && (err == -EBUSY))
 		fastrpc_store_sessions_info(fl);
+#endif
 
 	if (process_init && !err)
 		err = fastrpc_device_create(fl);

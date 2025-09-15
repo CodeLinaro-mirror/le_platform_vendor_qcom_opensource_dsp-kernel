@@ -131,7 +131,9 @@ enum fastrpc_multimode_invoke_type {
 	FASTRPC_INVOKE_REMOTE_PROCESS_STATE_DUMP = 10,
 	FASTRPC_INVOKE_SET_RPC_TIMEOUT = 11,
 	FASTRPC_INVOKE_DISABLE_DSP_RECOVERY = 12,
+#ifdef VERBOSE_LOG
 	FASTRPC_INVOKE_RETRIEVE_KERNEL_LOG = 13,
+#endif
 };
 
 struct fastrpc_init_create {
@@ -247,6 +249,7 @@ struct fastrpc_internal_proc_timeout {
 	__u32 reserved[FASTRPC_RPC_TIMEOUT_IOCTL_RSVD];
 };
 
+#ifdef VERBOSE_LOG
 /* Payload for FASTRPC_INVOKE_KERNEL_LOG_RETRIEVE type */
 struct fastrpc_ioctl_kernel_log {
 	/*
@@ -257,6 +260,7 @@ struct fastrpc_ioctl_kernel_log {
 	/* Size of the buffer in bytes */
 	__u32 buffer_size;
 };
+#endif
 
 enum fastrpc_control_type {
 	FASTRPC_CONTROL_LATENCY		=	1,

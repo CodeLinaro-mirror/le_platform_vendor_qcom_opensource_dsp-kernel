@@ -317,6 +317,7 @@
 #define DBG_FS_SIZE (200*1024)
 #define NUM_DUMPED (128)
 
+#ifdef VERBOSE_LOG
 /*
  * Buffer size for storing session info used in verbose
  * logging during session exhaustion
@@ -328,6 +329,7 @@
  * later copied to user space for debugging.
  */
 #define LOG_BUF_SIZE (24*1024)
+#endif
 
 #define PERF_END ((void)0)
 
@@ -537,6 +539,7 @@ enum fastrpc_dump_type {
 	INIT_MEM = 2,
 };
 
+#ifdef VERBOSE_LOG
 /* To maintain the current state of the log buffer */
 enum fastrpc_log_buf_type {
 	/* Buffer is ready for writing */
@@ -546,6 +549,7 @@ enum fastrpc_log_buf_type {
 	/* Buffer write is completed; waiting for read */
 	LOG_BUF_STATE_COMPLETED = 2,
 };
+#endif
 
 struct fastrpc_dump_info{
 	/* Type of memory dumped */
@@ -861,12 +865,14 @@ struct heap_bufs {
 	unsigned int num;
 };
 
+#ifdef VERBOSE_LOG
 struct fastrpc_log_buf {
 	char *buffer;
 	int offset;
 	int pid;
 	atomic_t state;
 };
+#endif
 
 struct fastrpc_domain;
 
@@ -1227,7 +1233,9 @@ struct fastrpc_user {
 	struct list_head active_user_ssr;
 	struct kref refcount;
 	struct work_struct put_work;
+#ifdef VERBOSE_LOG
 	struct fastrpc_log_buf log_buf;
+#endif
 };
 
 struct fastrpc_ctrl_latency {

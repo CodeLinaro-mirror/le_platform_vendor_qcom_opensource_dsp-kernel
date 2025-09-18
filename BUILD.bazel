@@ -76,3 +76,7 @@ define_modules("x1p42100", "consolidate", "no")
 define_modules("art", "perf", "no")
 
 define_modules("art", "consolidate", "no")
+
+define_modules("chora", "perf", "no")
+
+define_modules("chora", "consolidate", "no")

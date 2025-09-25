@@ -7683,6 +7683,11 @@ void fastrpc_driver_unregister(struct fastrpc_driver *frpc_driver){
 	struct fastrpc_user *fl = NULL;
 	spinlock_t *glock = &g_frpc.glock;
 
+	if (!frpc_driver) {
+		pr_err("%s : invalid driver passed", __func__);
+		return;
+	}
+
 	spin_lock_irqsave(glock, irq_flags);
 	frpc_dev = (struct fastrpc_device *)frpc_driver->device;
 	if (!frpc_dev) {
@@ -7693,6 +7698,7 @@ void fastrpc_driver_unregister(struct fastrpc_driver *frpc_driver){
 
 	// If device is already closed, free the device
 	if (frpc_dev->dev_close) {
+		frpc_driver->device = NULL;
 		spin_unlock_irqrestore(glock, irq_flags);
 		kfree(frpc_dev);
 		pr_info("Un-registering fastrpc driver with handle 0x%x\n",

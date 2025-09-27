@@ -1,3 +1,5 @@
+FASTRPC_DLKM_ENABLED := true
+
 SOONG_CONFIG_qtidspplatform_hy11:= false
 SOONG_CONFIG_qtidspplatform_hy22:= false
 SOONG_CONFIG_qtidspplatform_hy33:= false

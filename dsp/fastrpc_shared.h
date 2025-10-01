@@ -214,6 +214,9 @@
 #define DSP_STATUS_UP true
 #define DSP_STATUS_DOWN false
 
+/* Maximum number of remote sessions allowed per channel */
+#define FASTRPC_MAX_SESS_PER_DOMAIN 32
+
 /*
  * Num of pages shared with process spawn call.
  *     Page 1 : init-mem buf
@@ -314,6 +317,18 @@
 #define DBG_FS_SIZE (200*1024)
 #define NUM_DUMPED (128)
 
+/*
+ * Buffer size for storing session info used in verbose
+ * logging during session exhaustion
+ */
+#define SESSION_BUF_SIZE (1*1024)
+
+/*
+ * Size of log buffer for storing formatted session information
+ * later copied to user space for debugging.
+ */
+#define LOG_BUF_SIZE (24*1024)
+
 #define PERF_END ((void)0)
 
 #define PERF(enb, cnt, ff) \
@@ -411,6 +426,15 @@
  */
 #define GENERATE_LOGICAL_DOMAIN_ID(type, counter) \
 	((type * 1000) + counter)
+
+/*
+ * Checks if a given PD type is dynamic. Dynamic PD types are:
+ *   - USERPD
+ *   - USER_UNSIGNEDPD_POOL
+ * @return true if the PD type is dynamic, false otherwise.
+ */
+#define IS_DYNAMIC_PD(pd_type) \
+	((pd_type == USERPD) || (pd_type == USER_UNSIGNEDPD_POOL))
 
 /*
  * Process types on remote subsystem
@@ -511,6 +535,16 @@ enum fastrpc_dump_type {
 	CMA = 0,
 	DEBUGFS = 1,
 	INIT_MEM = 2,
+};
+
+/* To maintain the current state of the log buffer */
+enum fastrpc_log_buf_type {
+	/* Buffer is ready for writing */
+	LOG_BUF_STATE_DEFAULT = 0,
+	/* Buffer is currently being written to */
+	LOG_BUF_STATE_UPDATING = 1,
+	/* Buffer write is completed; waiting for read */
+	LOG_BUF_STATE_COMPLETED = 2,
 };
 
 struct fastrpc_dump_info{
@@ -825,6 +859,13 @@ struct heap_bufs {
 	struct list_head list;
 	/* Number of bufs */
 	unsigned int num;
+};
+
+struct fastrpc_log_buf {
+	char *buffer;
+	int offset;
+	int pid;
+	atomic_t state;
 };
 
 struct fastrpc_domain;
@@ -1186,6 +1227,7 @@ struct fastrpc_user {
 	struct list_head active_user_ssr;
 	struct kref refcount;
 	struct work_struct put_work;
+	struct fastrpc_log_buf log_buf;
 };
 
 struct fastrpc_ctrl_latency {
@@ -1415,5 +1457,37 @@ void fastrpc_file_put(struct fastrpc_user *fl, bool worker);
  *			disabled, otherwise false.
  */
 bool fastrpc_is_device_crashing(struct fastrpc_channel_ctx *cctx);
+
+/*
+ * fastrpc_get_domain_pid_info - Retrieves process ID information for a domain
+ *
+ * This function returns a string containing the list of hlos pids of all
+ * apps which have an active remote session on the given domain.
+ *
+ * @param[in]  domain: Pointer to the fastrpc_domain structure
+ * @param[out] out_buf: Pointer to output buffer containing list
+ *                      of hlos pids.
+ *                      Caller expected to free this buffer.
+ * @param[out] len_written: Pointer to an integer where the length
+ *                          of the written string will be stored.
+ *
+ * @return 0 on success, or a negative error code on failure (e.g., -ENOMEM).
+ */
+int fastrpc_get_domain_pid_info(struct fastrpc_domain *domain, char **out_buf,
+	int *len_written);
+
+/*
+ * fastrpc_sysfs_notify_pids - Notify usersapce that pid-list sysfs file
+ *                             has been updated.
+ *
+ * This function will notify userspace that the pid-list sysfs
+ * file has changed, allowing any user-space applications that
+ * are monitoring the attribute to react accordingly.
+ *
+ * @param domain: Pointer to the fastrpc_domain structure
+ *
+ * @return: None
+ */
+void fastrpc_sysfs_notify_pids(struct fastrpc_domain *domain);
 
 #endif /* __FASTRPC_SHARED_H__ */

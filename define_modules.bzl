@@ -14,18 +14,18 @@ def define_modules(target, variant):
     kernel_build_variant = "{}_{}".format(target, variant)
 
     kernel_build = select({
-        "//build/kernel/kleaf:socrepo_true": "//soc-repo:{}_base_kernel".format(kernel_build_variant),
-        "//build/kernel/kleaf:socrepo_false": "//msm-kernel:{}".format(kernel_build_variant),
+        "//build/qcom_build_extensions:qtisocrepo_true": "//soc-repo:{}_base_kernel".format(kernel_build_variant),
+        "//build/qcom_build_extensions:qtisocrepo_false": "//msm-kernel:{}".format(kernel_build_variant),
     })
     ddk_deps = select({
-        "//build/kernel/kleaf:socrepo_true":[
+        "//build/qcom_build_extensions:qtisocrepo_true":[
             "//soc-repo:all_headers",
             "//soc-repo:{}/drivers/firmware/qcom/qcom-scm".format(kernel_build_variant),
             "//soc-repo:{}/drivers/soc/qcom/mem_buf/mem_buf_dev".format(kernel_build_variant),
             "//soc-repo:{}/drivers/soc/qcom/pdr_interface".format(kernel_build_variant),
             "//soc-repo:{}/drivers/rpmsg/qcom_glink".format(kernel_build_variant),
         ],
-        "//build/kernel/kleaf:socrepo_false": ["//msm-kernel:all_headers"],
+        "//build/qcom_build_extensions:qtisocrepo_false": ["//msm-kernel:all_headers"],
     })
 
     # Path to dsp folder from soc-repo/include/trace directory
@@ -70,18 +70,18 @@ def define_vm_modules(target, variant):
     kernel_build_variant = "{}_{}".format(target, variant)
 
     kernel_build = select({
-        "//build/kernel/kleaf:socrepo_true": "//soc-repo:{}_base_kernel".format(kernel_build_variant),
-        "//build/kernel/kleaf:socrepo_false": "//msm-kernel:{}".format(kernel_build_variant),
+        "//build/qcom_build_extensions:qtisocrepo_true": "//soc-repo:{}_base_kernel".format(kernel_build_variant),
+        "//build/qcom_build_extensions:qtisocrepo_false": "//msm-kernel:{}".format(kernel_build_variant),
     })
 
     deps = select({
-        "//build/kernel/kleaf:socrepo_true": [
+        "//build/qcom_build_extensions:qtisocrepo_true": [
             "//soc-repo:all_headers",
             "//soc-repo:{}/drivers/firmware/qcom/qcom-scm".format(kernel_build_variant),
             "//soc-repo:{}/drivers/soc/qcom/mem_buf/mem_buf_dev".format(kernel_build_variant),
             "//soc-repo:{}/drivers/dma-buf/heaps/qcom_dma_heaps".format(kernel_build_variant),
             ] ,
-        "//build/kernel/kleaf:socrepo_false": ["//msm-kernel:all_headers"],
+        "//build/qcom_build_extensions:qtisocrepo_false": ["//msm-kernel:all_headers"],
     })
 
     # Path to dsp folder from soc-repo/include/trace directory
@@ -123,4 +123,12 @@ def define_vm_modules(target, variant):
         wipe_dist_dir = False,
         allow_duplicate_filenames = False,
         mode_overrides = {"**/*": "644"},
+    )
+
+def define_target_modules():
+    # Creates a ddk_headers that exposes the FastRPC UAPI header with public visibility
+    ddk_headers(
+        name = "frpc_uapi_headers",
+        hdrs = native.glob(["include/uapi/misc/fastrpc.h"]),
+        visibility = ["//visibility:public"]
     )

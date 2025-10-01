@@ -29,7 +29,7 @@ int fastrpc_setup_service_locator(struct fastrpc_channel_ctx *cctx, char *client
 					char *service_name, char *service_path, int spd_session);
 void fastrpc_register_wakeup_source(struct device *dev,
 	const char *client_name, struct wakeup_source **device_wake_source);
-int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx, bool is_pdr);
+int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx);
 void fastrpc_queue_pd_status(struct fastrpc_user *fl, int domain, int status, int sessionid);
 void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 	struct list_head *active_users_list);
@@ -154,56 +154,6 @@ bail:
 }
 
 /*
- * Retrieves legacy information for a given fastrpc_domain.
- *
- * This function maps the domain's type to its corresponding legacy name
- * and ID, based on the following table:
- *
- *   Domain Type       | Legacy Name              | Legacy ID
- *   ------------------|--------------------------|---------------
- *   SDSP              | domains[SDSP_DOMAIN_ID]  | SDSP_DOMAIN_ID
- *   LPASS             | domains[ADSP_DOMAIN_ID]  | ADSP_DOMAIN_ID
- *   NSP(instance 0)   | domains[CDSP_DOMAIN_ID]  | CDSP_DOMAIN_ID
- *   NSP(instance 1)   | domains[CDSP1_DOMAIN_ID] | CDSP1_DOMAIN_ID
- *
- * @param domain Pointer to the fastrpc_domain structure to retrieve
- * legacy info
- *
- * @return 0 on success, or a negative error code on failure
- *
- * Error codes:
- *   -EINVAL: Invalid domain type
- */
-static int fastrpc_retrieve_legacy_info(struct fastrpc_domain *domain)
-{
-	int err = 0;
-
-	switch (domain->type) {
-	case FASTRPC_SDSP:
-		domain->legacy_name = (char *)legacy_domains[SDSP_DOMAIN_ID];
-		domain->legacy_id = SDSP_DOMAIN_ID;
-		break;
-	case FASTRPC_LPASS:
-		domain->legacy_name = (char *)legacy_domains[ADSP_DOMAIN_ID];
-		domain->legacy_id = ADSP_DOMAIN_ID;
-		break;
-	case FASTRPC_NSP:
-		if (domain->instance_id == 0) {
-			domain->legacy_name = (char *)legacy_domains[CDSP_DOMAIN_ID];
-			domain->legacy_id = CDSP_DOMAIN_ID;
-		} else if (domain->instance_id == 1) {
-			domain->legacy_name = (char *)legacy_domains[CDSP1_DOMAIN_ID];
-			domain->legacy_id = CDSP1_DOMAIN_ID;
-		}
-		break;
-	default:
-		err = -EINVAL;
-		break;
-	}
-	return err;
-}
-
-/*
  * Configures the service locator for a given fastrpc channel context.
  *
  * This function sets up the service locator for the specified domain type,
@@ -295,10 +245,6 @@ static int fastrpc_configure_device_nodes(struct fastrpc_channel_ctx *data,
 		return err;
 
 	if (domain->legacy) {
-		err = fastrpc_retrieve_legacy_info(domain);
-		if (err)
-			return err;
-
 		/* Register a secure device with legacy name */
 		err = fastrpc_device_register(rdev, data, true, true,
 			domain->legacy_name);
@@ -603,7 +549,7 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	dev_info(cctx->dev, "Closing rpmsg channel for %s", cctx->domain->name);
 	kfree(cctx->gidlist.gids);
 	of_platform_depopulate(&rpdev->dev);
-	fastrpc_mmap_remove_ssr(cctx, false);
+	fastrpc_mmap_remove_ssr(cctx);
 	cctx->dev = NULL;
 	cctx->rpdev = NULL;
 	cctx->domain = NULL;

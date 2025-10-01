@@ -7,7 +7,7 @@ package(
     ],
 )
 
-load(":define_modules.bzl", "define_modules", "define_vm_modules")
+load(":define_modules.bzl", "define_modules", "define_vm_modules", "define_target_modules")
 
 define_modules("pineapple", "consolidate")
 
@@ -61,6 +61,8 @@ define_modules("alor", "perf")
 
 define_modules("alor", "consolidate")
 
-define_modules("x1p42100", "perf")
+define_modules("x1e80100", "perf")
 
-define_modules("x1p42100", "consolidate")
+define_modules("x1e80100", "consolidate")
+
+define_target_modules()

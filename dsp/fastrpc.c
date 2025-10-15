@@ -2309,18 +2309,18 @@ static void fastrpc_wait_for_completion(struct fastrpc_invoke_ctx *ctx,
 	int err = 0, jj = 0;
 	bool wait_resp = false;
 	u32 wTimeout = FASTRPC_USER_EARLY_HINT_TIMEOUT;
-	u32 wakeTime = ctx->early_wake_time;
+	u32 wakeTime = 0;
 
 	do {
 		switch (ctx->rsp_flags) {
 		/* try polling on completion with timeout */
 		case USER_EARLY_SIGNAL:
-			/* try wait if completion time is less than timeout */
+			wakeTime = ctx->early_wake_time;
 			/* disable preempt to avoid context switch latency */
 			preempt_disable();
 			jj = 0;
 			wait_resp = false;
-			for (; wakeTime < wTimeout && jj < wTimeout; jj++) {
+			for (; jj < wakeTime && jj < wTimeout; jj++) {
 				wait_resp = try_wait_for_completion(&ctx->work);
 				if (wait_resp)
 					break;
@@ -7904,7 +7904,7 @@ static void fastrpc_notify_user_ctx(struct fastrpc_invoke_ctx *ctx, int retval,
 	case USER_EARLY_SIGNAL:
 		/* user hint of approximate time of completion */
 		ctx->early_wake_time = early_wake_time;
-		break;
+		fallthrough;
 	case EARLY_RESPONSE:
 		/* rpc framework early response with return value */
 		trace_fastrpc_msg("wakeup_task: begin");

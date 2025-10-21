@@ -103,5 +103,9 @@ define_modules("art16k", "perf", "no")
 
 define_modules("art16k", "consolidate", "no")
 
+define_modules("malabar", "consolidate", "no")
+
+define_modules("malabar", "perf", "no")
+
 define_target_modules()
 

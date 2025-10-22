@@ -338,7 +338,7 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 
 	err = fastrpc_populate_domain_from_dt(rdev, &domain);
 	if (err)
-		return err;
+		goto free_data;
 
 	err = fastrpc_init_privileged_gids(rdev, "qcom,fastrpc-gids", &data->gidlist);
 	if (err)
@@ -438,7 +438,9 @@ populate_error:
 	if (data->fdevice)
 		misc_deregister(&data->fdevice->miscdev);
 
+free_data:
 	kfree(data);
+
 	return err;
 }
 

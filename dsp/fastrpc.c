@@ -5983,7 +5983,7 @@ static int fastrpc_get_info_from_dsp(struct fastrpc_user *fl, uint32_t *dsp_attr
 	args[0].ptr = (u64)(uintptr_t)&dsp_attr_buf_len;
 	args[0].length = sizeof(dsp_attr_buf_len);
 	args[0].fd = -1;
-	args[1].ptr = (u64)(uintptr_t)&dsp_attr_buf[1];
+	args[1].ptr = (u64)(uintptr_t)&dsp_attr_buf[DSP_ATTR_OFFSET];
 	args[1].length = dsp_attr_buf_len * sizeof(uint32_t);
 	args[1].fd = -1;
 

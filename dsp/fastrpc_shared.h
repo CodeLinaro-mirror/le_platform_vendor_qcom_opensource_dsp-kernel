@@ -458,6 +458,12 @@
 /* Max RX version supported for fastrpc_ipcmsg */
 #define KERNEL_MAX_IPC_RX_VER (MAX_RX_DATATYPE_VAL - 1)
 
+/*
+ * Attribute buffer sent to DSP starts at index 1, not 0.
+ * Kernel attributes are offset by +1 to align with DSP attributes.
+ */
+#define DSP_ATTR_OFFSET (1)
+
 enum fastrpc_reserved_ctx {
 	/*
          * Process status notifications from DSP
@@ -519,13 +525,18 @@ enum fastrpc_process_method_ids {
 	FASTRPC_RMID_INIT_MAX,
 };
 
-/* Attributes for internal purposes. Clients cannot query these */
+/*
+ * Attributes for internal purposes. Clients cannot query these.
+ * Any additional attributes need to include DSP_ATTR_OFFSET.
+ * This macro hides the offset and ensures matching values
+ * on HLOS and DSP sides.
+ */
 enum fastrpc_internal_attributes {
 	/* DMA handle reverse RPC support */
-	DMA_HANDLE_REVERSE_RPC_CAP = 129,
-	ROOTPD_RPC_HEAP_SUPPORT = 132,
-	DBGLOGBUF_SUPPORT = 134,
-	FASTRPC_IPCMSG_SUPPORT = 135,
+	DMA_HANDLE_REVERSE_RPC_CAP  = 128 + DSP_ATTR_OFFSET,
+	ROOTPD_RPC_HEAP_SUPPORT     = 131 + DSP_ATTR_OFFSET,
+	DBGLOGBUF_SUPPORT           = 133 + DSP_ATTR_OFFSET,
+	FASTRPC_IPCMSG_SUPPORT      = 135 + DSP_ATTR_OFFSET,
 };
 
 enum fastrpc_remote_domains_id {

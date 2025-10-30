@@ -420,7 +420,7 @@ static void fastrpc_socket_callback_wq(struct work_struct *work)
 			cid = GET_CID_FROM_SERVER_INSTANCE(remote_server_instance);
 			fastrpc_handle_rpc_response(scctx,
 							msg.iov_base,
-							msg.iov_len,
+							bytes_rx,
 							false);
 		}
 	}

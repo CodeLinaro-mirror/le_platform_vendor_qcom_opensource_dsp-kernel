@@ -51,7 +51,7 @@ define_modules("monaco", "gki", "no")
 
 define_modules("parrot", "consolidate", "no")
 
-define_modules("parrot", "gki", "no")
+define_modules("parrot", "perf", "no")
 
 define_modules("canoe", "perf", "no")
 

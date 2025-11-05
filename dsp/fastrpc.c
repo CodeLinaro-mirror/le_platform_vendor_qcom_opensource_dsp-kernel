@@ -4937,9 +4937,14 @@ static int fastrpc_get_frpc_tgid(uint32_t domain, uint32_t session,
 			break;
 		}
 	}
-
+	/*
+	 * If no user-object is found for given remote session in the
+	 * current channel context's list, it means the channel has
+	 * gone thru SSR and the user-object was present in the previous
+	 * channel context's list.
+	 * */
 	if (!found)
-		err = -ESRCH;
+		err = -EPIPE;
 	fastrpc_channel_update_invoke_cnt(cctx, false);
 	spin_unlock_irqrestore(&cctx->lock, flags);
 bail:

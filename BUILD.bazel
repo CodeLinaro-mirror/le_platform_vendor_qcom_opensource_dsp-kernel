@@ -61,8 +61,8 @@ define_modules("alor", "perf")
 
 define_modules("alor", "consolidate")
 
-define_modules("x1e80100", "perf")
+define_modules("hamoa", "perf")
 
-define_modules("x1e80100", "consolidate")
+define_modules("hamoa", "consolidate")
 
 define_target_modules()

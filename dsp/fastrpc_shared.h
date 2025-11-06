@@ -791,6 +791,8 @@ struct fastrpc_map {
 	struct kref refcount;
 	int secure;
 	atomic_t state;
+	/* Retained IOVA address and size */
+	struct dma_iova_state iova_state;
 };
 
 struct fastrpc_perf {

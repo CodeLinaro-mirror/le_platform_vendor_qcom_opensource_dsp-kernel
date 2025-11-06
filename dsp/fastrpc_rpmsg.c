@@ -433,12 +433,12 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 fdev_error:
 	if (data->default_user)
 		fastrpc_channel_default_user_delete(data);
-	kfree(data);
 
 populate_error:
 	if (data->fdevice)
 		misc_deregister(&data->fdevice->miscdev);
 
+	kfree(data);
 	return err;
 }
 

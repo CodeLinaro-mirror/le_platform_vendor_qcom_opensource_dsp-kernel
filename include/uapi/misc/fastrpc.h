@@ -56,6 +56,33 @@ enum fastrpc_map_flags {
 	FASTRPC_MAP_MAX,
 };
 
+/**
+ * @enum fastrpc_map_attrs - attributes for mapping and unmapping
+ * memory on DSP user process
+ */
+enum fastrpc_map_attrs {
+	/** Default attribute for all map and unmap requests */
+	FASTRPC_MAP_ATTR_DEFAULT = 0,
+
+	/** Attribute for memory protection of buffers */
+	FASTRPC_ATTR_SECUREMAP = 1,
+
+	/** Attributes for buffers with no virtual address */
+	FASTRPC_ATTR_NOVA = 256,
+
+	/**
+	 * When set during buffer mapping, it reserves the IOVA region so it
+	 * remains reserved after unmapping also.
+	 * When set during unmapping, it removes only the IOMMU mapping while
+	 * keeping the IOVA reserved for future reuse during subsequent
+	 * mappings of the same buffer.
+	 */
+	FASTRPC_MAP_ATTR_RETAIN_IOVA = 1024,
+
+	/** Always keep this as the last member */
+	FASTRPC_MAP_ATTR_MAX,
+};
+
 /* Types of DSP available */
 enum fastrpc_dsp_type {
 	FASTRPC_NSP =  1,
@@ -82,10 +109,6 @@ enum fastrpc_proc_attr {
 	/* Macro for system unsigned PD */
 	FASTRPC_MODE_SYSTEM_UNSIGNED_PD	= 1 << 17,
 };
-
-/* Fastrpc attribute for memory protection of buffers */
-#define FASTRPC_ATTR_SECUREMAP	(1)
-#define FASTRPC_ATTR_NOVA		(256)
 
 struct fastrpc_invoke_args {
 	__u64 ptr;
@@ -186,7 +209,8 @@ struct fastrpc_mem_unmap {
 	__s32 fd;		/* fd */
 	__u64 vaddr;		/* remote process (dsp) virtual address */
 	__u64 length;		/* buffer size */
-	__s32 reserved[5];
+	__u32 attr;		/* Attributes for FD */
+	__s32 reserved[4];
 };
 
 /* Types of context manage requests */

@@ -1590,6 +1590,12 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 	outbufs = REMOTE_SCALARS_OUTBUFS(ctx->sc);
 	metalen = fastrpc_get_meta_size(ctx);
 	pkt_size = fastrpc_get_payload_size(ctx, metalen);
+	outbufslen = sizeof(struct fastrpc_remote_buf) * outbufs;
+	ctx->outbufs = kzalloc(outbufslen, GFP_KERNEL);
+	if (!ctx->outbufs) {
+		err = -ENOMEM;
+		goto bail;
+	}
 	if (!pkt_size) {
 		dev_err(dev, "invalid payload size for handle 0x%x, sc 0x%x\n",
 			ctx->handle, ctx->sc);
@@ -1688,6 +1694,11 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 			if (rlen < mlen)
 				goto bail;
 
+			if (i >= inbufs) {
+				int j = i - inbufs;
+				ctx->outbufs[j].buf.pv = args - ctx->olaps[oix].offset;
+				ctx->outbufs[j].buf.len = len;
+			}
 			rpra[i].buf.pv = args - ctx->olaps[oix].offset;
 			pages[i].addr = ctx->buf->phys -
 					ctx->olaps[oix].offset +
@@ -1741,13 +1752,6 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 		rpra[i].dma.len = ctx->args[i].length;
 		rpra[i].dma.offset = (u64) ctx->args[i].ptr;
 	}
-	outbufslen = sizeof(struct fastrpc_remote_buf) * outbufs;
-	ctx->outbufs = kzalloc(outbufslen, GFP_KERNEL);
-	if (!ctx->outbufs) {
-		err = -ENOMEM;
-		goto bail;
-	}
-	memcpy(ctx->outbufs, rpra + inbufs, outbufslen);
 
 bail:
 	if (err)
@@ -5137,13 +5141,8 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int cmd,
 		break;
 	}
 
-	if (process_init && !err) {
+	if (process_init && !err)
 		err = fastrpc_device_create(fl);
-		if (err)
-			atomic_set(&fl->state, DEFAULT_PROC_STATE);
-		else
-			atomic_set(&fl->state, DSP_CREATE_COMPLETE);
-	}
 
 	spin_lock_irqsave(&cctx->lock, flags);
 	fastrpc_channel_update_invoke_cnt(cctx, false);
@@ -5529,6 +5528,7 @@ static int fastrpc_device_create(struct fastrpc_user *fl)
 	frpc_dev->fl = fl;
 	frpc_dev->handle = fl->tgid_frpc;
 	fl->device = frpc_dev;
+	atomic_set(&fl->state, DSP_CREATE_COMPLETE);
 	return err;
 }
 

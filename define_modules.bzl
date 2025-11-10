@@ -13,11 +13,17 @@ load(
 def define_modules(target, variant, build_loader):
     kernel_build_variant = "{}_{}".format(target, variant)
     data = [
-        ":{}_frpc-adsprpc".format(kernel_build_variant),]
-    if build_loader == "yes":
-        data += [
-        ":{}_cdsp-loader".format(kernel_build_variant),
-        ]
+        ":{}_frpc-adsprpc".format(kernel_build_variant),
+    ]
+
+    should_build_loader = build_loader == "yes"
+
+    if should_build_loader:
+        loader_target = ":{}_cdsp-loader".format(kernel_build_variant)
+        data += select({
+            "//build/kernel/kleaf:socrepo_true": [],
+            "//build/kernel/kleaf:socrepo_false": [loader_target],
+        })
 
     kernel_build = select({
         "//build/kernel/kleaf:socrepo_true": "//soc-repo:{}_base_kernel".format(kernel_build_variant),
@@ -60,12 +66,15 @@ def define_modules(target, variant, build_loader):
         ],
     )
 
-    if build_loader == "yes":
+    if should_build_loader:
         ddk_module(
             name = "{}_cdsp-loader".format(kernel_build_variant),
-            kernel_build = "//msm-kernel:{}".format(kernel_build_variant),
-            deps = ["//msm-kernel:all_headers"],
-            srcs = ["dsp/cdsp-loader.c"],
+            kernel_build = kernel_build,
+            deps = ddk_deps,
+            srcs = select({
+                "//build/kernel/kleaf:socrepo_true": [],
+                "//build/kernel/kleaf:socrepo_false": ["dsp/cdsp-loader.c"],
+            }),
             out = "cdsp-loader.ko",
         )
 

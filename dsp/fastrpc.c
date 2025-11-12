@@ -3346,7 +3346,7 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 	char *name;
 	int err = 0;
 	bool scm_done = false;
-	bool is_oispd = false, is_audiopd = false;
+	bool is_audiopd = false;
 	unsigned long flags;
 	struct {
 		int pgid;
@@ -3379,22 +3379,24 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 	fl->sctx = sctx;
 
 	smmucb = &fl->sctx->smmucb[DEFAULT_SMMU_IDX];
-	is_oispd = !strcmp(name, OISPD);
-	is_audiopd = !strcmp(name, AUDIOPD);
 
 	/*
 	 * Update the pd_type, to direct the messages to correct PD, when
 	 * fastrpc_getpd_msgidx is queried. Update pd_type only after session
 	 * allocation. Session is allocated based on user configured pd_type
 	 */
-	if (is_audiopd) {
+	if (!strcmp(name, AUDIOPD)) {
 		fl->pd_type = AUDIO_STATICPD;
 		fl->servloc_name = AUDIO_PDR_SERVICE_LOCATION_CLIENT_NAME;
 		fl->spd_id = AUDIO_STATIC_ID;
-	} else if (is_oispd) {
+		is_audiopd = true;
+	} else if (!strcmp(name, OISPD)) {
 		fl->pd_type = OIS_STATICPD;
 		fl->servloc_name = OIS_PDR_ADSP_SERVICE_LOCATION_CLIENT_NAME;
 		fl->spd_id = OIS_STATIC_ID;
+	} else if (!strcmp(name, ASCPD)) {
+		fl->pd_type = ASC_STATICPD;
+		fl->spd_id = ASC_STATIC_ID;
 	} else {
 		dev_err(smmucb->dev,
 		"Create static process is failed for proc_name %s", name);
@@ -3407,7 +3409,7 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 		goto err_name;
 	if (is_audiopd && IS_PDR(fl)) {
 		/*
-		 * Remove any previous mappings in case process is trying
+		 * Remove any previous remote heap mappings in case process is trying
 		 * to reconnect after a PD restart on remote subsystem.
 		 */
 		err = fastrpc_mmap_remove_ssr(fl->cctx, true);
@@ -3425,7 +3427,7 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 	inbuf.pageslen = 0;
 
 	// Remote heap feature is available only for audio static PD
-	if (!fl->cctx->staticpd_status && !is_oispd) {
+	if (!fl->cctx->staticpd_status && is_audiopd) {
 		inbuf.pageslen = 1;
 		err = fastrpc_buf_alloc(fl, NULL, init.memlen, REMOTEHEAP_BUF, &buf);
 		if (err)

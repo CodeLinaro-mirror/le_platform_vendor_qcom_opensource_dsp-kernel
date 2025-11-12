@@ -321,6 +321,7 @@
 #define AUDIOPD      "audiopd"
 #define SENSORSPD     "sensorspd"
 #define OISPD        "oispd"
+#define ASCPD        "ascpd"
 
 #define AUDIO_PDR_SERVICE_LOCATION_CLIENT_NAME   AUDIOPD
 #define AUDIO_PDR_ADSP_SERVICE_NAME              "avs/audio"
@@ -492,7 +493,7 @@ enum fastrpc_reserved_ctx {
 
 /*
  * Pool types on remote subsystem
- * Always add new pool types at the end, before POOL_MAX_PD_TYPE
+ * Always add new pool types at the end, before MAX_PD_TYPE
  */
 enum fastrpc_cb_pd_types {
 	DEFAULT_UNUSED            = 0,  /* PD type not configured for context banks */
@@ -506,6 +507,7 @@ enum fastrpc_cb_pd_types {
 	GUEST_OS_SHARED           = 8,  /* Legacy Guest OS Shared */
 	USER_UNSIGNEDPD_POOL      = 9,  /* DSP User Dynamic Unsigned PD pool */
 	EXT_MAP_PD_TYPE           = 10, /* DSP extended mapping */
+	ASC_STATICPD              = 11, /* ADSP Camera static ASC PD */
 	MAX_PD_TYPE,                    /* Max PD type */
 };
 
@@ -518,6 +520,7 @@ enum static_process_type {
 	AUDIO_STATIC_ID = 1,
 	SENSORS_STATIC_ID = 2,
 	OIS_STATIC_ID = 3,
+	ASC_STATIC_ID = 4,
 	INVALID_STATIC_ID = -1,
 };
 

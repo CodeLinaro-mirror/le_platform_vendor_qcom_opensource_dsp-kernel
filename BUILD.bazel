@@ -7,7 +7,7 @@ package(
     ],
 )
 
-load(":define_modules.bzl", "define_modules", "define_vm_modules")
+load(":define_modules.bzl", "define_modules", "define_vm_modules", "define_target_modules")
 
 define_modules("pineapple", "consolidate", "no")
 
@@ -88,3 +88,10 @@ define_modules("art", "consolidate", "no")
 define_modules("chora", "perf", "no")
 
 define_modules("chora", "consolidate", "no")
+
+define_modules("hamoa", "perf", "no")
+
+define_modules("hamoa", "consolidate", "no")
+
+define_target_modules()
+

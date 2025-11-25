@@ -228,6 +228,7 @@
 
 #define FASTRPC_CREATE_PROCESS_NARGS	6
 #define FASTRPC_CREATE_STATIC_PROCESS_NARGS	3
+#define FASTRPC_INIT_ATTACH2_NARGS 3
 
 /* DSP status macros */
 #define DSP_STATUS_UP true
@@ -243,11 +244,19 @@
  *     Page 3 : rootheap buf
  *     Page 4 : proc_init shared buf
  *     Page 5 : map debug log buf
+ *     Page 6 : preload buf
  */
 #define NUM_PAGES_WITH_SHARED_BUF 2
 #define NUM_PAGES_WITH_ROOTHEAP_BUF 3
 #define NUM_PAGES_WITH_PROC_INIT_SHAREDBUF 4
 #define NUM_PAGES_WITH_MAP_DEBUG_BUF 5
+#define NUM_PAGES_WITH_PRELOAD_BUF 7
+
+/*
+ * Num of pages shared with init attach 2 call
+ * Page 1 : Preload buf
+ */
+#define ATTACH2_NUM_PAGES_WITH_PRELOAD_BUF 1
 
 #define miscdev_to_fdevice(d) container_of(d, struct fastrpc_device_node, miscdev)
 
@@ -272,6 +281,9 @@
 /* Default root heap buffer size and count */
 #define FASTRPC_DEFAULT_ROOTHEAP_BUF_SIZE (0x140000)
 #define FASTRPC_DEFAULT_ROOTHEAP_BUF_COUNT (3)
+
+/* Default buffer size for preload memory */
+#define FASTRPC_DEFAULT_PRELOAD_BUF_SIZE (0x500000)
 
 /* Position of priority in frpc tid for glink msg packet */
 #define PRIORITY_POS_IN_FRPC_TID 26
@@ -557,6 +569,7 @@ enum fastrpc_internal_attributes {
 	ROOTPD_RPC_HEAP_SUPPORT     = 131 + DSP_ATTR_OFFSET,
 	DBGLOGBUF_SUPPORT           = 133 + DSP_ATTR_OFFSET,
 	FASTRPC_IPCMSG_SUPPORT      = 135 + DSP_ATTR_OFFSET,
+	FASTRPC_PRELOAD_SUPPORT     = 142 + DSP_ATTR_OFFSET,
 };
 
 enum fastrpc_remote_domains_id {
@@ -581,6 +594,8 @@ enum fastrpc_remote_domains_id {
 	ROOT_MEM_BUF,
 	/* Buffer to log DSP map/unmap debug info*/
 	MAP_DEBUG_BUF,
+	/* Buffer donated to rootpd for preload */
+	ROOT_PRELOAD_BUF
 };
 
 /* Types of RPC calls to DSP */
@@ -1176,6 +1191,9 @@ struct fastrpc_channel_ctx {
 	unsigned int rootheap_buf_count;
 	/* Completion object for the threads to wait for device to crash */
 	struct completion rpmsg_remove_start;
+	/* Buffer donated for preloading operations */
+	struct fastrpc_buf *preload_buf;
+
 };
 
 struct fastrpc_ssr_handler {

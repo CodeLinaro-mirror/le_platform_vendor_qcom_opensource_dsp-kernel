@@ -3540,6 +3540,126 @@ static int fastrpc_get_root_session(struct fastrpc_channel_ctx *cctx,
 	return err;
 }
 
+
+/**
+ * fastrpc_alloc_root_session_buf() - Allocate buffer using root PD session
+ *
+ * @cctx: Channel context pointer
+ * @obuf: Output pointer to allocated buffer
+ * @size: Size of buffer to allocate
+ * @buf_type: Type of buffer to allocate
+ *
+ * This function allocates a buffer using the context bank/session reserved
+ * for root PD. It retrieves the root session from the channel context and
+ * uses it to allocate the requested buffer.
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+static int fastrpc_alloc_root_session_buf(
+	struct fastrpc_channel_ctx *cctx,
+	struct fastrpc_buf **obuf, u64 size, u32 buf_type)
+{
+	struct fastrpc_buf *buf = NULL;
+	struct fastrpc_pool_ctx *sess = NULL;
+	struct fastrpc_smmu *smmucb = NULL;
+	int err = 0;
+
+	/* Get context bank / session reserved for rootPD */
+	err = fastrpc_get_root_session(cctx, &sess);
+	if (err)
+		goto bail;
+
+	smmucb = &sess->smmucb[DEFAULT_SMMU_IDX];
+	err = __fastrpc_buf_alloc(NULL, smmucb, cctx->domain_id, size, &buf,
+				 buf_type);
+	if (err)
+		goto bail;
+	*obuf = buf;
+
+bail:
+	if (err) {
+		dev_err(cctx->dev,
+			"Error 0x%x: %s: failed to allocate buffer domain id %u size 0x%llx type %d\n",
+			err, __func__, cctx->domain_id, size, buf_type);
+	}
+	return err;
+}
+
+/**
+ * fastrpc_preload_mem_free() - Free preloaded memory buffer for a channel
+ *
+ * @cctx: Pointer to the fastrpc channel context
+ *
+ * This function frees the preloaded memory buffer associated with the given
+ * channel context. It safely releases the buffer under spinlock protection
+ * with interrupts disabled to prevent race conditions.
+ *
+ * Context: Can be called from any context. Disables interrupts internally.
+ */
+static void fastrpc_preload_mem_free(struct fastrpc_channel_ctx *cctx)
+{
+	unsigned long flags = 0;
+
+	if (!cctx->preload_buf)
+		return;
+	spin_lock_irqsave(&cctx->lock, flags);
+	__fastrpc_buf_free(cctx->preload_buf);
+	cctx->preload_buf = NULL;
+	spin_unlock_irqrestore(&cctx->lock, flags);
+}
+
+/**
+ * fastrpc_preload_mem_alloc() - Allocate preload memory buffer for DSP
+ * @cctx: Pointer to the FastRPC channel context
+ * @pages: Array of physical page descriptors to be populated
+ * @pageslen: Pointer to the length of pages array, updated on success
+ * @page_idx: Current index in the pages array
+ *
+ * This function allocates a preload memory buffer for the DSP if preload
+ * support is enabled and the buffer doesn't already exist. The buffer is
+ * allocated as a root session buffer and stored in the channel context.
+ * Thread-safe allocation is ensured using spinlocks to prevent race
+ * conditions. On success, the physical address and size of the buffer
+ * are stored in the pages array at the specified index.
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+static int fastrpc_preload_mem_alloc(struct fastrpc_channel_ctx *cctx,
+	struct fastrpc_phy_page *pages, u32 *pageslen, u32 page_num)
+{
+	int err = 0;
+	unsigned long flags = 0;
+	struct fastrpc_buf *buf = NULL;
+
+
+	if (!cctx->dsp_attributes[FASTRPC_PRELOAD_SUPPORT])
+		return err;
+
+	if (!cctx->preload_buf) {
+		err = fastrpc_alloc_root_session_buf(cctx, &buf,
+						     FASTRPC_DEFAULT_PRELOAD_BUF_SIZE,
+						     ROOT_PRELOAD_BUF);
+		if (err)
+			goto bail;
+	}
+
+	spin_lock_irqsave(&cctx->lock, flags);
+	if (!cctx->preload_buf) {
+		cctx->preload_buf = buf;
+	} else {
+		if (buf)
+			__fastrpc_buf_free(buf);
+		buf = cctx->preload_buf;
+	}
+	spin_unlock_irqrestore(&cctx->lock, flags);
+	*pageslen = page_num;
+	pages[page_num-1].addr = buf->phys;
+	pages[page_num-1].size = buf->size;
+
+bail:
+	return err;
+}
+
 /*
  * Allocate buffer for growing rootheap on DSP
  * @arg1: channel context.
@@ -3552,8 +3672,6 @@ static int fastrpc_alloc_rootheap_buf(struct fastrpc_channel_ctx *cctx,
 	struct fastrpc_phy_page *pages, u32 *pageslen)
 {
 	struct fastrpc_buf *buf = NULL;
-	struct fastrpc_pool_ctx *sess = NULL;
-	struct fastrpc_smmu *smmucb = NULL;
 	int err = 0;
 	unsigned long flags = 0;
 	const unsigned int ROOTHEAP_BUF_SIZE =
@@ -3568,14 +3686,10 @@ static int fastrpc_alloc_rootheap_buf(struct fastrpc_channel_ctx *cctx,
 		cctx->rootheap_bufs.num >= NUM_ROOTHEAP_BUFS)
 		return err;
 
-	/* Get context bank / session reserved for rootPD */
-	err = fastrpc_get_root_session(cctx, &sess);
-	if (err)
-		goto bail;
-
-	smmucb = &sess->smmucb[DEFAULT_SMMU_IDX];
-	err = __fastrpc_buf_alloc(NULL, smmucb, cctx->domain_id,
-				ROOTHEAP_BUF_SIZE, &buf, ROOTHEAP_BUF);
+	/* Allocate buffer from context bank / session reserved for rootPD */
+	err = fastrpc_alloc_root_session_buf(cctx, &buf,
+						ROOTHEAP_BUF_SIZE,
+						ROOTHEAP_BUF);
 	if (err)
 		goto bail;
 
@@ -3732,7 +3846,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	struct fastrpc_init_create init;
 	struct fastrpc_invoke_args args[FASTRPC_CREATE_PROCESS_NARGS] = {0};
 	struct fastrpc_enhanced_invoke ioctl;
-	struct fastrpc_phy_page pages[NUM_PAGES_WITH_MAP_DEBUG_BUF] = {0};
+	struct fastrpc_phy_page pages[NUM_PAGES_WITH_PRELOAD_BUF] = {0};
 	struct fastrpc_map *configmap = NULL;
 	struct fastrpc_buf *imem = NULL;
 	struct fastrpc_pool_ctx *sctx = NULL;
@@ -3873,6 +3987,11 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 			inbuf.pageslen = NUM_PAGES_WITH_MAP_DEBUG_BUF;
 		}
 	}
+
+	err = fastrpc_preload_mem_alloc(fl->cctx, pages, &inbuf.pageslen, NUM_PAGES_WITH_PRELOAD_BUF);
+	if(err)
+		dev_err(fl->cctx->dev, "Error 0x%x: %s: Failed to allocate preload buffer\n",
+				err, __func__);
 
 	fl->init_mem = imem;
 	args[0].ptr = (u64)(uintptr_t)&inbuf;
@@ -4659,15 +4778,17 @@ static int fastrpc_init_attach(struct fastrpc_user *fl, int pd)
 static int fastrpc_init_attach2(struct fastrpc_user *fl, int pd,
 				char __user *argp)
 {
-	struct fastrpc_invoke_args args[2] = {0};
+	struct fastrpc_invoke_args args[FASTRPC_INIT_ATTACH2_NARGS] = {0};
 	struct fastrpc_enhanced_invoke ioctl = {0};
 	struct fastrpc_ioctl_init_attach2 attach = {0};
+	struct fastrpc_phy_page pages[ATTACH2_NUM_PAGES_WITH_PRELOAD_BUF] = {0};
 	int err = 0;
 	void *file = NULL;
 
 	struct {
 		int pgid;
 		u32 filelen;
+		u32 pageslen;
 	} inbuf;
 
 	err = fastrpc_init_attach_common(fl, pd);
@@ -4695,9 +4816,18 @@ static int fastrpc_init_attach2(struct fastrpc_user *fl, int pd,
 		goto err_out;
 	}
 
+	/* Allocate memory for preloading and pack it as page for sharing */
+	err = fastrpc_preload_mem_alloc(fl->cctx, pages, &inbuf.pageslen,
+					ATTACH2_NUM_PAGES_WITH_PRELOAD_BUF);
+	if(err) {
+		dev_err(fl->cctx->dev, "Error 0x%x: %s: Failed to allocate preload buffer\n",
+				err, __func__);
+		goto err_out;
+	}
+
 	/*
-	 * As part of attach2, pack tgid and shell file
-	 * to share with DSP.
+	 * As part of attach2, pack tgid, shell file
+	 * and memory to share with DSP.
 	 */
 	inbuf.pgid = fl->tgid_frpc;
 	inbuf.filelen = attach.filelen;
@@ -4710,9 +4840,13 @@ static int fastrpc_init_attach2(struct fastrpc_user *fl, int pd,
 	args[1].length = inbuf.filelen;
 	args[1].fd = attach.filefd;
 
+	args[2].ptr = (u64)(uintptr_t) pages;
+	args[2].length = inbuf.pageslen * sizeof(*pages);
+	args[2].fd = -1;
+
 	ioctl.inv.handle = FASTRPC_INIT_HANDLE;
 	ioctl.inv.sc = FASTRPC_SCALARS(FASTRPC_RMID_INIT_ATTACH2,
-					2, 0);
+					3, 0);
 	ioctl.inv.args = (__u64)args;
 
 	err = fastrpc_internal_invoke(fl, KERNEL_MSG_WITH_ZERO_PID,
@@ -8339,8 +8473,10 @@ static int fastrpc_cb_remove(struct platform_device *pdev)
 	unsigned long flags;
 	int i = 0, j = 0;
 
-	if (sess->pd_type == ROOT_PD)
+	if (sess->pd_type == ROOT_PD) {
 		fastrpc_rootheap_buf_list_free(cctx);
+		fastrpc_preload_mem_free(cctx);
+	}
 
 	spin_lock_irqsave(&cctx->lock, flags);
 	for (i = 0; i < FASTRPC_MAX_SESSIONS; i++) {

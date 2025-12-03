@@ -139,6 +139,12 @@ void ssr_timer_callback(struct timer_list *timer)
 
 	ssr_handler->domain_id = cctx->domain_id;
 
+	if (ctx->fl && cctx->domain)
+		pr_info("%s: Hang in process caused %s SSR by process %s, pid %d,"
+				"pid_frpc %d, tid %d, handle 0x%x, sc 0x%x\n",
+			__func__, cctx->domain->name, ctx->fl->name, ctx->fl->tgid_app,
+			ctx->fl->tgid_frpc, ctx->pid, ctx->handle, ctx->sc);
+
 	spin_unlock_irqrestore(&cctx->lock, flags);
 	fastrpc_channel_ctx_put(cctx);
 

@@ -65,4 +65,16 @@ define_modules("hamoa", "perf")
 
 define_modules("hamoa", "consolidate")
 
+define_modules("chora", "perf")
+
+define_modules("chora", "consolidate")
+
+define_modules("alor-le", "debug-defconfig")
+
+define_modules("alor-le", "defconfig")
+
+define_modules("malabar", "consolidate")
+
+define_modules("malabar", "perf")
+
 define_target_modules()

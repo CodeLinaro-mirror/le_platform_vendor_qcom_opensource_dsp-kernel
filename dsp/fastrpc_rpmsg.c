@@ -100,6 +100,7 @@ void ssr_timer_callback(struct timer_list *timer)
 	}
 
 	cctx = ctx->fl->cctx;
+	ctx->fl->is_faulted = true;
 	if (!cctx) {
 		pr_err("Error: %s channel ctx is null for handle 0x%x, sc 0x%x, pid %d, tid %d\n",
 			__func__, ctx->handle, ctx->sc, ctx->tgid, ctx->pid);

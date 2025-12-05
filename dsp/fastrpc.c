@@ -4112,6 +4112,7 @@ static int fastrpc_user_obj_create(struct file *filp,
 	fl->config.user_fd = -1;
 	fl->pd_type = DEFAULT_UNUSED;
 	fl->dsp_recovery = false;
+	fl->is_faulted = false;
 
 	if (filp) {
 		fl->tgid = fl->tgid_app = current->tgid;
@@ -4368,6 +4369,10 @@ void fastrpc_queue_pd_status(struct fastrpc_user *fl, int domain, int status, in
 	notif_rsp->status = status;
 	notif_rsp->domain = domain;
 	notif_rsp->session = sessionid;
+
+	if (status == FASTRPC_USERPD_EXCEPTION) {
+		fl->is_faulted = true;
+	}
 
 	spin_lock_irqsave(&fl->proc_state_notif.nqlock, flags);
 	list_add_tail(&notif_rsp->notifn, &fl->notif_queue);
@@ -7365,7 +7370,7 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 
 	list_for_each_entry_safe(user, n, active_users_list, active_user_ssr) {
 		total_size += DBG_FS_SIZE;
-		if (user->init_mem)
+		if (user->init_mem && user->is_faulted)
 			total_size += user->init_mem->size;
 	}
 
@@ -7419,7 +7424,7 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 			iter += 1;
 			offset += DBG_FS_SIZE;
 		}
-		if (user->init_mem) {
+		if (user->init_mem && user->is_faulted) {
 			if ((dump + total_size) - pos >= user->init_mem->size) {
 				memcpy(pos, user->init_mem->virt, user->init_mem->size);
 				populate_dump_metadata(&dinfo[iter], offset, user->init_mem->size,

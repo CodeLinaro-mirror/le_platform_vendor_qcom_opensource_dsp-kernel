@@ -1870,8 +1870,10 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 				dev_dbg(dev, "user passed non ion buffer size 0x%llx, mend 0x%llx mstart 0x%llx, sc 0x%x\n",
 					mlen, ctx->olaps[oix].mend, ctx->olaps[oix].mstart, ctx->sc);
 
-			if (rlen < mlen)
+			if (rlen < mlen) {
+				err = -EFAULT;
 				goto bail;
+			}
 
 			rpra[i].buf.pv = args - ctx->olaps[oix].offset;
 			pages[i].addr = ctx->buf->phys -
@@ -3645,8 +3647,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	}
 
 #ifdef CONFIG_DEBUG_FS
-	if (fl != NULL)
-		fastrpc_create_session_debugfs(fl);
+	fastrpc_create_session_debugfs(fl);
 #endif
 	/* remove buffer on success as no longer required */
 	if (fl->proc_init_sharedbuf) {
@@ -3882,10 +3883,23 @@ static int fastrpc_user_obj_free(struct fastrpc_user *user,
 		atomic_set(&fl->spd->is_attached, 0);
 
 	err = fastrpc_release_current_dsp_process(fl);
+
+	/*
+	 * Handle GLINK timeout during PD kill.
+	 * If SSR is active (shutdown started), wait for remote subsystem
+	 * to stop. Otherwise, trigger BUG_ON to prevent PD mapping
+	 * removal and avoid SMMU fault.
+	 */
 	if (err == -ETIMEDOUT) {
-		pr_err("%s failed with err %d for process %s (tgid %d, tgid_frpc %d)\n",
-			__func__, err, current->comm, fl->tgid_app, fl->tgid_frpc);
-		BUG_ON(1);
+		if (!cctx->startshutdown) {
+			pr_err("%s failed with err %d for process %s (tgid %d, tgid_frpc %d)\n",
+				__func__, err, current->comm, fl->tgid_app, fl->tgid_frpc);
+			BUG_ON(1);
+		} else if (!atomic_read(&cctx->teardown)) {
+			pr_info("%s process %s is waiting, err %d  (tgid %d, tgid_frpc %d)\n",
+			__func__, current->comm, err, fl->tgid_app, fl->tgid_frpc);
+			wait_for_completion(&cctx->rpmsg_remove_start);
+		}
 	}
 
 	/*
@@ -4692,7 +4706,7 @@ static int fastrpc_get_notif_response(
 	 */
 	if (legacy_domains) {
 		domain = fastrpc_lookup_domain_in_table(notif->domain, false);
-		if (domain->legacy)
+		if (domain && domain->legacy)
 			notif->domain = domain->legacy_id;
 	}
 
@@ -4773,9 +4787,6 @@ static int fastrpc_internal_control(struct fastrpc_user *fl,
 	struct fastrpc_channel_ctx *cctx = fl->cctx;
 	u32 latency = 0, cpu = 0;
 
-	if (!fl) {
-		return -EBADF;
-	}
 	if (!cp) {
 		return -EINVAL;
 	}
@@ -4937,9 +4948,14 @@ static int fastrpc_get_frpc_tgid(uint32_t domain, uint32_t session,
 			break;
 		}
 	}
-
+	/*
+	 * If no user-object is found for given remote session in the
+	 * current channel context's list, it means the channel has
+	 * gone thru SSR and the user-object was present in the previous
+	 * channel context's list.
+	 * */
 	if (!found)
-		err = -ESRCH;
+		err = -EPIPE;
 	fastrpc_channel_update_invoke_cnt(cctx, false);
 	spin_unlock_irqrestore(&cctx->lock, flags);
 bail:

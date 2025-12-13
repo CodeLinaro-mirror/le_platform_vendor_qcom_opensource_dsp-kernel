@@ -49,6 +49,8 @@ define_modules("monaco", "consolidate", "no")
 
 define_modules("monaco", "gki", "no")
 
+define_modules("monaco", "perf", "no")
+
 define_modules("parrot", "consolidate", "no")
 
 define_modules("parrot", "perf", "no")

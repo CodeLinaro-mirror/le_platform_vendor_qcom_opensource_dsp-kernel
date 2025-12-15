@@ -1630,6 +1630,19 @@ void fastrpc_file_put(struct fastrpc_user *fl, bool worker);
 bool fastrpc_is_device_crashing(struct fastrpc_channel_ctx *cctx);
 
 /*
+ * fastrpc_sysfs_notify_domain_event - Generate kernel uevent for domain
+ *                                      state changes
+ *
+ * Triggers a uevent on the dummy event attribute under /sys/kernel/fastrpc
+ * to notify userspace of potential domain state transitions (UP/DOWN events).
+ * Userspace watchers (e.g., fastrpc_sysfs_watcher) receive this notification
+ * and initiate re-enumeration of available domains in the sysfs tree.
+ *
+ * @return: None
+ */
+void fastrpc_sysfs_notify_domain_event(void);
+
+/*
  * fastrpc_get_domain_pid_info - Retrieves process ID information for a domain
  *
  * This function returns a string containing the list of hlos pids of all

@@ -8617,14 +8617,13 @@ static int fastrpc_init(void)
 	ret = platform_driver_register(&fastrpc_cb_driver);
 	if (ret < 0) {
 		pr_err("fastrpc: failed to register cb driver\n");
-		return ret;
+		goto platform_register_bail;
 	}
 
 	ret = fastrpc_transport_init();
 	if (ret < 0) {
 		pr_err("fastrpc: failed to register rpmsg driver\n");
-		platform_driver_unregister(&fastrpc_cb_driver);
-		return ret;
+		goto transport_init_bail;
 	}
 
 #if IS_ENABLED(CONFIG_QCOM_FASTRPC_TRUSTED)
@@ -8644,6 +8643,15 @@ static int fastrpc_init(void)
 	g_frpc.debugfs_root = debugfs_root;
 #endif
 	return 0;
+
+transport_init_bail:
+	platform_driver_unregister(&fastrpc_cb_driver);
+platform_register_bail:
+	fastrpc_sysfs_deregister_kset();
+	idr_destroy(&g_frpc.mdctx_idr);
+	mutex_destroy(&g_frpc.hmut);
+	mutex_destroy(&g_frpc.gmut);
+	return ret;
 }
 module_init(fastrpc_init);
 

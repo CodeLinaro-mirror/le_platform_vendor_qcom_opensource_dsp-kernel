@@ -33,6 +33,12 @@ define_vm_modules("canoe-oemvm", "debug-defconfig")
 define_vm_modules("canoe-tuivm", "defconfig")
 define_vm_modules("canoe-oemvm", "defconfig")
 
+define_vm_modules("art-tuivm", "debug-defconfig")
+define_vm_modules("art-oemvm", "debug-defconfig")
+
+define_vm_modules("art-tuivm", "defconfig")
+define_vm_modules("art-oemvm", "defconfig")
+
 define_modules("tuna", "consolidate", "no")
 
 define_modules("tuna", "perf", "no")

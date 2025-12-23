@@ -46,3 +46,9 @@ define_modules("lahaina", "consolidate", "no")
 define_modules("lahaina", "gki", "no")
 
 define_modules("lahaina", "perf", "no")
+
+define_modules("bengal", "consolidate", "no")
+
+define_modules("bengal", "gki", "no")
+
+define_modules("bengal", "perf", "no")

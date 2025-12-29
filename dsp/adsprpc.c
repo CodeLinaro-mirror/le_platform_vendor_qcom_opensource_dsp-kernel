@@ -260,6 +260,13 @@ enum fastrpc_remote_subsys_state {
 	SUBSYSTEM_UP,
 };
 
+/* Hibernation states */
+enum fastrpc_hibernation_state {
+	NORMAL_STATE = 0,
+	HIBERNATION_SUSPEND,
+	HIBERNATION_RESTORE,
+};
+
 #define PERF_END ((void)0)
 
 #define PERF(enb, cnt, ff) \
@@ -760,7 +767,7 @@ skip_buf_cache:
 			goto bail;
 		}
 		vmid = fl->apps->channel[cid].vmid;
-		if ((vmid) && (fl->apps->channel[cid].in_hib == 0)) {
+		if ((vmid) && (fl->apps->channel[cid].in_hib == NORMAL_STATE)) {
 			u64 src_perms = BIT(QCOM_SCM_VMID_HLOS)| BIT(vmid);
 			struct qcom_scm_vmperm dest_perms = {0};
 			int hyp_err = 0;
@@ -1057,7 +1064,7 @@ static void fastrpc_mmap_free(struct fastrpc_mmap *map, uint32_t flags)
 			sess = fl->sctx;
 
 		vmid = fl->apps->channel[cid].vmid;
-		if (vmid && map->phys && (me->channel[cid].in_hib == 0)) {
+		if (vmid && map->phys && (me->channel[cid].in_hib == NORMAL_STATE)) {
 			int hyp_err = 0;
 			u64 src_perms = BIT(QCOM_SCM_VMID_HLOS) | BIT(vmid);
 			struct qcom_scm_vmperm dst_perms = {0};
@@ -5176,7 +5183,7 @@ static int fastrpc_munmap_rh(uint64_t phys, size_t size,
 	struct secure_vm *rhvm = &me->channel[RH_CID].rhvm;
 
 	if ((rhvm->vmid)
-			&& (me->channel[RH_CID].in_hib == 0)) {
+			&& (me->channel[RH_CID].in_hib == NORMAL_STATE)) {
 		u64 src_perms = 0;
 		struct qcom_scm_vmperm dst_perms = {0};
 		uint32_t i = 0;
@@ -6423,6 +6430,7 @@ static int fastrpc_channel_open(struct fastrpc_file *fl, uint32_t flags)
 		return err;
 	}
 	cid = fl->cid;
+	me->channel[cid].in_hib = NORMAL_STATE;
 
 	err = fastrpc_wait_for_transport_interrupt(cid, flags);
 	if (err)
@@ -6459,7 +6467,6 @@ static int fastrpc_channel_open(struct fastrpc_file *fl, uint32_t flags)
 		me->channel[cid].prevssrcount =
 					me->channel[cid].ssrcount;
 	}
-	me->channel[cid].in_hib = 0;
 	mutex_unlock(&me->channel[cid].smd_mutex);
 
 bail:
@@ -7992,11 +7999,11 @@ static int fastrpc_restart_notifier_cb(struct notifier_block *nb,
 			"QCOM_SSR_BEFORE_POWERUP", "fastrpc_restart_notifier-enter");
 		pr_info("adsprpc: %s: subsystem %s is about to start\n",
 			__func__, gcinfo[cid].subsys);
-		if (cid == CDSP_DOMAIN_ID && dump_enabled() && ssrcount)
+		if (cid == CDSP_DOMAIN_ID && dump_enabled() && ssrcount && me->channel[cid].in_hib==NORMAL_STATE)
 			fastrpc_update_ramdump_status(cid);
 		fastrpc_notify_drivers(me, cid);
 		/* Skip ram dump collection in first boot */
-		if (cid == CDSP_DOMAIN_ID && dump_enabled() && ssrcount) {
+		if (cid == CDSP_DOMAIN_ID && dump_enabled() && ssrcount && me->channel[cid].in_hib==NORMAL_STATE) {
 			mutex_lock(&me->channel[cid].smd_mutex);
 			fastrpc_print_debug_data(cid);
 			mutex_unlock(&me->channel[cid].smd_mutex);
@@ -8631,11 +8638,15 @@ static struct notifier_block fastrpc_notif_block = {
 #ifdef CONFIG_PM_SLEEP
 static int fastrpc_hibernation_suspend(struct device *dev)
 {
+	struct fastrpc_apps *me = &gfa;
 	int err = 0;
+	int cid;
 
 	if (of_device_is_compatible(dev->of_node,
 					"qcom,msm-fastrpc-compute")) {
-		err = fastrpc_dsp_restart_handler(NULL, 0, true);
+		for (cid = 0; cid < NUM_CHANNELS; cid++)
+			me->channel[cid].in_hib = HIBERNATION_SUSPEND;
+		err = fastrpc_dsp_restart_handler(NULL, 0, false);
 		if (err)
 			ADSPRPC_WARN("failed to unmap remote heap (err %d)\n",
 					err);
@@ -8649,7 +8660,7 @@ static int fastrpc_restore(struct device *dev)
 
 	pr_info("adsprpc: restore enter\n");
 	for (cid = 0; cid < NUM_CHANNELS; cid++)
-		me->channel[cid].in_hib = 1;
+		me->channel[cid].in_hib = HIBERNATION_RESTORE;
 
 	pr_info("adsprpc: restore exit\n");
 	return 0;
@@ -9124,7 +9135,7 @@ static int __init fastrpc_device_init(void)
 		me->jobid[i] = 1;
 		me->channel[i].dev = me->secure_dev;
 		me->channel[i].ssrcount = 0;
-		me->channel[i].in_hib = 0;
+		me->channel[i].in_hib = NORMAL_STATE;
 		me->channel[i].prevssrcount = 0;
 		me->channel[i].subsystemstate = SUBSYSTEM_UP;
 		me->channel[i].rh_dump_dev = NULL;

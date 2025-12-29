@@ -69,6 +69,8 @@ define_modules("seraph", "consolidate", "yes")
 
 define_modules("seraph", "gki", "yes")
 
+define_modules("seraph", "perf", "yes")
+
 define_modules("vienna", "perf", "no")
 
 define_modules("vienna", "consolidate", "no")

@@ -1735,8 +1735,10 @@ map_retry:
 
 	if (retain_iova_attr) {
 		err = fastrpc_map_reserve_iova(smmucb, map);
-		if (err)
+		if (err) {
+			mutex_unlock(&smmucb->map_mutex);
 			goto assign_err;
+		}
 	} else if (attr & FASTRPC_ATTR_SECUREMAP) {
 		map->phys = sg_phys(map->table->sgl);
 		for_each_sg(map->table->sgl, sgl, map->table->nents,
@@ -1812,7 +1814,14 @@ map_err:
 attach_err:
 	dma_buf_put(map->buf);
 get_err:
-	kfree(map);
+	if (!retained_map) {
+		/*
+		 * If an fd that was previously mapped with the 'retain-iova'
+		 * attribute is being mapped again, it will already be part
+		 * of the list, so it cannot be freed.
+		 */
+		kfree(map);
+	}
 
 	return err;
 }

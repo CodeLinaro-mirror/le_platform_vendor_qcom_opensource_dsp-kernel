@@ -2309,7 +2309,7 @@ static int fastrpc_invoke_send(struct fastrpc_pool_ctx *sctx,
 	struct fastrpc_channel_ctx *cctx;
 	struct fastrpc_user *fl = ctx->fl;
 	struct fastrpc_msg *msg = &ctx->msg;
-	struct fastrpc_ipcmsg *ipcmsg = NULL;
+	struct fastrpc_ipcmsg ipcmsg = {0};
 	int ret;
 
 	cctx = fl->cctx;
@@ -2335,25 +2335,15 @@ static int fastrpc_invoke_send(struct fastrpc_pool_ctx *sctx,
 	 * payload. Priority is passed as part of the payload.
 	 */
 	if (fl->cctx->dsp_attributes[FASTRPC_IPCMSG_SUPPORT]) {
-		ipcmsg = kzalloc(sizeof(*ipcmsg), GFP_KERNEL);
-		if (!ipcmsg) {
-			dev_err(fl->cctx->dev,
-				"Error: %s: failed to allocate memory for msgv3 packet",
-				__func__);
-			return -ENOMEM;
-		}
-		ipcmsg->type = IPCMSG_TX_PRIORITY_REQ;
-		ipcmsg->payload.req.msg = *msg;
-		ipcmsg->payload.req.priority = priority;
-		ipcmsg->size = sizeof(ipcmsg->payload.req);
-		ret = fastrpc_transport_send(cctx, (void *)ipcmsg,
-			sizeof(*ipcmsg));
-		trace_fastrpc_transport_send_ipcmsg(ipcmsg->type, cctx->domain_id,
+		ipcmsg.type = IPCMSG_TX_PRIORITY_REQ;
+		ipcmsg.payload.req.msg = *msg;
+		ipcmsg.payload.req.priority = priority;
+		ipcmsg.size = sizeof(ipcmsg.payload.req);
+		ret = fastrpc_transport_send(cctx, (void *)&ipcmsg,
+			sizeof(ipcmsg));
+		trace_fastrpc_transport_send_ipcmsg(ipcmsg.type, cctx->domain_id,
 			(uint64_t)ctx, msg->ctx, msg->handle, msg->sc, msg->addr,
-			msg->size, ipcmsg->payload.req.priority);
-		/* Free the allocated ipcmsg struct */
-		if (ipcmsg)
-			kfree(ipcmsg);
+			msg->size, ipcmsg.payload.req.priority);
 	} else {
 		/*
 		 * If DSP does not support new fastrpc_ipcmsg struct,
@@ -3005,19 +2995,21 @@ int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx, bool is_pdr)
 
 /*
  * Function to get static PD for process trying to attach,
- * by comparing service locator
+ * by comparing fixed pid.
  */
 static int fastrpc_get_static_pd_session(struct fastrpc_user *fl, u32 *session)
 {
 	int i, err = 0;
+	struct fastrpc_static_pd *spd = NULL;
 
 	if (!fl)
 		return -EBADF;
 
 	for (i = 0; i < FASTRPC_MAX_SPD ; i++) {
-		if (!fl->cctx->spd[i].servloc_name)
+		spd = &fl->cctx->spd[i];
+		if (!spd->spd_id)
 			continue;
-		if (!strcmp(fl->servloc_name, fl->cctx->spd[i].servloc_name)) {
+		if (fl->spd_id == spd->spd_id) {
 			*session = i;
 			break;
 		}
@@ -3026,7 +3018,7 @@ static int fastrpc_get_static_pd_session(struct fastrpc_user *fl, u32 *session)
 	if (i >= FASTRPC_MAX_SPD)
 		return -EUSERS;
 
-	if (atomic_read(&fl->cctx->spd[i].ispdup) == 0)
+	if (spd && atomic_read(&spd->ispdup) == 0)
 		return -ENOTCONN;
 
 	return err;
@@ -3380,8 +3372,8 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 	fl->sctx = sctx;
 
 	smmucb = &fl->sctx->smmucb[DEFAULT_SMMU_IDX];
-	is_oispd = !strcmp(name, "oispd");
-	is_audiopd = !strcmp(name, "audiopd");
+	is_oispd = !strcmp(name, OISPD);
+	is_audiopd = !strcmp(name, AUDIOPD);
 
 	/*
 	 * Update the pd_type, to direct the messages to correct PD, when
@@ -3391,9 +3383,11 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 	if (is_audiopd) {
 		fl->pd_type = AUDIO_STATICPD;
 		fl->servloc_name = AUDIO_PDR_SERVICE_LOCATION_CLIENT_NAME;
+		fl->spd_id = AUDIO_STATIC_ID;
 	} else if (is_oispd) {
 		fl->pd_type = OIS_STATICPD;
 		fl->servloc_name = OIS_PDR_ADSP_SERVICE_LOCATION_CLIENT_NAME;
+		fl->spd_id = OIS_STATIC_ID;
 	} else {
 		dev_err(smmucb->dev,
 		"Create static process is failed for proc_name %s", name);
@@ -4536,6 +4530,8 @@ static int fastrpc_init_attach(struct fastrpc_user *fl, int pd)
 			fl->servloc_name = SENSORS_PDR_ADSP_SERVICE_LOCATION_CLIENT_NAME;
 		else if (fl->cctx->domain->type == FASTRPC_SDSP)
 			fl->servloc_name = SENSORS_PDR_SLPI_SERVICE_LOCATION_CLIENT_NAME;
+
+		fl->spd_id = SENSORS_STATIC_ID;
 
 		err = fastrpc_init_sensor_static_pd_status(fl);
 		if (err)
@@ -7523,18 +7519,170 @@ void fastrpc_notify_users(struct fastrpc_user *user)
 	spin_unlock(&user->lock);
 }
 
+
+/*
+ * fastrpc_notify_pdr_drivers() - Function to notify userspace on
+ * static PD down
+ * @arg1: channel context
+ * @arg2: name of the process to send the notification
+ */
 static void fastrpc_notify_pdr_drivers(struct fastrpc_channel_ctx *cctx,
-		char *servloc_name)
+	int pid)
 {
 	struct fastrpc_user *fl;
 	unsigned long flags;
+	int err = 0;
 
 	spin_lock_irqsave(&cctx->lock, flags);
 	list_for_each_entry(fl, &cctx->users, user) {
-		if (fl->servloc_name && !strcmp(servloc_name, fl->servloc_name))
+		err = fastrpc_file_get(fl);
+		if (err) {
+			dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
+				__func__, fl);
+			continue;
+		}
+		if (fl->spd_id == pid)
 			fastrpc_notify_users(fl);
+		fastrpc_file_put(fl, false);
 	}
 	spin_unlock_irqrestore(&cctx->lock, flags);
+}
+
+/*
+ * fastrpc_populate_static_pd_session() - Populate the static
+ * pd structure on PD up
+ * @arg1: channel context
+ * @arg2: pid of the process to populate
+ */
+static int fastrpc_populate_static_pd_session(struct fastrpc_channel_ctx *cctx,
+	int pid)
+{
+	int i = 0, err = 0;
+	unsigned long flags = 0;
+	struct fastrpc_static_pd *spd = NULL;
+
+	spin_lock_irqsave(&cctx->lock, flags);
+	// Re-use the session, if found to retain the pdr count
+	for (i = 0; i < FASTRPC_MAX_SPD; i++) {
+		if (cctx->spd[i].spd_id == pid)
+			break;
+	}
+	if (i < FASTRPC_MAX_SPD)
+		goto spd_session_found;
+	// Use un-used session to populate static PD
+	for (i = 0; i < FASTRPC_MAX_SPD; i++) {
+		if (cctx->spd[i].used)
+			continue;
+
+		break;
+	}
+	if (i >= FASTRPC_MAX_SPD) {
+		spin_unlock_irqrestore(&cctx->lock, flags);
+		return -EUSERS;
+	}
+
+spd_session_found:
+	spd = &cctx->spd[i];
+	spd->spd_id = pid;
+	spd->cctx = cctx;
+	atomic_set(&spd->ispdup, 1);
+	spd->used = true;
+
+	/* Ignore PDR callback */
+	atomic_set(&spd->spd_status_notif, 1);
+	spin_unlock_irqrestore(&cctx->lock, flags);
+	return err;
+}
+
+/*
+ * fastrpc_reset_staticpd_session() - Reset static PD variables on PD down
+ * @arg1: static pd structure
+ */
+static void fastrpc_reset_staticpd_session(struct fastrpc_static_pd *spd)
+{
+	struct fastrpc_channel_ctx *cctx = spd->cctx;
+
+	atomic_set(&spd->ispdup, 0);
+	atomic_set(&spd->is_attached, 0);
+
+	/*
+	 * Audio PD status tracked using variable staticpd_status.
+	 * Used for enabling remoteheap only for Audio PD.
+	 */
+	if (spd->spd_id == AUDIO_STATIC_ID)
+		cctx->staticpd_status = false;
+}
+
+/*
+ * get_static_id_from_pd_name() - Get pid of the static PD given the name
+ * @arg1: static pd name
+ */
+static int get_static_id_from_pd_name(char *name) {
+
+	if(!strncmp(name, AUDIOPD, strlen(AUDIOPD)))
+		return AUDIO_STATIC_ID;
+	else if(!strncmp(name, SENSORSPD, strlen(SENSORSPD)))
+		return SENSORS_STATIC_ID;
+	else if(!strncmp(name, OISPD, strlen(OISPD)))
+		return OIS_STATIC_ID;
+	else
+		return INVALID_STATIC_ID;
+}
+
+/*
+ * fastrpc_depopulate_static_pd_session() - De-populate the static pd structure on PD down
+ * @arg1: channel context
+ * @arg2: notif struct sent on PD down
+ */
+static int fastrpc_depopulate_static_pd_session(struct fastrpc_channel_ctx *cctx,
+	struct dsp_notif_rsp *notif)
+{
+	int i, err = 0;
+	unsigned long flags;
+
+	spin_lock_irqsave(&cctx->lock, flags);
+	for (i = 0; i < FASTRPC_MAX_SPD ; i++) {
+		if( cctx->spd[i].spd_id == notif->pid)
+			break;
+	}
+	if (i >= FASTRPC_MAX_SPD) {
+		spin_unlock_irqrestore(&cctx->lock, flags);
+		return -EUSERS;
+	}
+	fastrpc_reset_staticpd_session(&cctx->spd[i]);
+	spin_unlock_irqrestore(&cctx->lock, flags);
+	return err;
+}
+
+/*
+ * fastrpc_pdr_notif() - Function which handles static PD notification from DSP
+ * @arg1: channel context
+ * @arg2: notif struct sent on PD down
+ */
+static void fastrpc_pdr_notif(struct fastrpc_channel_ctx *cctx,
+	struct dsp_notif_rsp *notif)
+{
+
+	if (!cctx || !notif)
+		return;
+
+	switch (notif->status) {
+	case FASTRPC_USERPD_EXIT:
+		pr_info("%s: Static PD with pid %d is down for PDR on domain %d\n",
+			__func__, notif->pid, cctx->domain->id);
+		fastrpc_depopulate_static_pd_session(cctx, notif);
+		fastrpc_notify_pdr_drivers(cctx, notif->pid);
+		break;
+	case FASTRPC_USERPD_UP:
+		pr_info("%s: Static PD with pid %d is up for PDR on domain %d\n",
+			__func__, notif->pid, cctx->domain->id);
+		fastrpc_populate_static_pd_session(cctx, notif->pid);
+		break;
+	default:
+		pr_info("%s: Invalid status %d\n", __func__, notif->status);
+		break;
+	}
+	return;
 }
 
 static void fastrpc_pdr_cb(int state, char *service_path, void *priv)
@@ -7547,13 +7695,23 @@ static void fastrpc_pdr_cb(int state, char *service_path, void *priv)
 		return;
 
 	cctx = spd->cctx;
+
+	/*
+	 * Ignore PDR callback if internal static pd notif
+	 * mechanism is supported
+	 */
+	if (atomic_read(&spd->spd_status_notif))
+		return;
+
 	switch (state) {
 	case SERVREG_SERVICE_STATE_DOWN:
-		pr_info("fastrpc: %s: %s (%s) is down for PDR on %s\n",
-			__func__, spd->spdname,
+		pr_info("fastrpc: %s: %d (%s) is down for PDR on %s\n",
+			__func__, spd->spd_id,
 			spd->servloc_name,
 			cctx->domain->name);
 		spin_lock_irqsave(&cctx->lock, flags);
+		fastrpc_reset_staticpd_session(spd);
+
 		spd->pdrcount++;
 		atomic_set(&spd->ispdup, 0);
 		atomic_set(&spd->is_attached, 0);
@@ -7562,11 +7720,11 @@ static void fastrpc_pdr_cb(int state, char *service_path, void *priv)
 				AUDIO_PDR_SERVICE_LOCATION_CLIENT_NAME))
 			cctx->staticpd_status = false;
 
-		fastrpc_notify_pdr_drivers(cctx, spd->servloc_name);
+		fastrpc_notify_pdr_drivers(cctx, spd->spd_id);
 		break;
 	case SERVREG_SERVICE_STATE_UP:
-		pr_info("fastrpc: %s: %s (%s) is up for PDR on %s\n",
-			__func__, spd->spdname,
+		pr_info("fastrpc: %s: %d (%s) is up for PDR on %s\n",
+			__func__, spd->spd_id,
 			spd->servloc_name,
 			cctx->domain->name);
 		atomic_set(&spd->ispdup, 1);
@@ -8115,8 +8273,8 @@ int fastrpc_setup_service_locator(struct fastrpc_channel_ctx *cctx, char *client
 		goto bail;
 	}
 	cctx->spd[spd_session].pdrhandle = handle;
-	cctx->spd[spd_session].servloc_name = client_name;
-	cctx->spd[spd_session].spdname = service_path;
+	cctx->spd[spd_session].servloc_name = service_path;
+	cctx->spd[spd_session].spd_id = get_static_id_from_pd_name(client_name);
 	cctx->spd[spd_session].cctx = cctx;
 	service = pdr_add_lookup(handle, service_name, service_path);
 	if (IS_ERR(service)) {
@@ -8276,7 +8434,6 @@ static int fastrpc_handle_ipcmsg_rsp(struct fastrpc_channel_ctx *cctx,
 					payload_size, sizeof(err_rsp), version);
 			}
 			break;
-
 		default:
 			err = -EINVAL;
 			dev_err(cctx->dev,
@@ -8409,6 +8566,9 @@ int fastrpc_handle_rpc_response(struct fastrpc_channel_ctx *cctx,
 						cctx->domain_id, cctx, notif);
 				else
 					err = -ENOENT;
+			} else if (rspv2->ctx == FASTRPC_STATICPD_RSP_CTX) {
+				notif = &data->rsp3;
+				fastrpc_pdr_notif(cctx, notif);
 			} else {
 				err = fastrpc_handle_legacy_rsp(cctx,
 					(void *)(&data->rsp), false, is_glink_wakeup);
@@ -8439,15 +8599,8 @@ int fastrpc_handle_rpc_response(struct fastrpc_channel_ctx *cctx,
 			break;
 
 		/* fastrpc_ipcmsg response */
-		case SIZE_FASTRPC_IPCMSG:
-			err = fastrpc_handle_ipcmsg_rsp(cctx, &data->rsp5);
-			break;
-
 		default:
-			err = -EBADMSG;
-			dev_err(cctx->dev,
-				"Error %d: %s: Unsupported response packet size %d",
-				err, __func__, len);
+			err = fastrpc_handle_ipcmsg_rsp(cctx, &data->rsp5);
 			break;
 	}
 

@@ -285,12 +285,24 @@ static void __fastrpc_free_map(struct fastrpc_map *map)
 {
 	struct fastrpc_user *fl = NULL;
 	struct fastrpc_smmu *smmucb = NULL;
+	__maybe_unused bool iova_in_use = false;
+	bool retain_iova = false;
 
 	if (!map)
 		return;
 
 	fl = map->fl;
-	if (fl) {
+
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0))
+	iova_in_use = dma_use_iova(&map->iova_state);
+#endif
+	retain_iova = (map->attr == FASTRPC_MAP_ATTR_RETAIN_IOVA);
+
+	/*
+	 * If mapping is being removed but IOVA is retained, skip
+	 * removing corresponding entry from map-list.
+	 */
+	if (fl && !retain_iova) {
 		spin_lock(&map->fl->lock);
 		list_del(&map->node);
 		spin_unlock(&map->fl->lock);
@@ -328,14 +340,44 @@ static void __fastrpc_free_map(struct fastrpc_map *map)
 				mutex_unlock(&smmucb->map_mutex);
 				goto free_map;
 			}
-			__fastrpc_dma_map_free(map);
-			smmucb->allocatedbytes -= SMMU_ALIGN(map->size);
+
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0))
+			if (iova_in_use) {
+				if (map->phys) {
+					/*
+					 * Remove smmu mapping.
+					 * This does NOT release iova region.
+					 */
+					dma_iova_unlink(smmucb->dev, &map->iova_state,
+						0, map->size, DMA_BIDIRECTIONAL, 0);
+					map->phys = 0;
+				}
+
+				/*
+				 * If buffer is being unmapped without 'retain iova' attribute,
+				 * then release the iova region as well.
+				 */
+				if (!retain_iova)
+					dma_iova_free(smmucb->dev, &map->iova_state);
+			}
+#endif
+
+			if (map->buf) {
+				__fastrpc_dma_map_free(map);
+				map->buf = NULL;
+			}
+			if (!retain_iova) {
+				/* Do not update smmu device stats if iova region was retained */
+				smmucb->allocatedbytes -= SMMU_ALIGN(map->size);
+			}
+
 			mutex_unlock(&smmucb->map_mutex);
 		}
 	}
 
 free_map:
-	kfree(map);
+	if (!retain_iova)
+		kfree(map);
 }
 
 static void fastrpc_free_map(struct kref *ref)
@@ -363,52 +405,89 @@ static int fastrpc_map_get(struct fastrpc_map *map)
 
 static int fastrpc_map_lookup(struct fastrpc_user *fl, int fd,
 			    u64 va, u64 len, struct dma_buf *buf, int mflags,
-			    struct fastrpc_map **ppmap, bool take_ref)
+			    struct fastrpc_map **ppmap, bool take_ref,
+				uint32_t attrs)
 {
 	struct fastrpc_pool_ctx *sess = fl->sctx;
-	struct fastrpc_map *map = NULL;
+	struct fastrpc_map *map = NULL, *found = NULL;
 	int ret = -ENOENT;
+	bool buf_put_needed = false,
+		retained_map = (attrs == FASTRPC_MAP_ATTR_RETAIN_IOVA);
 
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(6,13,0))
+	if (retained_map)
+		return -EOPNOTSUPP;
+#endif
 	if (mflags == ADSP_MMAP_DMA_BUFFER) {
 		if (!buf)
-			return ret;
+			return -ENOENT;
 	} else {
 		/* Fetch DMA buffer from fd */
 		buf = dma_buf_get(fd);
 		if (IS_ERR(buf))
 			return PTR_ERR(buf);
+
+		buf_put_needed = true;
 	}
 
 	spin_lock(&fl->lock);
-		list_for_each_entry(map, &fl->maps, node) {
-			/*
-			 * Retrieve the map if the DMA buffer and fd match. For
-			 * duplicated fds with the same DMA buffer, create separate
-			 * maps for each duplicated fd.
-			 */
-			if (map->buf == buf && map->fd == fd)
-				goto map_found;
+	list_for_each_entry(map, &fl->maps, node) {
+		/*
+		 * For regular map, multiple fd's can point to same dma-buf.
+		 * Create separate mapping for each duplicated fd.
+		 *
+		 * For map with 'retain-iova' attribute, client can request
+		 * to map the same fd which is now pointing to a different
+		 * dma-buf. So skip the dma-buf check.
+		 */
+		if (map->fd == fd && (retained_map || map->buf == buf)) {
+			found = map;
+			ret = 0;
+			break;
 		}
-	goto error;
+	}
 
-map_found:
-	if (take_ref) {
+	if (!found)
+		goto bail;
+
+	/*
+	 * Validate that the found map has same attributes as the one passed
+	 * by user. In case of 'retain-iova' attribute, also validate that
+	 * the current ref-count of map has been reset to 0.
+	 */
+	if (found->attr != attrs ||
+		(retained_map && (kref_read(&map->refcount) != 0))) {
+		found = NULL;
+		ret = -EBADFD;
+	}
+
+	/*
+	 * For buffers with 'retain-iova' attribute, refcount can be only
+	 * 1 or 0 i.e. only 1 mapping request can be made.
+	 * For all other attributes, multiple mapping requests can be made on
+	 * the same buffer, and its ref-count will be incremented in
+	 * subsequent requests.
+	 */
+	if (take_ref && !retained_map) {
 		ret = fastrpc_map_get(map);
 		if (ret) {
 			dev_dbg(sess->smmucb[DEFAULT_SMMU_IDX].dev,
 				"%s: Failed to get map fd=%d ret=%d\n",
 				__func__, fd, ret);
-				goto error;
+			found = NULL;
+			ret = -ENOENT;
 		}
 	}
-	*ppmap = map;
-	ret = 0;
-
-error:
+bail:
 	spin_unlock(&fl->lock);
-	/* Drop the DMA buf ref except for the DMA bus driver */
-	if (mflags != ADSP_MMAP_DMA_BUFFER)
+
+	/* Drop the DMA buf ref */
+	if (buf_put_needed)
 		dma_buf_put(buf);
+
+	if (!ret)
+		*ppmap = found;
+
 	return ret;
 }
 
@@ -1406,6 +1485,104 @@ static int set_buffer_secure_type(struct fastrpc_map *map)
 	return err;
 }
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0))
+/**
+ * fastrpc_map_reserve_iova() -
+ * Function to reserve iova region first (or use previously
+ * reserved region for same buffer) and map each SGL entry of dma
+ * buffer to that iova region.
+ * @arg1: SMMU context bank
+ * @arg2: FastRPC map structure
+ *
+ * Return: Returns 0 on Success, error code on failure
+ */
+
+static int fastrpc_map_reserve_iova(struct fastrpc_smmu *smmucb,
+		struct fastrpc_map *map)
+{
+	struct scatterlist *sgl = NULL;
+	int err = 0, sgl_index = 0;
+	bool iova_reserved = false;
+	size_t offset = 0;
+
+	/* Compute the total size of all SGL entries of buffer */
+	for_each_sgtable_sg(map->table, sgl, sgl_index)
+		map->size += sgl->length;
+
+	if (map->size < map->len) {
+		err = -EBADF;
+		dev_err(smmucb->dev,
+		"Error: %s: passed dma buffer size %llu mismatch with actual size %llu for fd %d\n",
+		__func__, map->len, map->size, map->fd);
+		goto iova_reserve_err;
+	}
+
+	/* Check if map has an iova region reserved already */
+	if (!dma_use_iova(&map->iova_state)) {
+		/*
+		 * If no iova region reserved, then reserve a
+		 * new region of buffer's size.
+		 */
+		iova_reserved = dma_iova_try_alloc(smmucb->dev,
+						&(map->iova_state),
+						0, map->size);
+		if (!iova_reserved) {
+			err = -ENOMEM;
+			goto iova_reserve_err;
+		}
+	}
+
+	sgl_index = 0;
+	for_each_sgtable_sg(map->table, sgl, sgl_index) {
+		/*
+		 * Create smmu mapping of each SGL entry of the dma buffer at
+		 * appropriate offsets within the reserved iova region.
+		 */
+		err = dma_iova_link(smmucb->dev, &map->iova_state,
+				sg_phys(sgl), offset,
+				sgl->length, DMA_BIDIRECTIONAL, 0);
+		if (err) {
+			dev_err(smmucb->dev,
+			"Error %d: %s: dma_iova_link failed for fd %d, sgl phys 0x%llx, offset 0x%zx\n",
+			err, __func__, map->fd, sg_phys(sgl), offset);
+			goto dma_link_err;
+		}
+		offset += sgl->length;
+	}
+
+	/*
+	 * Synchronize the IOMMU’s TLB to make recent IOMMU page‑table
+	 * updates visible to the device
+	 */
+	err = dma_iova_sync(smmucb->dev,
+			&map->iova_state, 0, map->size);
+	if (err)
+		goto dma_sync_err;
+
+	map->phys = map->iova_state.addr;
+	RECONSTRUCT_IOVA_FROM_SID_PA((u64)smmucb->sid,
+		map->phys, smmucb->sid_pos);
+	if (iova_reserved) {
+		/*
+		 * If previously reserved iova region for same buffer was
+		 * reused for creating smmu mapping, then no need to update
+		 * smmu device memory stats.
+		 */
+		smmucb->allocatedbytes += SMMU_ALIGN(map->size);
+	}
+
+	return 0;
+dma_sync_err:
+	dma_iova_unlink(smmucb->dev, &map->iova_state, 0, map->size,
+				DMA_BIDIRECTIONAL, 0);
+dma_link_err:
+	if (iova_reserved)
+		dma_iova_free(smmucb->dev, &map->iova_state);
+iova_reserve_err:
+	return err;
+}
+#endif
+
 static int fastrpc_map_create(struct fastrpc_user *fl, int fd,
 			      u64 va, struct dma_buf *buf, u64 len,
 			      u32 attr, int mflags, struct fastrpc_map **ppmap,
@@ -1415,26 +1592,52 @@ static int fastrpc_map_create(struct fastrpc_user *fl, int fd,
 	struct fastrpc_pool_ctx **pool_ctx = NULL;
 	struct fastrpc_map *map = NULL;
 	struct scatterlist *sgl = NULL;
-	int err = 0, sgl_index = 0;
+	int err = 0, sgl_index = 0, ret = 0;
 	struct device *dev = NULL;
 	struct fastrpc_smmu *smmucb = NULL;
 	u32 smmuidx = DEFAULT_SMMU_IDX, pd_type = 0;
-	bool secure = false;
+	bool secure = false, retained_map = false,
+		retain_iova_attr = (attr == FASTRPC_MAP_ATTR_RETAIN_IOVA);
 
-	if (!fastrpc_map_lookup(fl, fd, va, len, buf, mflags, ppmap, take_ref))
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(6,13,0))
+	if (retain_iova_attr)
+		return -EOPNOTSUPP;
+#endif
+	ret = fastrpc_map_lookup(fl, fd, va, len, buf, mflags,
+			ppmap, take_ref, attr);
+
+	if (ret == -EBADFD) {
+		/*
+		 * For EBADFD, return error to user,
+		 * For ENOENT, proceed to create new map.
+		 */
+		return -EBADFD;
+	} else if (ret == 0){
+		if (retain_iova_attr) {
+			/* Map with 'retain-iova' flag. Skip new map allocation */
+			map = *ppmap;
+			retained_map = true;
+			goto skip_map_alloc;
+		}
+		/* Return map found */
 		return 0;
+	}
 
 	map = kzalloc(sizeof(*map), GFP_KERNEL);
 	if (!map)
 		return -ENOMEM;
 
 	INIT_LIST_HEAD(&map->node);
+
+skip_map_alloc:
 	kref_init(&map->refcount);
 
 	map->fl = fl;
 	map->fd = fd;
 	map->flags = mflags;
 	map->len = len;
+	map->size = 0;
+	map->attr = attr;
 
 	if(mflags == ADSP_MMAP_DMA_BUFFER) {
 		if (!buf) {
@@ -1509,7 +1712,11 @@ map_retry:
 	if (attr & FASTRPC_ATTR_NOMAP || mflags == FASTRPC_MAP_FD_NOMAP) {
 		dev = fl->cctx->dev;
 	} else {
-		dev =  smmucb->dev;
+		/*
+		 * For 'retain iova' attr, use parent SMMU dev,
+		 * to get sgl without mapping on IOMMU.
+		 */
+		dev = retain_iova_attr ? smmucb->dev->parent : smmucb->dev;
 		map->smmucb = smmucb;
 	}
 
@@ -1544,17 +1751,23 @@ map_retry:
 		goto map_err;
 	}
 
-	if (attr & FASTRPC_ATTR_SECUREMAP) {
+	if (retain_iova_attr) {
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0))
+		err = fastrpc_map_reserve_iova(smmucb, map);
+#else
+		err = -EOPNOTSUPP;
+#endif
+		if (err)
+			goto assign_err;
+	} else if (attr & FASTRPC_ATTR_SECUREMAP) {
 		map->phys = sg_phys(map->table->sgl);
 		for_each_sg(map->table->sgl, sgl, map->table->nents,
 			sgl_index)
 			map->size += sg_dma_len(sgl);
-		map->va = (void *) (uintptr_t) va;
 		smmucb->allocatedbytes += SMMU_ALIGN(map->size);
 	} else if (attr & FASTRPC_ATTR_NOMAP || mflags == FASTRPC_MAP_FD_NOMAP){
 		map->phys = sg_dma_address(map->table->sgl);
 		map->size = sg_dma_len(map->table->sgl);
-		map->va = (void *) (uintptr_t) va;
 	} else {
 		map->phys = sg_dma_address(map->table->sgl);
 		RECONSTRUCT_IOVA_FROM_SID_PA((u64)smmucb->sid,
@@ -1562,9 +1775,9 @@ map_retry:
 		for_each_sg(map->table->sgl, sgl, map->table->nents,
 			sgl_index)
 			map->size += sg_dma_len(sgl);
-		map->va = (void *) (uintptr_t) va;
 		smmucb->allocatedbytes += SMMU_ALIGN(map->size);
 	}
+	map->va = (void *) (uintptr_t) va;
 
 	trace_fastrpc_dma_map(map->fl->cctx->domain_id, map->fd, map->phys,
 		map->size, map->len, map->attach->dma_map_attrs, map->flags);
@@ -1602,14 +1815,18 @@ map_retry:
 			goto assign_err;
 		}
 	}
-	map->attr = attr;
 	spin_lock(&fl->lock);
-	list_add_tail(&map->node, &fl->maps);
+	if (!retained_map) {
+		/*
+		 * If an fd previously mapped with 'retain-iova' attribute is
+		 * being mapped again, it should already be part of the list.
+		 */
+		list_add_tail(&map->node, &fl->maps);
+	}
 	spin_unlock(&fl->lock);
 	*ppmap = map;
 
 	return 0;
-
 assign_err:
 	dma_buf_unmap_attachment_wrap(map);
 map_err:
@@ -1920,7 +2137,8 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 			 */
 			mutex_lock(&ctx->fl->map_mutex);
 			if (!fastrpc_map_lookup(ctx->fl, ctx->args[i].fd,
-				 0, 0, NULL, 0 , &ctx->maps[i], false)) {
+				 0, 0, NULL, 0 , &ctx->maps[i],
+				 false, FASTRPC_MAP_ATTR_DEFAULT)) {
 				pages[i].addr = ctx->maps[i]->phys;
 				pages[i].size = ctx->maps[i]->size;
 			}
@@ -1987,7 +2205,8 @@ static int fastrpc_put_args(struct fastrpc_invoke_ctx *ctx,
 		if (!fdlist[i])
 			break;
 		mutex_lock(&fl->map_mutex);
-		if (!fastrpc_map_lookup(fl, (int)fdlist[i], 0, 0, NULL, 0, &mmap, false))
+		if (!fastrpc_map_lookup(fl, (int)fdlist[i],
+			0, 0, NULL, 0, &mmap, false, FASTRPC_MAP_ATTR_DEFAULT))
 			/* Validate the map flags for DMA handles and skip freeing map if invalid */
 			if (mmap->flags == FASTRPC_MAP_LEGACY_DMA_HANDLE) {
 				/* Allow DMA handle maps to free only once */
@@ -3751,8 +3970,12 @@ void fastrpc_free_user(struct fastrpc_user *fl)
 
 	mutex_lock(&fl->map_mutex);
 	// During process tear down free the map, even if refcount is non-zero
-	list_for_each_entry_safe(map, m, &fl->maps, node)
+	list_for_each_entry_safe(map, m, &fl->maps, node) {
+		// During process tear down, 'retained iova' maps also need to be freed
+		if (map->attr == FASTRPC_MAP_ATTR_RETAIN_IOVA)
+			map->attr = FASTRPC_MAP_ATTR_DEFAULT;
 		__fastrpc_free_map(map);
+	}
 	mutex_unlock(&fl->map_mutex);
 
 	fastrpc_buf_list_free(fl, &fl->mmaps, false);
@@ -6519,6 +6742,21 @@ static int fastrpc_req_mem_unmap_impl(struct fastrpc_user *fl, struct fastrpc_me
 	/* Set the map state to default on successful unmapping */
 	atomic_set(&map->state, FD_MAP_DEFAULT);
 	mutex_lock(&fl->map_mutex);
+
+	/*
+	 * If the mapping was created with IOVA retention on unmap, allow
+	 * clearing that flag so the unmap also releases the IOVA region.
+	 */
+	if (map->attr == FASTRPC_MAP_ATTR_RETAIN_IOVA &&
+		req->attr == FASTRPC_MAP_ATTR_DEFAULT) {
+		map->attr = req->attr;
+	}
+
+	/*
+	 * Reset return virtual address of DSP, to return
+	 * failure on multiple unmap requests of same FD.
+	 */
+	map->raddr = 0;
 	fastrpc_map_put(map);
 	mutex_unlock(&fl->map_mutex);
 	return 0;
@@ -6944,7 +7182,8 @@ long fastrpc_dev_unmap_dma(struct fastrpc_device *dev,
 	spin_unlock_irqrestore(&cctx->lock, irq_flags);
 	mutex_lock(&fl->map_mutex);
 	err = fastrpc_map_lookup(fl, -1, 0, 0, p.unmap->buf,
-				ADSP_MMAP_DMA_BUFFER, &map, false);
+				ADSP_MMAP_DMA_BUFFER, &map,
+				false, FASTRPC_MAP_ATTR_DEFAULT);
 	 /*
 	  * Check if DSP mapping is complete, then move the state to
 	  * unmap in progress only if there is no other ongoing unmap.
@@ -7680,6 +7919,18 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 	}
 	/* Set larger segment size to allow smmu to map > 4GB */
 	dma_set_max_seg_size(dev, DMA_BIT_MASK(32));
+
+	/*
+	 * Set the DMA mask for the SMMU parent device to 64-bit,
+	 * allowing the device to access the full range of DDR memory.
+	 * This is necessary for devices that need to perform DMA operations,
+	 * on high memory addresses beyond the 32-bit limit.
+	 */
+	rc = dma_set_mask(dev->parent, DMA_BIT_MASK(64));
+	if (rc) {
+		dev_err(dev, "64-bit parent SMMU dev DMA enable failed\n");
+		return rc;
+	}
 
 #ifdef CONFIG_DEBUG_FS
 	if (debugfs_root && !g_frpc.debugfs_global_file) {

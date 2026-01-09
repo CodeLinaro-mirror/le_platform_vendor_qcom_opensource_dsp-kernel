@@ -1834,7 +1834,14 @@ map_err:
 attach_err:
 	dma_buf_put(map->buf);
 get_err:
-	kfree(map);
+	if (!retained_map) {
+		/*
+		 * If an fd that was previously mapped with the 'retain-iova'
+		 * attribute is being mapped again, it will already be part
+		 * of the list, so it cannot be freed.
+		 */
+		kfree(map);
+	}
 
 	return err;
 }

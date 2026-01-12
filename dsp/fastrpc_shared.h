@@ -36,7 +36,7 @@
 #define CDSP1_DOMAIN_ID (4)
 #define NUM_LEGACY_ID_MAX	5 /* adsp, mdsp, slpi, cdsp, cdsp1 */
 #define FASTRPC_MAX_SESSIONS	50
-#define FASTRPC_MAX_SESSIONS_PER_PROCESS	4
+#define FASTRPC_MAX_SESSIONS_PER_PROCESS	6
 
 /* Check if given domain id is valid */
 #define IS_LEGACY_DOMAIN_ID(domain) (domain < NUM_LEGACY_ID_MAX)

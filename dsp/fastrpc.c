@@ -1347,26 +1347,21 @@ static struct fastrpc_pool_ctx *fastrpc_session_alloc(
 		 * 3. If process is secure usecase (CPZ usecase), then session also
 		 *    should have secure parameter set.
 		 * AND
-		 * 4. If process needs to share CB (sensors usecases share one CB), then
-		 *    session also should have sharedcb parameter set.
+		 * 4. If process needs to share CB (for SID sharing):
+		 *    - For sensors PD, session will have sharedcb parameter set
+		 *    - For some extended map usecases, the sharedcb parameter cannot be set
+		 *      in the code, but the CB can be shared
 		 * AND
 		 * 5. If pd_type is configured, then process pd_type needs to match with
 		 *    session pd_type, else pd_type check is ignored
 		 */
 		isess = &cctx->session[i];
 
-		/*
-		 * If the extended-map context bank supports SID sharing, then
-		 * allow client-apps requesting extended mapping to share that
-		 * context bank.
-		 */
-		if (isess->pd_type == EXT_MAP_PD_TYPE && isess->sharedcb)
-			sharedcb = true;
-
 		if ((isess->usecount == 0 || isess->smmucount > 1) &&
 			isess->smmucb[DEFAULT_SMMU_IDX].valid &&
 			isess->secure == secure &&
-			isess->sharedcb == sharedcb &&
+			((isess->pd_type == EXT_MAP_PD_TYPE && isess->sharedcb) ||
+			(isess->sharedcb == sharedcb)) &&
 			(pd_type == DEFAULT_UNUSED || isess->pd_type == pd_type || secure)) {
 			session = isess;
 			/*

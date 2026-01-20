@@ -91,6 +91,10 @@ define_modules("chora", "perf", "no")
 
 define_modules("chora", "consolidate", "no")
 
+define_modules("pebble", "perf", "no")
+
+define_modules("pebble", "consolidate", "no")
+
 define_modules("hamoa", "perf", "no")
 
 define_modules("hamoa", "consolidate", "no")

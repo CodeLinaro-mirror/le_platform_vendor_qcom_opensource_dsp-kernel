@@ -1404,6 +1404,8 @@ struct fastrpc_user {
 	char name[TASK_COMM_LEN];
 	/* PD type of remote subsystem process */
 	u32 pd_type;
+	/* Flag to set if DSP remote process ran into exception or faulted */
+	bool is_faulted;
 	/* total cached buffers */
 	u32 num_cached_buf;
 	/* total persistent headers */

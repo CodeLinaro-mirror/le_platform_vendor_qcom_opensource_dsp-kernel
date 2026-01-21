@@ -50,27 +50,36 @@ static void fastrpc_handle_ssr_request(struct work_struct *work)
 		container_of(work, struct fastrpc_ssr_handler, ssr_work);
 	void *rphandle = ssr_handler->rphandle;
 
-	if (!rphandle) {
+	struct rproc *rproc = (struct rproc *)rphandle;
+	if (!rphandle || !rproc) {
 		pr_err("Error: %s: invalid rproc handle for domain %d\n",
 			__func__, ssr_handler->domain_id);
 		goto bail;
 	}
 
-	/* Shut down DSP */
-	rc = rproc_shutdown(rphandle);
-	if (rc) {
-		pr_err("Error: %s: rproc_shutdown failed with rc %d and rphandle %pK\n",
-			__func__, rc, rphandle);
-		goto bail;
+	if (rproc->recovery_disabled) {
+		/* If recovery disabled, use rproc_shutdown/rproc_boot to trigger dsp ssr. No elf file dumped. */
+		pr_info("%s : SSR started with recovery disabled \n", __func__);
+		/* Shut down DSP */
+		rc = rproc_shutdown(rphandle);
+		if (rc) {
+			pr_err("Error: %s: rproc_shutdown failed with rc %d and rphandle %pK\n",
+				__func__, rc, rphandle);
+			goto bail;
+		}
+		/* Reboot DSP */
+		rc = rproc_boot(rphandle);
+		if (rc) {
+		 	pr_err("Error: %s: rproc_boot failed with rc %d and rphandle %pK\n",
+		 		__func__, rc, rphandle);
+		 	goto bail;
+		}
+	} else {
+		/* If recovery enabled, use rproc_report_crash to trigger dsp ssr and dump elf file */
+		pr_info("%s : SSR started with recovery enabled \n", __func__);
+		rproc_report_crash(rphandle, RPROC_WATCHDOG);
 	}
 
-	/* Reboot DSP */
-	rc = rproc_boot(rphandle);
-	if (rc) {
-		pr_err("Error: %s: rproc_boot failed with rc %d and rphandle %pK\n",
-			__func__, rc, rphandle);
-		goto bail;
-	}
 	pr_info("%s : SSR completed successfully", __func__);
 
 bail:

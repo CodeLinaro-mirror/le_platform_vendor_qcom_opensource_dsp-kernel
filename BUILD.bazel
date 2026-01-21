@@ -99,5 +99,9 @@ define_modules("hamoa", "perf", "no")
 
 define_modules("hamoa", "consolidate", "no")
 
+define_modules("art16k", "perf", "no")
+
+define_modules("art16k", "consolidate", "no")
+
 define_target_modules()
 

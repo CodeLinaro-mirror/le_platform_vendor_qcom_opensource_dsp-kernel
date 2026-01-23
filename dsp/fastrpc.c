@@ -866,7 +866,7 @@ static void fastrpc_channel_ctx_free(struct kref *ref)
 		for (j = 0; j < cctx->session[i].smmucount; j++)
 			mutex_destroy(&cctx->session[i].smmucb[j].map_mutex);
 	ida_destroy(&cctx->tgid_frpc_ida);
-	kfree(cctx);
+	kvfree(cctx);
 }
 
 void fastrpc_channel_ctx_get(struct fastrpc_channel_ctx *cctx)

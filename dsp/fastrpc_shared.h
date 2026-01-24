@@ -317,19 +317,24 @@
 /* Macro to return SSR status */
 #define IS_SSR(fl) (fl && fl->cctx && atomic_read(&fl->cctx->teardown))
 
-#define AUDIO_PDR_SERVICE_LOCATION_CLIENT_NAME   "audio_pdr_adsp"
+/* PD Names of static PDs on remote processor */
+#define AUDIOPD      "audiopd"
+#define SENSORSPD     "sensorspd"
+#define OISPD        "oispd"
+
+#define AUDIO_PDR_SERVICE_LOCATION_CLIENT_NAME   AUDIOPD
 #define AUDIO_PDR_ADSP_SERVICE_NAME              "avs/audio"
 #define ADSP_AUDIOPD_NAME                        "msm/adsp/audio_pd"
 
-#define SENSORS_PDR_ADSP_SERVICE_LOCATION_CLIENT_NAME   "sensors_pdr_adsp"
+#define SENSORS_PDR_ADSP_SERVICE_LOCATION_CLIENT_NAME   SENSORSPD
 #define SENSORS_PDR_ADSP_SERVICE_NAME              "tms/servreg"
 #define ADSP_SENSORPD_NAME                       "msm/adsp/sensor_pd"
 
-#define SENSORS_PDR_SLPI_SERVICE_LOCATION_CLIENT_NAME "sensors_pdr_slpi"
+#define SENSORS_PDR_SLPI_SERVICE_LOCATION_CLIENT_NAME SENSORSPD
 #define SENSORS_PDR_SLPI_SERVICE_NAME            SENSORS_PDR_ADSP_SERVICE_NAME
 #define SLPI_SENSORPD_NAME                       "msm/slpi/sensor_pd"
 
-#define OIS_PDR_ADSP_SERVICE_LOCATION_CLIENT_NAME   "ois_pdr_adsprpc"
+#define OIS_PDR_ADSP_SERVICE_LOCATION_CLIENT_NAME OISPD
 #define OIS_PDR_ADSP_SERVICE_NAME              "tms/servreg"
 #define ADSP_OISPD_NAME                        "msm/adsp/ois_pd"
 
@@ -466,12 +471,14 @@
 
 enum fastrpc_reserved_ctx {
 	/*
-         * Process status notifications from DSP
-         * will be sent with this unique context
-         */
+	 * Dynamic PD status notifications from DSP
+	 * will be sent with this unique context
+	 */
 	FASTRPC_NOTIF_CTX_RESERVED	= 0xABCDABCD,
 	/* Root request from DSP will be sent with this unique context */
 	FASTRPC_ROOT_CTX_RESERVED	= 0xAABBCCDD,
+	/* Static PD notifications from DSP will be sent with this unique context */
+	FASTRPC_STATICPD_RSP_CTX = 0xABCDDCAB,
 };
 
 /*
@@ -484,8 +491,8 @@ enum fastrpc_reserved_ctx {
 	((pd_type == USERPD) || (pd_type == USER_UNSIGNEDPD_POOL))
 
 /*
- * Process types on remote subsystem
- * Always add new PD types at the end, before MAX_PD_TYPE
+ * Pool types on remote subsystem
+ * Always add new pool types at the end, before POOL_MAX_PD_TYPE
  */
 enum fastrpc_cb_pd_types {
 	DEFAULT_UNUSED            = 0,  /* PD type not configured for context banks */
@@ -500,6 +507,18 @@ enum fastrpc_cb_pd_types {
 	USER_UNSIGNEDPD_POOL      = 9,  /* DSP User Dynamic Unsigned PD pool */
 	EXT_MAP_PD_TYPE           = 10, /* DSP extended mapping */
 	MAX_PD_TYPE,                    /* Max PD type */
+};
+
+/*
+ * Dummy pids assigned to static pds for the purposes of pd status
+ * notifications. These values should always be same as the
+ * corresponding dsp values.
+ */
+enum static_process_type {
+	AUDIO_STATIC_ID = 1,
+	SENSORS_STATIC_ID = 2,
+	OIS_STATIC_ID = 3,
+	INVALID_STATIC_ID = -1,
 };
 
 /* List of const remote handles used by framework only */
@@ -945,6 +964,10 @@ struct fastrpc_map {
 	struct kref refcount;
 	int secure;
 	atomic_t state;
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0))
+	/* Retained IOVA address and size */
+	struct dma_iova_state iova_state;
+#endif
 };
 
 struct fastrpc_perf {
@@ -1002,14 +1025,50 @@ struct fastrpc_pool_ctx {
 };
 
 struct fastrpc_static_pd {
+	/* Static PD ID */
+	enum static_process_type spd_id;
+
+	/* Service locator name */
 	char *servloc_name;
-	char *spdname;
+
+	/* PDR Handle associated with static PD */
 	void *pdrhandle;
+
+	/* PDR count, incremented on each PDR */
 	u64 pdrcount;
+
+	/*
+	 * Previous PDR count, saved at the start of each session.
+	 * RPC calls to static PD returns failures if (pdrcount != prevpdrcount)
+	 */
 	u64 prevpdrcount;
+
+	/*
+	 * ispdup is set to true on PD up notifications
+	 * and false on PD down notification
+	 */
 	atomic_t ispdup;
+
+	/*
+	 * This flag is used to ensure only one application can attach to
+	 * static PD at a time.
+	 */
 	atomic_t is_attached;
+
+	/* pointer to channel context */
 	struct fastrpc_channel_ctx *cctx;
+
+	/*
+	 * set to true once the session is populated.
+	 */
+	bool used;
+
+	/*
+	 * Flag set to 1 if internal static pd status notification mechanism
+	 * is available. In that case, pdr callback notifications through service
+	 * locator will be ignored.
+	 */
+	atomic_t spd_status_notif;
 };
 
 struct heap_bufs {
@@ -1367,6 +1426,8 @@ struct fastrpc_user {
 	char *servloc_name;;
 	/* Lock for lists */
 	spinlock_t lock;
+	/* static PID */
+	enum static_process_type spd_id;
 	/* lock for dsp signals */
 	spinlock_t dspsignals_lock;
 	/*mutex for process maps synchronization*/

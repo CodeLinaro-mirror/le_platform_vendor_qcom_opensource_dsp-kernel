@@ -7,7 +7,7 @@ package(
     ],
 )
 
-load(":define_modules.bzl", "define_modules", "define_vm_modules")
+load(":define_modules.bzl", "define_modules", "define_vm_modules", "define_target_modules")
 
 define_modules("pineapple", "consolidate", "no")
 
@@ -33,6 +33,12 @@ define_vm_modules("canoe-oemvm", "debug-defconfig")
 define_vm_modules("canoe-tuivm", "defconfig")
 define_vm_modules("canoe-oemvm", "defconfig")
 
+define_vm_modules("art-tuivm", "debug-defconfig")
+define_vm_modules("art-oemvm", "debug-defconfig")
+
+define_vm_modules("art-tuivm", "defconfig")
+define_vm_modules("art-oemvm", "defconfig")
+
 define_modules("tuna", "consolidate", "no")
 
 define_modules("tuna", "perf", "no")
@@ -49,6 +55,8 @@ define_modules("monaco", "consolidate", "no")
 
 define_modules("monaco", "gki", "no")
 
+define_modules("monaco", "perf", "no")
+
 define_modules("parrot", "consolidate", "no")
 
 define_modules("parrot", "perf", "no")
@@ -60,6 +68,8 @@ define_modules("canoe", "consolidate", "no")
 define_modules("seraph", "consolidate", "yes")
 
 define_modules("seraph", "gki", "yes")
+
+define_modules("seraph", "perf", "yes")
 
 define_modules("vienna", "perf", "no")
 
@@ -76,3 +86,14 @@ define_modules("x1p42100", "consolidate", "no")
 define_modules("art", "perf", "no")
 
 define_modules("art", "consolidate", "no")
+
+define_modules("chora", "perf", "no")
+
+define_modules("chora", "consolidate", "no")
+
+define_modules("hamoa", "perf", "no")
+
+define_modules("hamoa", "consolidate", "no")
+
+define_target_modules()
+

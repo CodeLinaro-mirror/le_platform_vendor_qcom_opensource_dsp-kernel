@@ -14,25 +14,31 @@ load(
 def define_modules(target, variant, build_loader):
     kernel_build_variant = "{}_{}".format(target, variant)
     data = [
-        ":{}_frpc-adsprpc".format(kernel_build_variant),]
-    if build_loader == "yes":
-        data += [
-        ":{}_cdsp-loader".format(kernel_build_variant),
-        ]
+        ":{}_frpc-adsprpc".format(kernel_build_variant),
+    ]
+
+    should_build_loader = build_loader == "yes"
+
+    if should_build_loader:
+        loader_target = ":{}_cdsp-loader".format(kernel_build_variant)
+        data += select({
+            "//build/kernel/kleaf:socrepo_true": [],
+            "//build/kernel/kleaf:socrepo_false": [loader_target],
+        })
 
     kernel_build = select({
-        "//build/kernel/kleaf:socrepo_true": "//soc-repo:{}_base_kernel".format(kernel_build_variant),
-        "//build/kernel/kleaf:socrepo_false": "//msm-kernel:{}".format(kernel_build_variant),
+        "//build/qcom_build_extensions:qtisocrepo_true": "//soc-repo:{}_base_kernel".format(kernel_build_variant),
+        "//build/qcom_build_extensions:qtisocrepo_false": "//msm-kernel:{}".format(kernel_build_variant),
     })
     ddk_deps = select({
-        "//build/kernel/kleaf:socrepo_true":[
+        "//build/qcom_build_extensions:qtisocrepo_true":[
             "//soc-repo:all_headers",
             "//soc-repo:{}/drivers/firmware/qcom/qcom-scm".format(kernel_build_variant),
             "//soc-repo:{}/drivers/soc/qcom/mem_buf/mem_buf_dev".format(kernel_build_variant),
             "//soc-repo:{}/drivers/soc/qcom/pdr_interface".format(kernel_build_variant),
             "//soc-repo:{}/drivers/rpmsg/qcom_glink".format(kernel_build_variant),
         ],
-        "//build/kernel/kleaf:socrepo_false": ["//msm-kernel:all_headers"],
+        "//build/qcom_build_extensions:qtisocrepo_false": ["//msm-kernel:all_headers"],
     })
 
     # Path to dsp folder from soc-repo/include/trace directory
@@ -61,12 +67,15 @@ def define_modules(target, variant, build_loader):
         ],
     )
 
-    if build_loader == "yes":
+    if should_build_loader:
         ddk_module(
             name = "{}_cdsp-loader".format(kernel_build_variant),
-            kernel_build = "//msm-kernel:{}".format(kernel_build_variant),
-            deps = ["//msm-kernel:all_headers"],
-            srcs = ["dsp/cdsp-loader.c"],
+            kernel_build = kernel_build,
+            deps = ddk_deps,
+            srcs = select({
+                "//build/kernel/kleaf:socrepo_true": [],
+                "//build/kernel/kleaf:socrepo_false": ["dsp/cdsp-loader.c"],
+            }),
             out = "cdsp-loader.ko",
         )
 
@@ -87,18 +96,18 @@ def define_vm_modules(target, variant):
     kernel_build_variant = "{}_{}".format(target, variant)
 
     kernel_build = select({
-        "//build/kernel/kleaf:socrepo_true": "//soc-repo:{}_base_kernel".format(kernel_build_variant),
-        "//build/kernel/kleaf:socrepo_false": "//msm-kernel:{}".format(kernel_build_variant),
+        "//build/qcom_build_extensions:qtisocrepo_true": "//soc-repo:{}_base_kernel".format(kernel_build_variant),
+        "//build/qcom_build_extensions:qtisocrepo_false": "//msm-kernel:{}".format(kernel_build_variant),
     })
 
     deps = select({
-        "//build/kernel/kleaf:socrepo_true": [
+        "//build/qcom_build_extensions:qtisocrepo_true": [
             "//soc-repo:all_headers",
             "//soc-repo:{}/drivers/firmware/qcom/qcom-scm".format(kernel_build_variant),
             "//soc-repo:{}/drivers/soc/qcom/mem_buf/mem_buf_dev".format(kernel_build_variant),
             "//soc-repo:{}/drivers/dma-buf/heaps/qcom_dma_heaps".format(kernel_build_variant),
             ] ,
-        "//build/kernel/kleaf:socrepo_false": ["//msm-kernel:all_headers"],
+        "//build/qcom_build_extensions:qtisocrepo_false": ["//msm-kernel:all_headers"],
     })
 
     # Path to dsp folder from soc-repo/include/trace directory
@@ -141,4 +150,12 @@ def define_vm_modules(target, variant):
         name = "{}_dsp-kernel_dist".format(kernel_build_variant),
         srcs = [":{}_dist_files".format(kernel_build_variant)],
         destdir = "out/target/product/{}/dlkm/lib/modules/".format(target),
+    )
+
+def define_target_modules():
+    # Creates a ddk_headers that exposes the FastRPC UAPI header with public visibility
+    ddk_headers(
+        name = "frpc_uapi_headers",
+        hdrs = native.glob(["include/uapi/misc/fastrpc.h"]),
+        visibility = ["//visibility:public"]
     )

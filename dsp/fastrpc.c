@@ -285,12 +285,24 @@ static void __fastrpc_free_map(struct fastrpc_map *map)
 {
 	struct fastrpc_user *fl = NULL;
 	struct fastrpc_smmu *smmucb = NULL;
+	__maybe_unused bool iova_in_use = false;
+	bool retain_iova = false;
 
 	if (!map)
 		return;
 
 	fl = map->fl;
-	if (fl) {
+
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0))
+	iova_in_use = dma_use_iova(&map->iova_state);
+#endif
+	retain_iova = (map->attr == FASTRPC_MAP_ATTR_RETAIN_IOVA);
+
+	/*
+	 * If mapping is being removed but IOVA is retained, skip
+	 * removing corresponding entry from map-list.
+	 */
+	if (fl && !retain_iova) {
 		spin_lock(&map->fl->lock);
 		list_del(&map->node);
 		spin_unlock(&map->fl->lock);
@@ -328,14 +340,44 @@ static void __fastrpc_free_map(struct fastrpc_map *map)
 				mutex_unlock(&smmucb->map_mutex);
 				goto free_map;
 			}
-			__fastrpc_dma_map_free(map);
-			smmucb->allocatedbytes -= SMMU_ALIGN(map->size);
+
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0))
+			if (iova_in_use) {
+				if (map->phys) {
+					/*
+					 * Remove smmu mapping.
+					 * This does NOT release iova region.
+					 */
+					dma_iova_unlink(smmucb->dev, &map->iova_state,
+						0, map->size, DMA_BIDIRECTIONAL, 0);
+					map->phys = 0;
+				}
+
+				/*
+				 * If buffer is being unmapped without 'retain iova' attribute,
+				 * then release the iova region as well.
+				 */
+				if (!retain_iova)
+					dma_iova_free(smmucb->dev, &map->iova_state);
+			}
+#endif
+
+			if (map->buf) {
+				__fastrpc_dma_map_free(map);
+				map->buf = NULL;
+			}
+			if (!retain_iova) {
+				/* Do not update smmu device stats if iova region was retained */
+				smmucb->allocatedbytes -= SMMU_ALIGN(map->size);
+			}
+
 			mutex_unlock(&smmucb->map_mutex);
 		}
 	}
 
 free_map:
-	kfree(map);
+	if (!retain_iova)
+		kfree(map);
 }
 
 static void fastrpc_free_map(struct kref *ref)
@@ -363,52 +405,89 @@ static int fastrpc_map_get(struct fastrpc_map *map)
 
 static int fastrpc_map_lookup(struct fastrpc_user *fl, int fd,
 			    u64 va, u64 len, struct dma_buf *buf, int mflags,
-			    struct fastrpc_map **ppmap, bool take_ref)
+			    struct fastrpc_map **ppmap, bool take_ref,
+				uint32_t attrs)
 {
 	struct fastrpc_pool_ctx *sess = fl->sctx;
-	struct fastrpc_map *map = NULL;
+	struct fastrpc_map *map = NULL, *found = NULL;
 	int ret = -ENOENT;
+	bool buf_put_needed = false,
+		retained_map = (attrs == FASTRPC_MAP_ATTR_RETAIN_IOVA);
 
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(6,13,0))
+	if (retained_map)
+		return -EOPNOTSUPP;
+#endif
 	if (mflags == ADSP_MMAP_DMA_BUFFER) {
 		if (!buf)
-			return ret;
+			return -ENOENT;
 	} else {
 		/* Fetch DMA buffer from fd */
 		buf = dma_buf_get(fd);
 		if (IS_ERR(buf))
 			return PTR_ERR(buf);
+
+		buf_put_needed = true;
 	}
 
 	spin_lock(&fl->lock);
-		list_for_each_entry(map, &fl->maps, node) {
-			/*
-			 * Retrieve the map if the DMA buffer and fd match. For
-			 * duplicated fds with the same DMA buffer, create separate
-			 * maps for each duplicated fd.
-			 */
-			if (map->buf == buf && map->fd == fd)
-				goto map_found;
+	list_for_each_entry(map, &fl->maps, node) {
+		/*
+		 * For regular map, multiple fd's can point to same dma-buf.
+		 * Create separate mapping for each duplicated fd.
+		 *
+		 * For map with 'retain-iova' attribute, client can request
+		 * to map the same fd which is now pointing to a different
+		 * dma-buf. So skip the dma-buf check.
+		 */
+		if (map->fd == fd && (retained_map || map->buf == buf)) {
+			found = map;
+			ret = 0;
+			break;
 		}
-	goto error;
+	}
 
-map_found:
-	if (take_ref) {
+	if (!found)
+		goto bail;
+
+	/*
+	 * Validate that the found map has same attributes as the one passed
+	 * by user. In case of 'retain-iova' attribute, also validate that
+	 * the current ref-count of map has been reset to 0.
+	 */
+	if (found->attr != attrs ||
+		(retained_map && (kref_read(&map->refcount) != 0))) {
+		found = NULL;
+		ret = -EBADFD;
+	}
+
+	/*
+	 * For buffers with 'retain-iova' attribute, refcount can be only
+	 * 1 or 0 i.e. only 1 mapping request can be made.
+	 * For all other attributes, multiple mapping requests can be made on
+	 * the same buffer, and its ref-count will be incremented in
+	 * subsequent requests.
+	 */
+	if (take_ref && !retained_map) {
 		ret = fastrpc_map_get(map);
 		if (ret) {
 			dev_dbg(sess->smmucb[DEFAULT_SMMU_IDX].dev,
 				"%s: Failed to get map fd=%d ret=%d\n",
 				__func__, fd, ret);
-				goto error;
+			found = NULL;
+			ret = -ENOENT;
 		}
 	}
-	*ppmap = map;
-	ret = 0;
-
-error:
+bail:
 	spin_unlock(&fl->lock);
-	/* Drop the DMA buf ref except for the DMA bus driver */
-	if (mflags != ADSP_MMAP_DMA_BUFFER)
+
+	/* Drop the DMA buf ref */
+	if (buf_put_needed)
 		dma_buf_put(buf);
+
+	if (!ret)
+		*ppmap = found;
+
 	return ret;
 }
 
@@ -1406,6 +1485,104 @@ static int set_buffer_secure_type(struct fastrpc_map *map)
 	return err;
 }
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0))
+/**
+ * fastrpc_map_reserve_iova() -
+ * Function to reserve iova region first (or use previously
+ * reserved region for same buffer) and map each SGL entry of dma
+ * buffer to that iova region.
+ * @arg1: SMMU context bank
+ * @arg2: FastRPC map structure
+ *
+ * Return: Returns 0 on Success, error code on failure
+ */
+
+static int fastrpc_map_reserve_iova(struct fastrpc_smmu *smmucb,
+		struct fastrpc_map *map)
+{
+	struct scatterlist *sgl = NULL;
+	int err = 0, sgl_index = 0;
+	bool iova_reserved = false;
+	size_t offset = 0;
+
+	/* Compute the total size of all SGL entries of buffer */
+	for_each_sgtable_sg(map->table, sgl, sgl_index)
+		map->size += sgl->length;
+
+	if (map->size < map->len) {
+		err = -EBADF;
+		dev_err(smmucb->dev,
+		"Error: %s: passed dma buffer size %llu mismatch with actual size %llu for fd %d\n",
+		__func__, map->len, map->size, map->fd);
+		goto iova_reserve_err;
+	}
+
+	/* Check if map has an iova region reserved already */
+	if (!dma_use_iova(&map->iova_state)) {
+		/*
+		 * If no iova region reserved, then reserve a
+		 * new region of buffer's size.
+		 */
+		iova_reserved = dma_iova_try_alloc(smmucb->dev,
+						&(map->iova_state),
+						0, map->size);
+		if (!iova_reserved) {
+			err = -ENOMEM;
+			goto iova_reserve_err;
+		}
+	}
+
+	sgl_index = 0;
+	for_each_sgtable_sg(map->table, sgl, sgl_index) {
+		/*
+		 * Create smmu mapping of each SGL entry of the dma buffer at
+		 * appropriate offsets within the reserved iova region.
+		 */
+		err = dma_iova_link(smmucb->dev, &map->iova_state,
+				sg_phys(sgl), offset,
+				sgl->length, DMA_BIDIRECTIONAL, 0);
+		if (err) {
+			dev_err(smmucb->dev,
+			"Error %d: %s: dma_iova_link failed for fd %d, sgl phys 0x%llx, offset 0x%zx\n",
+			err, __func__, map->fd, sg_phys(sgl), offset);
+			goto dma_link_err;
+		}
+		offset += sgl->length;
+	}
+
+	/*
+	 * Synchronize the IOMMU’s TLB to make recent IOMMU page‑table
+	 * updates visible to the device
+	 */
+	err = dma_iova_sync(smmucb->dev,
+			&map->iova_state, 0, map->size);
+	if (err)
+		goto dma_sync_err;
+
+	map->phys = map->iova_state.addr;
+	RECONSTRUCT_IOVA_FROM_SID_PA((u64)smmucb->sid,
+		map->phys, smmucb->sid_pos);
+	if (iova_reserved) {
+		/*
+		 * If previously reserved iova region for same buffer was
+		 * reused for creating smmu mapping, then no need to update
+		 * smmu device memory stats.
+		 */
+		smmucb->allocatedbytes += SMMU_ALIGN(map->size);
+	}
+
+	return 0;
+dma_sync_err:
+	dma_iova_unlink(smmucb->dev, &map->iova_state, 0, map->size,
+				DMA_BIDIRECTIONAL, 0);
+dma_link_err:
+	if (iova_reserved)
+		dma_iova_free(smmucb->dev, &map->iova_state);
+iova_reserve_err:
+	return err;
+}
+#endif
+
 static int fastrpc_map_create(struct fastrpc_user *fl, int fd,
 			      u64 va, struct dma_buf *buf, u64 len,
 			      u32 attr, int mflags, struct fastrpc_map **ppmap,
@@ -1415,26 +1592,52 @@ static int fastrpc_map_create(struct fastrpc_user *fl, int fd,
 	struct fastrpc_pool_ctx **pool_ctx = NULL;
 	struct fastrpc_map *map = NULL;
 	struct scatterlist *sgl = NULL;
-	int err = 0, sgl_index = 0;
+	int err = 0, sgl_index = 0, ret = 0;
 	struct device *dev = NULL;
 	struct fastrpc_smmu *smmucb = NULL;
 	u32 smmuidx = DEFAULT_SMMU_IDX, pd_type = 0;
-	bool secure = false;
+	bool secure = false, retained_map = false,
+		retain_iova_attr = (attr == FASTRPC_MAP_ATTR_RETAIN_IOVA);
 
-	if (!fastrpc_map_lookup(fl, fd, va, len, buf, mflags, ppmap, take_ref))
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(6,13,0))
+	if (retain_iova_attr)
+		return -EOPNOTSUPP;
+#endif
+	ret = fastrpc_map_lookup(fl, fd, va, len, buf, mflags,
+			ppmap, take_ref, attr);
+
+	if (ret == -EBADFD) {
+		/*
+		 * For EBADFD, return error to user,
+		 * For ENOENT, proceed to create new map.
+		 */
+		return -EBADFD;
+	} else if (ret == 0){
+		if (retain_iova_attr) {
+			/* Map with 'retain-iova' flag. Skip new map allocation */
+			map = *ppmap;
+			retained_map = true;
+			goto skip_map_alloc;
+		}
+		/* Return map found */
 		return 0;
+	}
 
 	map = kzalloc(sizeof(*map), GFP_KERNEL);
 	if (!map)
 		return -ENOMEM;
 
 	INIT_LIST_HEAD(&map->node);
+
+skip_map_alloc:
 	kref_init(&map->refcount);
 
 	map->fl = fl;
 	map->fd = fd;
 	map->flags = mflags;
 	map->len = len;
+	map->size = 0;
+	map->attr = attr;
 
 	if(mflags == ADSP_MMAP_DMA_BUFFER) {
 		if (!buf) {
@@ -1509,7 +1712,11 @@ map_retry:
 	if (attr & FASTRPC_ATTR_NOMAP || mflags == FASTRPC_MAP_FD_NOMAP) {
 		dev = fl->cctx->dev;
 	} else {
-		dev =  smmucb->dev;
+		/*
+		 * For 'retain iova' attr, use parent SMMU dev,
+		 * to get sgl without mapping on IOMMU.
+		 */
+		dev = retain_iova_attr ? smmucb->dev->parent : smmucb->dev;
 		map->smmucb = smmucb;
 	}
 
@@ -1544,17 +1751,23 @@ map_retry:
 		goto map_err;
 	}
 
-	if (attr & FASTRPC_ATTR_SECUREMAP) {
+	if (retain_iova_attr) {
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0))
+		err = fastrpc_map_reserve_iova(smmucb, map);
+#else
+		err = -EOPNOTSUPP;
+#endif
+		if (err)
+			goto assign_err;
+	} else if (attr & FASTRPC_ATTR_SECUREMAP) {
 		map->phys = sg_phys(map->table->sgl);
 		for_each_sg(map->table->sgl, sgl, map->table->nents,
 			sgl_index)
 			map->size += sg_dma_len(sgl);
-		map->va = (void *) (uintptr_t) va;
 		smmucb->allocatedbytes += SMMU_ALIGN(map->size);
 	} else if (attr & FASTRPC_ATTR_NOMAP || mflags == FASTRPC_MAP_FD_NOMAP){
 		map->phys = sg_dma_address(map->table->sgl);
 		map->size = sg_dma_len(map->table->sgl);
-		map->va = (void *) (uintptr_t) va;
 	} else {
 		map->phys = sg_dma_address(map->table->sgl);
 		RECONSTRUCT_IOVA_FROM_SID_PA((u64)smmucb->sid,
@@ -1562,9 +1775,9 @@ map_retry:
 		for_each_sg(map->table->sgl, sgl, map->table->nents,
 			sgl_index)
 			map->size += sg_dma_len(sgl);
-		map->va = (void *) (uintptr_t) va;
 		smmucb->allocatedbytes += SMMU_ALIGN(map->size);
 	}
+	map->va = (void *) (uintptr_t) va;
 
 	trace_fastrpc_dma_map(map->fl->cctx->domain_id, map->fd, map->phys,
 		map->size, map->len, map->attach->dma_map_attrs, map->flags);
@@ -1602,14 +1815,18 @@ map_retry:
 			goto assign_err;
 		}
 	}
-	map->attr = attr;
 	spin_lock(&fl->lock);
-	list_add_tail(&map->node, &fl->maps);
+	if (!retained_map) {
+		/*
+		 * If an fd previously mapped with 'retain-iova' attribute is
+		 * being mapped again, it should already be part of the list.
+		 */
+		list_add_tail(&map->node, &fl->maps);
+	}
 	spin_unlock(&fl->lock);
 	*ppmap = map;
 
 	return 0;
-
 assign_err:
 	dma_buf_unmap_attachment_wrap(map);
 map_err:
@@ -1617,7 +1834,14 @@ map_err:
 attach_err:
 	dma_buf_put(map->buf);
 get_err:
-	kfree(map);
+	if (!retained_map) {
+		/*
+		 * If an fd that was previously mapped with the 'retain-iova'
+		 * attribute is being mapped again, it will already be part
+		 * of the list, so it cannot be freed.
+		 */
+		kfree(map);
+	}
 
 	return err;
 }
@@ -1920,7 +2144,8 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 			 */
 			mutex_lock(&ctx->fl->map_mutex);
 			if (!fastrpc_map_lookup(ctx->fl, ctx->args[i].fd,
-				 0, 0, NULL, 0 , &ctx->maps[i], false)) {
+				 0, 0, NULL, 0 , &ctx->maps[i],
+				 false, FASTRPC_MAP_ATTR_DEFAULT)) {
 				pages[i].addr = ctx->maps[i]->phys;
 				pages[i].size = ctx->maps[i]->size;
 			}
@@ -1987,7 +2212,8 @@ static int fastrpc_put_args(struct fastrpc_invoke_ctx *ctx,
 		if (!fdlist[i])
 			break;
 		mutex_lock(&fl->map_mutex);
-		if (!fastrpc_map_lookup(fl, (int)fdlist[i], 0, 0, NULL, 0, &mmap, false))
+		if (!fastrpc_map_lookup(fl, (int)fdlist[i],
+			0, 0, NULL, 0, &mmap, false, FASTRPC_MAP_ATTR_DEFAULT))
 			/* Validate the map flags for DMA handles and skip freeing map if invalid */
 			if (mmap->flags == FASTRPC_MAP_LEGACY_DMA_HANDLE) {
 				/* Allow DMA handle maps to free only once */
@@ -2090,7 +2316,7 @@ static int fastrpc_invoke_send(struct fastrpc_pool_ctx *sctx,
 	struct fastrpc_channel_ctx *cctx;
 	struct fastrpc_user *fl = ctx->fl;
 	struct fastrpc_msg *msg = &ctx->msg;
-	struct fastrpc_ipcmsg *ipcmsg = NULL;
+	struct fastrpc_ipcmsg ipcmsg = {0};
 	int ret;
 
 	cctx = fl->cctx;
@@ -2116,25 +2342,15 @@ static int fastrpc_invoke_send(struct fastrpc_pool_ctx *sctx,
 	 * payload. Priority is passed as part of the payload.
 	 */
 	if (fl->cctx->dsp_attributes[FASTRPC_IPCMSG_SUPPORT]) {
-		ipcmsg = kzalloc(sizeof(*ipcmsg), GFP_KERNEL);
-		if (!ipcmsg) {
-			dev_err(fl->cctx->dev,
-				"Error: %s: failed to allocate memory for msgv3 packet",
-				__func__);
-			return -ENOMEM;
-		}
-		ipcmsg->type = IPCMSG_TX_PRIORITY_REQ;
-		ipcmsg->payload.req.msg = *msg;
-		ipcmsg->payload.req.priority = priority;
-		ipcmsg->size = sizeof(ipcmsg->payload.req);
-		ret = fastrpc_transport_send(cctx, (void *)ipcmsg,
-			sizeof(*ipcmsg));
-		trace_fastrpc_transport_send_ipcmsg(ipcmsg->type, cctx->domain_id,
+		ipcmsg.type = IPCMSG_TX_PRIORITY_REQ;
+		ipcmsg.payload.req.msg = *msg;
+		ipcmsg.payload.req.priority = priority;
+		ipcmsg.size = sizeof(ipcmsg.payload.req);
+		ret = fastrpc_transport_send(cctx, (void *)&ipcmsg,
+			sizeof(ipcmsg));
+		trace_fastrpc_transport_send_ipcmsg(ipcmsg.type, cctx->domain_id,
 			(uint64_t)ctx, msg->ctx, msg->handle, msg->sc, msg->addr,
-			msg->size, ipcmsg->payload.req.priority);
-		/* Free the allocated ipcmsg struct */
-		if (ipcmsg)
-			kfree(ipcmsg);
+			msg->size, ipcmsg.payload.req.priority);
 	} else {
 		/*
 		 * If DSP does not support new fastrpc_ipcmsg struct,
@@ -2786,19 +3002,21 @@ int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx, bool is_pdr)
 
 /*
  * Function to get static PD for process trying to attach,
- * by comparing service locator
+ * by comparing fixed pid.
  */
 static int fastrpc_get_static_pd_session(struct fastrpc_user *fl, u32 *session)
 {
 	int i, err = 0;
+	struct fastrpc_static_pd *spd = NULL;
 
 	if (!fl)
 		return -EBADF;
 
 	for (i = 0; i < FASTRPC_MAX_SPD ; i++) {
-		if (!fl->cctx->spd[i].servloc_name)
+		spd = &fl->cctx->spd[i];
+		if (!spd->spd_id)
 			continue;
-		if (!strcmp(fl->servloc_name, fl->cctx->spd[i].servloc_name)) {
+		if (fl->spd_id == spd->spd_id) {
 			*session = i;
 			break;
 		}
@@ -2807,7 +3025,7 @@ static int fastrpc_get_static_pd_session(struct fastrpc_user *fl, u32 *session)
 	if (i >= FASTRPC_MAX_SPD)
 		return -EUSERS;
 
-	if (atomic_read(&fl->cctx->spd[i].ispdup) == 0)
+	if (spd && atomic_read(&spd->ispdup) == 0)
 		return -ENOTCONN;
 
 	return err;
@@ -3161,8 +3379,8 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 	fl->sctx = sctx;
 
 	smmucb = &fl->sctx->smmucb[DEFAULT_SMMU_IDX];
-	is_oispd = !strcmp(name, "oispd");
-	is_audiopd = !strcmp(name, "audiopd");
+	is_oispd = !strcmp(name, OISPD);
+	is_audiopd = !strcmp(name, AUDIOPD);
 
 	/*
 	 * Update the pd_type, to direct the messages to correct PD, when
@@ -3172,9 +3390,11 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 	if (is_audiopd) {
 		fl->pd_type = AUDIO_STATICPD;
 		fl->servloc_name = AUDIO_PDR_SERVICE_LOCATION_CLIENT_NAME;
+		fl->spd_id = AUDIO_STATIC_ID;
 	} else if (is_oispd) {
 		fl->pd_type = OIS_STATICPD;
 		fl->servloc_name = OIS_PDR_ADSP_SERVICE_LOCATION_CLIENT_NAME;
+		fl->spd_id = OIS_STATIC_ID;
 	} else {
 		dev_err(smmucb->dev,
 		"Create static process is failed for proc_name %s", name);
@@ -3751,8 +3971,12 @@ void fastrpc_free_user(struct fastrpc_user *fl)
 
 	mutex_lock(&fl->map_mutex);
 	// During process tear down free the map, even if refcount is non-zero
-	list_for_each_entry_safe(map, m, &fl->maps, node)
+	list_for_each_entry_safe(map, m, &fl->maps, node) {
+		// During process tear down, 'retained iova' maps also need to be freed
+		if (map->attr == FASTRPC_MAP_ATTR_RETAIN_IOVA)
+			map->attr = FASTRPC_MAP_ATTR_DEFAULT;
 		__fastrpc_free_map(map);
+	}
 	mutex_unlock(&fl->map_mutex);
 
 	fastrpc_buf_list_free(fl, &fl->mmaps, false);
@@ -4313,6 +4537,8 @@ static int fastrpc_init_attach(struct fastrpc_user *fl, int pd)
 			fl->servloc_name = SENSORS_PDR_ADSP_SERVICE_LOCATION_CLIENT_NAME;
 		else if (fl->cctx->domain->type == FASTRPC_SDSP)
 			fl->servloc_name = SENSORS_PDR_SLPI_SERVICE_LOCATION_CLIENT_NAME;
+
+		fl->spd_id = SENSORS_STATIC_ID;
 
 		err = fastrpc_init_sensor_static_pd_status(fl);
 		if (err)
@@ -6519,6 +6745,21 @@ static int fastrpc_req_mem_unmap_impl(struct fastrpc_user *fl, struct fastrpc_me
 	/* Set the map state to default on successful unmapping */
 	atomic_set(&map->state, FD_MAP_DEFAULT);
 	mutex_lock(&fl->map_mutex);
+
+	/*
+	 * If the mapping was created with IOVA retention on unmap, allow
+	 * clearing that flag so the unmap also releases the IOVA region.
+	 */
+	if (map->attr == FASTRPC_MAP_ATTR_RETAIN_IOVA &&
+		req->attr == FASTRPC_MAP_ATTR_DEFAULT) {
+		map->attr = req->attr;
+	}
+
+	/*
+	 * Reset return virtual address of DSP, to return
+	 * failure on multiple unmap requests of same FD.
+	 */
+	map->raddr = 0;
 	fastrpc_map_put(map);
 	mutex_unlock(&fl->map_mutex);
 	return 0;
@@ -6944,7 +7185,8 @@ long fastrpc_dev_unmap_dma(struct fastrpc_device *dev,
 	spin_unlock_irqrestore(&cctx->lock, irq_flags);
 	mutex_lock(&fl->map_mutex);
 	err = fastrpc_map_lookup(fl, -1, 0, 0, p.unmap->buf,
-				ADSP_MMAP_DMA_BUFFER, &map, false);
+				ADSP_MMAP_DMA_BUFFER, &map,
+				false, FASTRPC_MAP_ATTR_DEFAULT);
 	 /*
 	  * Check if DSP mapping is complete, then move the state to
 	  * unmap in progress only if there is no other ongoing unmap.
@@ -7284,18 +7526,170 @@ void fastrpc_notify_users(struct fastrpc_user *user)
 	spin_unlock(&user->lock);
 }
 
+
+/*
+ * fastrpc_notify_pdr_drivers() - Function to notify userspace on
+ * static PD down
+ * @arg1: channel context
+ * @arg2: name of the process to send the notification
+ */
 static void fastrpc_notify_pdr_drivers(struct fastrpc_channel_ctx *cctx,
-		char *servloc_name)
+	int pid)
 {
 	struct fastrpc_user *fl;
 	unsigned long flags;
+	int err = 0;
 
 	spin_lock_irqsave(&cctx->lock, flags);
 	list_for_each_entry(fl, &cctx->users, user) {
-		if (fl->servloc_name && !strcmp(servloc_name, fl->servloc_name))
+		err = fastrpc_file_get(fl);
+		if (err) {
+			dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
+				__func__, fl);
+			continue;
+		}
+		if (fl->spd_id == pid)
 			fastrpc_notify_users(fl);
+		fastrpc_file_put(fl, false);
 	}
 	spin_unlock_irqrestore(&cctx->lock, flags);
+}
+
+/*
+ * fastrpc_populate_static_pd_session() - Populate the static
+ * pd structure on PD up
+ * @arg1: channel context
+ * @arg2: pid of the process to populate
+ */
+static int fastrpc_populate_static_pd_session(struct fastrpc_channel_ctx *cctx,
+	int pid)
+{
+	int i = 0, err = 0;
+	unsigned long flags = 0;
+	struct fastrpc_static_pd *spd = NULL;
+
+	spin_lock_irqsave(&cctx->lock, flags);
+	// Re-use the session, if found to retain the pdr count
+	for (i = 0; i < FASTRPC_MAX_SPD; i++) {
+		if (cctx->spd[i].spd_id == pid)
+			break;
+	}
+	if (i < FASTRPC_MAX_SPD)
+		goto spd_session_found;
+	// Use un-used session to populate static PD
+	for (i = 0; i < FASTRPC_MAX_SPD; i++) {
+		if (cctx->spd[i].used)
+			continue;
+
+		break;
+	}
+	if (i >= FASTRPC_MAX_SPD) {
+		spin_unlock_irqrestore(&cctx->lock, flags);
+		return -EUSERS;
+	}
+
+spd_session_found:
+	spd = &cctx->spd[i];
+	spd->spd_id = pid;
+	spd->cctx = cctx;
+	atomic_set(&spd->ispdup, 1);
+	spd->used = true;
+
+	/* Ignore PDR callback */
+	atomic_set(&spd->spd_status_notif, 1);
+	spin_unlock_irqrestore(&cctx->lock, flags);
+	return err;
+}
+
+/*
+ * fastrpc_reset_staticpd_session() - Reset static PD variables on PD down
+ * @arg1: static pd structure
+ */
+static void fastrpc_reset_staticpd_session(struct fastrpc_static_pd *spd)
+{
+	struct fastrpc_channel_ctx *cctx = spd->cctx;
+
+	atomic_set(&spd->ispdup, 0);
+	atomic_set(&spd->is_attached, 0);
+
+	/*
+	 * Audio PD status tracked using variable staticpd_status.
+	 * Used for enabling remoteheap only for Audio PD.
+	 */
+	if (spd->spd_id == AUDIO_STATIC_ID)
+		cctx->staticpd_status = false;
+}
+
+/*
+ * get_static_id_from_pd_name() - Get pid of the static PD given the name
+ * @arg1: static pd name
+ */
+static int get_static_id_from_pd_name(char *name) {
+
+	if(!strncmp(name, AUDIOPD, strlen(AUDIOPD)))
+		return AUDIO_STATIC_ID;
+	else if(!strncmp(name, SENSORSPD, strlen(SENSORSPD)))
+		return SENSORS_STATIC_ID;
+	else if(!strncmp(name, OISPD, strlen(OISPD)))
+		return OIS_STATIC_ID;
+	else
+		return INVALID_STATIC_ID;
+}
+
+/*
+ * fastrpc_depopulate_static_pd_session() - De-populate the static pd structure on PD down
+ * @arg1: channel context
+ * @arg2: notif struct sent on PD down
+ */
+static int fastrpc_depopulate_static_pd_session(struct fastrpc_channel_ctx *cctx,
+	struct dsp_notif_rsp *notif)
+{
+	int i, err = 0;
+	unsigned long flags;
+
+	spin_lock_irqsave(&cctx->lock, flags);
+	for (i = 0; i < FASTRPC_MAX_SPD ; i++) {
+		if( cctx->spd[i].spd_id == notif->pid)
+			break;
+	}
+	if (i >= FASTRPC_MAX_SPD) {
+		spin_unlock_irqrestore(&cctx->lock, flags);
+		return -EUSERS;
+	}
+	fastrpc_reset_staticpd_session(&cctx->spd[i]);
+	spin_unlock_irqrestore(&cctx->lock, flags);
+	return err;
+}
+
+/*
+ * fastrpc_pdr_notif() - Function which handles static PD notification from DSP
+ * @arg1: channel context
+ * @arg2: notif struct sent on PD down
+ */
+static void fastrpc_pdr_notif(struct fastrpc_channel_ctx *cctx,
+	struct dsp_notif_rsp *notif)
+{
+
+	if (!cctx || !notif)
+		return;
+
+	switch (notif->status) {
+	case FASTRPC_USERPD_EXIT:
+		pr_info("%s: Static PD with pid %d is down for PDR on domain %d\n",
+			__func__, notif->pid, cctx->domain->id);
+		fastrpc_depopulate_static_pd_session(cctx, notif);
+		fastrpc_notify_pdr_drivers(cctx, notif->pid);
+		break;
+	case FASTRPC_USERPD_UP:
+		pr_info("%s: Static PD with pid %d is up for PDR on domain %d\n",
+			__func__, notif->pid, cctx->domain->id);
+		fastrpc_populate_static_pd_session(cctx, notif->pid);
+		break;
+	default:
+		pr_info("%s: Invalid status %d\n", __func__, notif->status);
+		break;
+	}
+	return;
 }
 
 static void fastrpc_pdr_cb(int state, char *service_path, void *priv)
@@ -7308,13 +7702,23 @@ static void fastrpc_pdr_cb(int state, char *service_path, void *priv)
 		return;
 
 	cctx = spd->cctx;
+
+	/*
+	 * Ignore PDR callback if internal static pd notif
+	 * mechanism is supported
+	 */
+	if (atomic_read(&spd->spd_status_notif))
+		return;
+
 	switch (state) {
 	case SERVREG_SERVICE_STATE_DOWN:
-		pr_info("fastrpc: %s: %s (%s) is down for PDR on %s\n",
-			__func__, spd->spdname,
+		pr_info("fastrpc: %s: %d (%s) is down for PDR on %s\n",
+			__func__, spd->spd_id,
 			spd->servloc_name,
 			cctx->domain->name);
 		spin_lock_irqsave(&cctx->lock, flags);
+		fastrpc_reset_staticpd_session(spd);
+
 		spd->pdrcount++;
 		atomic_set(&spd->ispdup, 0);
 		atomic_set(&spd->is_attached, 0);
@@ -7323,11 +7727,11 @@ static void fastrpc_pdr_cb(int state, char *service_path, void *priv)
 				AUDIO_PDR_SERVICE_LOCATION_CLIENT_NAME))
 			cctx->staticpd_status = false;
 
-		fastrpc_notify_pdr_drivers(cctx, spd->servloc_name);
+		fastrpc_notify_pdr_drivers(cctx, spd->spd_id);
 		break;
 	case SERVREG_SERVICE_STATE_UP:
-		pr_info("fastrpc: %s: %s (%s) is up for PDR on %s\n",
-			__func__, spd->spdname,
+		pr_info("fastrpc: %s: %d (%s) is up for PDR on %s\n",
+			__func__, spd->spd_id,
 			spd->servloc_name,
 			cctx->domain->name);
 		atomic_set(&spd->ispdup, 1);
@@ -7681,6 +8085,18 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 	/* Set larger segment size to allow smmu to map > 4GB */
 	dma_set_max_seg_size(dev, DMA_BIT_MASK(32));
 
+	/*
+	 * Set the DMA mask for the SMMU parent device to 64-bit,
+	 * allowing the device to access the full range of DDR memory.
+	 * This is necessary for devices that need to perform DMA operations,
+	 * on high memory addresses beyond the 32-bit limit.
+	 */
+	rc = dma_set_mask(dev->parent, DMA_BIT_MASK(64));
+	if (rc) {
+		dev_err(dev, "64-bit parent SMMU dev DMA enable failed\n");
+		return rc;
+	}
+
 #ifdef CONFIG_DEBUG_FS
 	if (debugfs_root && !g_frpc.debugfs_global_file) {
 		debugfs_global_file = debugfs_create_file("global", 0644,
@@ -7864,8 +8280,8 @@ int fastrpc_setup_service_locator(struct fastrpc_channel_ctx *cctx, char *client
 		goto bail;
 	}
 	cctx->spd[spd_session].pdrhandle = handle;
-	cctx->spd[spd_session].servloc_name = client_name;
-	cctx->spd[spd_session].spdname = service_path;
+	cctx->spd[spd_session].servloc_name = service_path;
+	cctx->spd[spd_session].spd_id = get_static_id_from_pd_name(client_name);
 	cctx->spd[spd_session].cctx = cctx;
 	service = pdr_add_lookup(handle, service_name, service_path);
 	if (IS_ERR(service)) {
@@ -8025,7 +8441,6 @@ static int fastrpc_handle_ipcmsg_rsp(struct fastrpc_channel_ctx *cctx,
 					payload_size, sizeof(err_rsp), version);
 			}
 			break;
-
 		default:
 			err = -EINVAL;
 			dev_err(cctx->dev,
@@ -8158,6 +8573,9 @@ int fastrpc_handle_rpc_response(struct fastrpc_channel_ctx *cctx,
 						cctx->domain_id, cctx, notif);
 				else
 					err = -ENOENT;
+			} else if (rspv2->ctx == FASTRPC_STATICPD_RSP_CTX) {
+				notif = &data->rsp3;
+				fastrpc_pdr_notif(cctx, notif);
 			} else {
 				err = fastrpc_handle_legacy_rsp(cctx,
 					(void *)(&data->rsp), false, is_glink_wakeup);
@@ -8188,15 +8606,8 @@ int fastrpc_handle_rpc_response(struct fastrpc_channel_ctx *cctx,
 			break;
 
 		/* fastrpc_ipcmsg response */
-		case SIZE_FASTRPC_IPCMSG:
-			err = fastrpc_handle_ipcmsg_rsp(cctx, &data->rsp5);
-			break;
-
 		default:
-			err = -EBADMSG;
-			dev_err(cctx->dev,
-				"Error %d: %s: Unsupported response packet size %d",
-				err, __func__, len);
+			err = fastrpc_handle_ipcmsg_rsp(cctx, &data->rsp5);
 			break;
 	}
 
@@ -8617,14 +9028,13 @@ static int fastrpc_init(void)
 	ret = platform_driver_register(&fastrpc_cb_driver);
 	if (ret < 0) {
 		pr_err("fastrpc: failed to register cb driver\n");
-		return ret;
+		goto platform_register_bail;
 	}
 
 	ret = fastrpc_transport_init();
 	if (ret < 0) {
 		pr_err("fastrpc: failed to register rpmsg driver\n");
-		platform_driver_unregister(&fastrpc_cb_driver);
-		return ret;
+		goto transport_init_bail;
 	}
 
 #if IS_ENABLED(CONFIG_QCOM_FASTRPC_TRUSTED)
@@ -8644,6 +9054,15 @@ static int fastrpc_init(void)
 	g_frpc.debugfs_root = debugfs_root;
 #endif
 	return 0;
+
+transport_init_bail:
+	platform_driver_unregister(&fastrpc_cb_driver);
+platform_register_bail:
+	fastrpc_sysfs_deregister_kset();
+	idr_destroy(&g_frpc.mdctx_idr);
+	mutex_destroy(&g_frpc.hmut);
+	mutex_destroy(&g_frpc.gmut);
+	return ret;
 }
 module_init(fastrpc_init);
 

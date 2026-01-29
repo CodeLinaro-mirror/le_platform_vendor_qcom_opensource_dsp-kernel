@@ -6604,6 +6604,12 @@ static int fastrpc_get_dsp_info(struct fastrpc_user *fl, char __user *argp)
 		return -ECHRNG;
 	}
 
+	if (cap.attribute_id == KERNEL_TSTACK_FLAG_SUPPORT) {
+		/* Kernel-only attribute, no DSP query needed */
+		cap.capability = 1;
+		goto done;
+	}
+
 	if (cap.attribute_id >= FASTRPC_MAX_DSP_ATTRIBUTES) {
 		dev_err(fl->cctx->dev, "Error: invalid attribute: %d, err: %d\n",
 			cap.attribute_id, err);
@@ -6614,6 +6620,7 @@ static int fastrpc_get_dsp_info(struct fastrpc_user *fl, char __user *argp)
 	if (err)
 		return err;
 
+done:
 	if (copy_to_user(argp, &cap, sizeof(cap)))
 		return -EFAULT;
 
@@ -6810,7 +6817,8 @@ static int fastrpc_req_mmap(struct fastrpc_user *fl, char __user *argp)
 	smmucb = &fl->sctx->smmucb[DEFAULT_SMMU_IDX];
 	dev = smmucb->dev;
 	if ((req.flags == ADSP_MMAP_ADD_PAGES ||
-		req.flags == ADSP_MMAP_REMOTE_HEAP_ADDR) && !fl->is_unsigned_pd) {
+		req.flags == ADSP_MMAP_REMOTE_HEAP_ADDR ||
+		req.flags == ADSP_MMAP_ADD_PAGES_TSTACK) && !fl->is_unsigned_pd) {
 		if (req.vaddrin) {
 			dev_err(dev,
 			"adding user allocated pages is only supported for unsigned PD\n");
@@ -6832,7 +6840,7 @@ static int fastrpc_req_mmap(struct fastrpc_user *fl, char __user *argp)
 		 * Update dev with correct SMMU device,
 		 * on which the memory is allocated.
 		 */
-		if (req.flags == ADSP_MMAP_ADD_PAGES)
+		if (req.flags == ADSP_MMAP_ADD_PAGES || req.flags == ADSP_MMAP_ADD_PAGES_TSTACK)
 			dev = buf->smmucb->dev;
 
 		req_msg.pgid = fl->tgid_frpc;

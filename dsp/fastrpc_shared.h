@@ -172,6 +172,8 @@
 #define DSP_MMAP_ADD_ROOT_POOL_MEM  0x7000
 /* Map buffer in case of root mem request for DSP heap */
 #define DSP_MMAP_ADD_ROOT_HEAP_MEM  0x8000
+/* Map buffer for additional region when threadstackpool grows */
+#define ADSP_MMAP_ADD_PAGES_TSTACK  0x9000
 
 /* Size of dbglogbuf to log map/unmap calls on DSP*/
 #define DBGLOGBUF_SIZE (1*1024*1024)
@@ -575,6 +577,7 @@ enum fastrpc_internal_attributes {
 	/* Performance timeline DSP support */
 	TIMELINE_SUPPORT            = 141 + DSP_ATTR_OFFSET,
 	FASTRPC_PRELOAD_SUPPORT     = 142 + DSP_ATTR_OFFSET,
+	KERNEL_TSTACK_FLAG_SUPPORT  = 259 + DSP_ATTR_OFFSET,
 };
 
 enum fastrpc_remote_domains_id {

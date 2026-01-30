@@ -293,7 +293,7 @@ static void __fastrpc_free_map(struct fastrpc_map *map)
 
 	fl = map->fl;
 
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0))
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,16,0))
 	iova_in_use = dma_use_iova(&map->iova_state);
 #endif
 	retain_iova = (map->attr == FASTRPC_MAP_ATTR_RETAIN_IOVA);
@@ -341,7 +341,7 @@ static void __fastrpc_free_map(struct fastrpc_map *map)
 				goto free_map;
 			}
 
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0))
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,16,0))
 			if (iova_in_use) {
 				if (map->phys) {
 					/*
@@ -1480,7 +1480,7 @@ static int set_buffer_secure_type(struct fastrpc_map *map)
 	return err;
 }
 
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0))
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,16,0))
 /**
  * fastrpc_map_reserve_iova() -
  * Function to reserve iova region first (or use previously
@@ -1747,7 +1747,7 @@ map_retry:
 	}
 
 	if (retain_iova_attr) {
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0))
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,16,0))
 		err = fastrpc_map_reserve_iova(smmucb, map);
 #else
 		err = -EOPNOTSUPP;

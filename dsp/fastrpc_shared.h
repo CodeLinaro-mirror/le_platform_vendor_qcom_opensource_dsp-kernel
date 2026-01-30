@@ -964,7 +964,7 @@ struct fastrpc_map {
 	struct kref refcount;
 	int secure;
 	atomic_t state;
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0))
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,16,0))
 	/* Retained IOVA address and size */
 	struct dma_iova_state iova_state;
 #endif

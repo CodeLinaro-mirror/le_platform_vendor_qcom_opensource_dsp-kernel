@@ -1751,4 +1751,19 @@ int fastrpc_get_domain_pid_info(struct fastrpc_domain *domain, char **out_buf,
  */
 void fastrpc_sysfs_notify_pids(struct fastrpc_domain *domain);
 
+void fastrpc_register_wakeup_source(struct device *dev, const char *client_name,
+				struct wakeup_source **device_wake_source);
+
+void fastrpc_channel_ctx_get(struct fastrpc_channel_ctx *cctx);
+void fastrpc_channel_ctx_put(struct fastrpc_channel_ctx *cctx);
+void fastrpc_update_gctx(struct fastrpc_channel_ctx *cctx, int flag);
+void fastrpc_queue_pd_status(struct fastrpc_user *fl, int domain, int status, int sessionid);
+void frpc_coredump(struct fastrpc_channel_ctx *cctx, struct list_head *active_users_list);
+void fastrpc_lowest_capacity_corecount(struct device *dev, struct fastrpc_channel_ctx *cctx);
+
+int fastrpc_init_privileged_gids(struct device *dev, char *prop_name, struct gid_list *gidlist);
+int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx, bool is_pdr);
+int fastrpc_setup_service_locator(struct fastrpc_channel_ctx *cctx, char *client_name,
+				char *service_name, char *service_path, int spd_session);
+
 #endif /* __FASTRPC_SHARED_H__ */

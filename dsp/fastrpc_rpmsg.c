@@ -19,21 +19,6 @@
 #include <linux/remoteproc.h>
 #include <linux/rpmsg/qcom_glink.h>
 
-void fastrpc_channel_ctx_put(struct fastrpc_channel_ctx *cctx);
-void fastrpc_channel_ctx_get(struct fastrpc_channel_ctx *cctx);
-void fastrpc_update_gctx(struct fastrpc_channel_ctx *cctx, int flag);
-void fastrpc_lowest_capacity_corecount(struct device *dev, struct fastrpc_channel_ctx *cctx);
-int fastrpc_init_privileged_gids(struct device *dev, char *prop_name,
-						struct gid_list *gidlist);
-int fastrpc_setup_service_locator(struct fastrpc_channel_ctx *cctx, char *client_name,
-					char *service_name, char *service_path, int spd_session);
-void fastrpc_register_wakeup_source(struct device *dev,
-	const char *client_name, struct wakeup_source **device_wake_source);
-int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx, bool is_pdr);
-void fastrpc_queue_pd_status(struct fastrpc_user *fl, int domain, int status, int sessionid);
-void frpc_coredump(struct fastrpc_channel_ctx *cctx,
-	struct list_head *active_users_list);
-
 struct fastrpc_channel_ctx* get_current_channel_ctx(struct device *dev)
 {
 	return dev_get_drvdata(dev->parent);

@@ -3099,7 +3099,7 @@ static int fastrpc_init_sensor_static_pd_status(struct fastrpc_user *fl)
 	return err;
 }
 
-void print_buf_info(struct seq_file *s_file, struct fastrpc_buf *buf)
+static void print_buf_info(struct seq_file *s_file, struct fastrpc_buf *buf)
 {
     seq_printf(s_file,"\n %s %2s 0x%p", "virt", ":", buf->virt);
 	seq_printf(s_file,"\n %s %2s 0x%llx", "phys", ":", buf->phys);
@@ -3109,7 +3109,7 @@ void print_buf_info(struct seq_file *s_file, struct fastrpc_buf *buf)
 	seq_printf(s_file,"\n %s %s %d", "in_use", ":", buf->in_use);
 }
 
-void print_ictx_info(struct seq_file *s_file, struct fastrpc_invoke_ctx *ictx)
+static void print_ictx_info(struct seq_file *s_file, struct fastrpc_invoke_ctx *ictx)
 {
 	seq_printf(s_file,"\n %s %7s %d", "nscalars", ":", ictx->nscalars);
 	seq_printf(s_file,"\n %s %10s %d", "nbufs", ":", ictx->nbufs);
@@ -3126,7 +3126,7 @@ void print_ictx_info(struct seq_file *s_file, struct fastrpc_invoke_ctx *ictx)
 	seq_printf(s_file,"\n %s %9s %llu", "msg_sz", ":", ictx->msg_sz);
 }
 
-void print_sctx_info(struct seq_file *s_file, struct fastrpc_pool_ctx *sctx)
+static void print_sctx_info(struct seq_file *s_file, struct fastrpc_pool_ctx *sctx)
 {
 	int i;
 	struct fastrpc_smmu *s = NULL;
@@ -3156,7 +3156,7 @@ void print_sctx_info(struct seq_file *s_file, struct fastrpc_pool_ctx *sctx)
 	}
 }
 
-void print_ctx_info(struct seq_file *s_file, struct fastrpc_channel_ctx *ctx)
+static void print_ctx_info(struct seq_file *s_file, struct fastrpc_channel_ctx *ctx)
 {
 	seq_printf(s_file,"%s %8s %d\n", "domain_id", ":", ctx->domain_id);
 	seq_printf(s_file,"%s %8s %d\n", "sesscount", ":", ctx->sesscount);
@@ -3169,7 +3169,7 @@ void print_ctx_info(struct seq_file *s_file, struct fastrpc_channel_ctx *ctx)
 	seq_printf(s_file,"%s %s %d\n", "unsigned_support", ":", ctx->unsigned_support);
 }
 
-void print_map_info(struct seq_file *s_file, struct fastrpc_map *map)
+static void print_map_info(struct seq_file *s_file, struct fastrpc_map *map)
 {
 	seq_printf(s_file,"%s %4s %d\n", "fd", ":", map->fd);
 	seq_printf(s_file,"%s %s 0x%llx\n", "phys", ":", map->phys);
@@ -4956,7 +4956,7 @@ static void fastrpc_notif_find_process(int domain, struct fastrpc_channel_ctx *c
  * times out on the DSP.
  */
 
-void fastrpc_handle_dsp_root_request(struct work_struct *work)
+static void fastrpc_handle_dsp_root_request(struct work_struct *work)
 {
 	const unsigned int ROOT_RESPONSE_ARG_LENGTH = 2, ROOT_MEM_MSG_SIZE = 4,
                        ROOT_ERROR_MSG_SIZE = 1;
@@ -6153,7 +6153,7 @@ static int fastrpc_dspsignal_signal(struct fastrpc_user *fl,
 	return err;
 }
 
-int fastrpc_dspsignal_wait(struct fastrpc_user *fl,
+static int fastrpc_dspsignal_wait(struct fastrpc_user *fl,
 			     struct fastrpc_internal_dspsignal *fsig)
 {
 	int err = 0;
@@ -7325,7 +7325,7 @@ union fastrpc_dev_param {
 	* Return: 0 on success.
 	*
 	*/
-long fastrpc_dev_map_dma(struct fastrpc_device *dev,
+static long fastrpc_dev_map_dma(struct fastrpc_device *dev,
 			unsigned long invoke_param)
 {
 	int err = 0;
@@ -7450,7 +7450,7 @@ error:
 	* Return: 0 on success.
 	*
 	*/
-long fastrpc_dev_unmap_dma(struct fastrpc_device *dev,
+static long fastrpc_dev_unmap_dma(struct fastrpc_device *dev,
 			unsigned long invoke_param)
 {
 	int err = 0;
@@ -7564,7 +7564,7 @@ error:
 	* Return: void.
 	*
 	*/
-long fastrpc_dev_get_hlos_pid(struct fastrpc_device *dev,
+static long fastrpc_dev_get_hlos_pid(struct fastrpc_device *dev,
 			unsigned long invoke_param)
 {
 	int err = 0;

@@ -856,7 +856,7 @@ static void fastrpc_channel_ctx_free(struct kref *ref)
 		for (j = 0; j < cctx->session[i].smmucount; j++)
 			mutex_destroy(&cctx->session[i].smmucb[j].map_mutex);
 	ida_destroy(&cctx->tgid_frpc_ida);
-	kfree(cctx);
+	kvfree(cctx);
 }
 
 void fastrpc_channel_ctx_get(struct fastrpc_channel_ctx *cctx)
@@ -5985,8 +5985,8 @@ static int fastrpc_invoke_dspsignal(struct fastrpc_user *fl, struct fastrpc_inte
  * Copies available log entries from the ring buffer to the user-provided
  * buffer in the ioctl payload.
  *
- * @param[in]  klog   : Pointer to ioctl kernel log structure
- * @param[in]  fl   : Pointer to fastrpc user
+ * @param[in] klog   : Pointer to ioctl kernel log structure
+ * @param[in] fl   : Pointer to fastrpc user
  *
  * @return 0 on success, error code on failure
  */

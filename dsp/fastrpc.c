@@ -3184,6 +3184,21 @@ static void print_map_info(struct seq_file *s_file, struct fastrpc_map *map)
 	seq_printf(s_file,"%s %2s 0x%x\n", "flags", ":", map->flags);
 }
 
+void print_session_info(struct seq_file *s_file, struct fastrpc_user *fl)
+{
+	seq_printf(s_file,"%s %2s %s\n", "process_name", ":", fl->name);
+	seq_printf(s_file,"%s %12s %d\n", "tgid", ":", fl->tgid);
+	seq_printf(s_file,"%s %7s %d\n", "tgid_frpc", ":", fl->tgid_frpc);
+	seq_printf(s_file,"%s %3s %d\n", "is_secure_dev", ":", fl->is_secure_dev);
+	seq_printf(s_file,"%s %3s %d\n", "num_pers_hdrs", ":", fl->num_pers_hdrs);
+	seq_printf(s_file,"%s %2s %d\n", "num_cached_buf", ":", fl->num_cached_buf);
+	seq_printf(s_file,"%s %5s %d\n", "wake_enable", ":", fl->wake_enable);
+	seq_printf(s_file,"%s %2s %d\n",  "is_unsigned_pd", ":", fl->is_unsigned_pd);
+	seq_printf(s_file,"%s %7s %d\n",  "sessionid", ":", fl->sessionid);
+	seq_printf(s_file,"%s %9s %d\n", "pd_type", ":", fl->pd_type);
+	seq_printf(s_file,"%s %9s %d\n",  "profile", ":", fl->profile);
+}
+
 static int fastrpc_debugfs_show(struct seq_file *s_file, void *data)
 {
 	struct fastrpc_user *fl = s_file->private;
@@ -3202,16 +3217,7 @@ static int fastrpc_debugfs_show(struct seq_file *s_file, void *data)
 			return 0;
 		}
 
-		seq_printf(s_file,"%s %12s %d\n", "tgid", ":", fl->tgid);
-		seq_printf(s_file,"%s %7s %d\n", "tgid_frpc", ":", fl->tgid_frpc);
-		seq_printf(s_file,"%s %3s %d\n", "is_secure_dev", ":", fl->is_secure_dev);
-		seq_printf(s_file,"%s %3s %d\n", "num_pers_hdrs", ":", fl->num_pers_hdrs);
-		seq_printf(s_file,"%s %2s %d\n", "num_cached_buf", ":", fl->num_cached_buf);
-		seq_printf(s_file,"%s %5s %d\n", "wake_enable", ":", fl->wake_enable);
-		seq_printf(s_file,"%s %2s %d\n",  "is_unsigned_pd", ":", fl->is_unsigned_pd);
-		seq_printf(s_file,"%s %7s %d\n",  "sessionid", ":", fl->sessionid);
-		seq_printf(s_file,"%s %9s %d\n", "pd_type", ":", fl->pd_type);
-		seq_printf(s_file,"%s %9s %d\n",  "profile", ":", fl->profile);
+		print_session_info(s_file, fl);
 
 		if(fl->cctx) {
 			seq_printf(s_file,"\n=============== Channel Context ===============\n");
@@ -3870,6 +3876,115 @@ static void *fastrpc_get_and_copy_shell_file(
 	return file;
 }
 
+/**
+ * Log detailed session-related information to ring buffer
+ *
+ * Logs session metadata, channel context, and invoke, interrupted context
+ * information for a given user session to the ring buffer for debugging.
+ *
+ * @param[in] s_file        : Pointer to seq_file used for formatting output
+ * @param[in] fl            : Pointer to fastrpc user session
+ * @param[in] session_num   : Session number for identification
+ */
+static void fastrpc_log_session_info(struct seq_file *s_file,
+	struct fastrpc_user *fl, int session_num)
+{
+	struct fastrpc_invoke_ctx *ictx;
+
+	s_file->count = 0;
+	print_session_info(s_file, fl);
+	FASTRPC_LOG_INFO(fl->cctx->dev, fl->cctx, FASTRPC_LOG_RINGBUF,
+		"session_num : %d %.*s\n", session_num, s_file->count, s_file->buf);
+
+	if (fl->sctx) {
+		s_file->count = 0;
+		print_sctx_info(s_file, fl->sctx);
+		FASTRPC_LOG_INFO(fl->cctx->dev, fl->cctx, FASTRPC_LOG_RINGBUF,
+		"session_num : %d %.*s\n", session_num, s_file->count, s_file->buf);
+	}
+
+	spin_lock(&fl->lock);
+	list_for_each_entry(ictx, &fl->pending, node) {
+		s_file->count = 0;
+		print_ictx_info(s_file, ictx);
+		FASTRPC_LOG_INFO(fl->cctx->dev, fl->cctx, FASTRPC_LOG_RINGBUF,
+		"session_num : %d %.*s\n", session_num, s_file->count, s_file->buf);
+	}
+	list_for_each_entry(ictx, &fl->interrupted, node) {
+		s_file->count = 0;
+		print_ictx_info(s_file, ictx);
+		FASTRPC_LOG_INFO(fl->cctx->dev, fl->cctx, FASTRPC_LOG_RINGBUF,
+		"session_num : %d %.*s\n", session_num, s_file->count, s_file->buf);
+	}
+	spin_unlock(&fl->lock);
+}
+
+/**
+ * Collect and log information for all active sessions
+ *
+ * Iterates over all user sessions in the channel context and logs
+ * detailed session information to the ring buffer.
+ *
+ * @param[in] cctx : Pointer to channel context
+ *
+ * @return 0 on success, error code on failure
+ */
+static void fastrpc_get_sessions_info(struct fastrpc_channel_ctx *cctx)
+{
+	struct seq_file *s_file = NULL;
+	int err = 0, ret, session_num = 1;
+	struct fastrpc_user *fl, *n;
+	unsigned long irq_flags = 0;
+	struct list_head users_list;
+
+	INIT_LIST_HEAD(&users_list);
+	s_file = kzalloc(sizeof(*s_file), GFP_KERNEL);
+	if (!s_file) {
+		err = -ENOMEM;
+		goto bail;
+	}
+	s_file->buf = (char*)kzalloc(SESSION_BUF_SIZE, GFP_KERNEL);
+	if (!s_file->buf) {
+		err = -ENOMEM;
+		goto bail;
+	}
+	s_file->size = SESSION_BUF_SIZE;
+
+	print_ctx_info(s_file, cctx);
+	FASTRPC_LOG_INFO(cctx->dev, cctx, FASTRPC_LOG_RINGBUF,
+		"Channel information for dsp-type : %d %.*s\n",
+		cctx->domain->type, s_file->count, s_file->buf);
+
+	spin_lock_irqsave(&cctx->lock, irq_flags);
+	list_for_each_entry(fl, &cctx->users, user) {
+		ret = fastrpc_file_get(fl);
+		if (ret) {
+			dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
+				__func__, fl);
+			continue;
+		}
+		list_add_tail(&fl->rb_log_node, &users_list);
+	}
+	spin_unlock_irqrestore(&cctx->lock, irq_flags);
+
+	list_for_each_entry_safe(fl, n, &users_list, rb_log_node) {
+		fastrpc_log_session_info(s_file, fl,
+			session_num);
+		list_del(&fl->rb_log_node);
+		fastrpc_file_put(fl, false);
+		session_num++;
+	}
+
+bail:
+	if (err)
+		dev_err(cctx->dev, "%s : err %d Failed to push session information into ring buffer\n",
+				__func__, err);
+	if (s_file) {
+		kfree(s_file->buf);
+		kfree(s_file);
+	}
+}
+
 static int fastrpc_init_create_process(struct fastrpc_user *fl,
 					char __user *argp)
 {
@@ -3966,6 +4081,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	sctx = fastrpc_session_alloc(fl, false, fl->pd_type);
 	if (!sctx) {
 		dev_warn_ratelimited(fl->cctx->dev, "No session available\n");
+		fastrpc_get_sessions_info(fl->cctx);
 		err = -EBUSY;
 		goto err_out;
 	}

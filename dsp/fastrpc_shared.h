@@ -372,6 +372,12 @@
 /* Size of the ring buffer used for storing log messages (256 KB) */
 #define RING_BUFFER_SIZE (256*1024)
 
+/*
+ * Buffer size for storing session info used in verbose
+ * logging during session exhaustion
+ */
+#define SESSION_BUF_SIZE (2*1024)
+
 #define PERF_END ((void)0)
 
 #define PERF(enb, cnt, ff) \
@@ -1608,6 +1614,11 @@ struct fastrpc_user {
 	struct list_head active_user_ssr;
 	struct kref refcount;
 	struct work_struct put_work;
+	/*
+	 * Node for linking this user object into the temporary users list
+	 * used during session verbose logging.
+	 */
+	struct list_head rb_log_node;
 	/* Flag set to request the logger thread to wake up and exit */
 	bool logger_exit;
 };

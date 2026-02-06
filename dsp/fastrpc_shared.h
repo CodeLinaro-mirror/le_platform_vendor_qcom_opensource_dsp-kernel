@@ -1489,6 +1489,8 @@ struct fastrpc_user {
 	struct list_head active_user_ssr;
 	struct kref refcount;
 	struct work_struct put_work;
+	/* Flag set to request the logger thread to wake up and exit */
+	bool logger_exit;
 };
 
 struct fastrpc_ctrl_latency {

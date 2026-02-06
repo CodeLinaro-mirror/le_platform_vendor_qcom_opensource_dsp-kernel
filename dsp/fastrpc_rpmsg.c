@@ -18,6 +18,9 @@
 #include <linux/delay.h>
 #include <linux/remoteproc.h>
 #include <linux/rpmsg/qcom_glink.h>
+#if FRPC_RING_BUFFER_ENABLED
+#include <linux/ring_buffer.h>
+#endif
 
 struct fastrpc_channel_ctx* get_current_channel_ctx(struct device *dev)
 {
@@ -390,6 +393,9 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	init_completion(&data->ssr_complete);
 	init_completion(&data->rpmsg_remove_start);
 	init_waitqueue_head(&data->ssr_wait_queue);
+#if FRPC_RING_BUFFER_ENABLED
+	init_waitqueue_head(&data->log.wq);
+#endif
 	data->domain_id = domain->id;
 	data->max_sess_per_proc = FASTRPC_MAX_SESSIONS_PER_PROCESS;
 	data->rpdev = rpdev;
@@ -404,6 +410,13 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	if (domain->type == FASTRPC_NSP) {
 		data->unsigned_support = true;
 		data->cpuinfo_todsp = FASTRPC_CPUINFO_EARLY_WAKEUP;
+#if FRPC_RING_BUFFER_ENABLED
+		data->log.rb = ring_buffer_alloc(RING_BUFFER_SIZE,
+			RB_FL_OVERWRITE);
+		if (!data->log.rb)
+			dev_err(rdev, "ring buffer allocation failed for %s \n",
+				domain->name);
+#endif
 	}
 
 	/* Configure device nodes for DSP */
@@ -435,6 +448,12 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	return 0;
 
 fdev_error:
+#if FRPC_RING_BUFFER_ENABLED
+	if (domain->type == FASTRPC_NSP && data->log.rb) {
+		ring_buffer_free(data->log.rb);
+		data->log.rb = NULL;
+	}
+#endif
 	if (data->kcomm_user.obj)
 		fastrpc_channel_default_user_delete(data);
 
@@ -536,7 +555,12 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 		spin_lock_irqsave(&cctx->lock, flags);
 	}
 	spin_unlock_irqrestore(&cctx->lock, flags);
-
+#if FRPC_RING_BUFFER_ENABLED
+	if (domain->type == FASTRPC_NSP && cctx->log.rb) {
+		ring_buffer_free(cctx->log.rb);
+		cctx->log.rb = NULL;
+	}
+#endif
 	/*
 	 * As remote channel is down, corresponding SMMU devices will also
 	 * be removed. So free all SMMU mappings of every process using this

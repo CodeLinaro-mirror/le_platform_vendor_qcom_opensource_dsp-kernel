@@ -34,6 +34,9 @@
 #include "fastrpc_shared.h"
 #include <linux/platform_device.h>
 #include <linux/types.h>
+#if FRPC_RING_BUFFER_ENABLED
+#include <linux/ring_buffer.h>
+#endif
 #include <linux/version.h>
 #define CREATE_TRACE_POINTS
 #include "fastrpc_trace.h"
@@ -9128,6 +9131,70 @@ static int fastrpc_retrieve_legacy_info(struct fastrpc_domain *domain)
 		break;
 	}
 	return err;
+}
+
+void fastrpc_log_internal(struct device *dev,
+	struct fastrpc_channel_ctx *cctx, int dest_mask,
+	enum fastrpc_log_level level, const char *fmt, ...)
+{
+#if FRPC_RING_BUFFER_ENABLED
+	if ((dest_mask & FASTRPC_LOG_RINGBUF) && cctx && cctx->log.rb) {
+		int msg_len;
+		va_list arg;
+
+		/* Measure formatted length (excluding NULL terminator). */
+		va_start(arg, fmt);
+		msg_len = vsnprintf(NULL, 0, fmt, arg);
+		va_end(arg);
+
+		if (msg_len >= 0) {
+			/* rb_data_len : level + string + NULL terminator */
+			const int rb_data_len = 1 + msg_len + 1;
+			const size_t event_len   =
+				sizeof(struct fastrpc_event_log) + rb_data_len;
+			struct ring_buffer_event *event =
+				ring_buffer_lock_reserve(cctx->log.rb, event_len);
+
+			if (event) {
+				struct fastrpc_event_log *entry = ring_buffer_event_data(event);
+				entry->data_len = rb_data_len;
+				entry->data[0]  = (char)level;
+
+				va_list arg_rb;
+				va_start(arg_rb, fmt);
+				vsnprintf(&entry->data[1], rb_data_len - 1, fmt, arg_rb);
+				va_end(arg_rb);
+
+				ring_buffer_unlock_commit(cctx->log.rb);
+				wake_up_interruptible(&cctx->log.wq);
+			}
+		}
+	}
+#endif /* >= 6.18 */
+
+	if (dest_mask & FASTRPC_LOG_DMESG) {
+		va_list arg_dmesg;
+		struct va_format vaf;
+
+		va_start(arg_dmesg, fmt);
+		vaf.fmt = fmt;
+		vaf.va  = &arg_dmesg;
+
+		switch (level) {
+		case FASTRPC_LOG_LEVEL_INFO:
+			dev ? dev_info(dev, "%pV\n", &vaf) : pr_info("%pV\n", &vaf);
+			break;
+		case FASTRPC_LOG_LEVEL_WARN:
+			dev ? dev_warn(dev, "%pV\n", &vaf) : pr_warn("%pV\n", &vaf);
+			break;
+		case FASTRPC_LOG_LEVEL_ERROR:
+		default:
+			dev ? dev_err(dev, "%pV\n", &vaf) : pr_err("%pV\n", &vaf);
+			break;
+		}
+
+		va_end(arg_dmesg);
+	}
 }
 
 /*

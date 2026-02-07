@@ -572,6 +572,8 @@ enum fastrpc_internal_attributes {
 	ROOTPD_RPC_HEAP_SUPPORT     = 131 + DSP_ATTR_OFFSET,
 	DBGLOGBUF_SUPPORT           = 133 + DSP_ATTR_OFFSET,
 	FASTRPC_IPCMSG_SUPPORT      = 135 + DSP_ATTR_OFFSET,
+	/* Performance timeline DSP support */
+	TIMELINE_SUPPORT            = 141 + DSP_ATTR_OFFSET,
 	FASTRPC_PRELOAD_SUPPORT     = 142 + DSP_ATTR_OFFSET,
 };
 

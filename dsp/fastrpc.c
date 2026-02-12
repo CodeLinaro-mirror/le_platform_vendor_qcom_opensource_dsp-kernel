@@ -3600,14 +3600,10 @@ bail:
  */
 static void fastrpc_preload_mem_free(struct fastrpc_channel_ctx *cctx)
 {
-	unsigned long flags = 0;
-
 	if (!cctx->preload_buf)
 		return;
-	spin_lock_irqsave(&cctx->lock, flags);
 	__fastrpc_buf_free(cctx->preload_buf);
 	cctx->preload_buf = NULL;
-	spin_unlock_irqrestore(&cctx->lock, flags);
 }
 
 /**
@@ -3648,17 +3644,17 @@ static int fastrpc_preload_mem_alloc(struct fastrpc_channel_ctx *cctx,
 	spin_lock_irqsave(&cctx->lock, flags);
 	if (!cctx->preload_buf) {
 		cctx->preload_buf = buf;
-	} else {
-		if (buf)
-			__fastrpc_buf_free(buf);
-		buf = cctx->preload_buf;
+		/* Set buf as NULL to indicate it is being used */
+		buf = NULL;
 	}
 	spin_unlock_irqrestore(&cctx->lock, flags);
 	*pageslen = page_num;
-	pages[page_num-1].addr = buf->phys;
-	pages[page_num-1].size = buf->size;
+	pages[page_num-1].addr = cctx->preload_buf->phys;
+	pages[page_num-1].size = cctx->preload_buf->size;
 
 bail:
+	if (buf)
+		__fastrpc_buf_free(buf);
 	return err;
 }
 

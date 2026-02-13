@@ -478,6 +478,8 @@
 /* Max RX version supported for fastrpc_ipcmsg */
 #define KERNEL_MAX_IPC_RX_VER (MAX_RX_DATATYPE_VAL - 1)
 
+/* process name length of process offloading to dsp */
+#define PROCESS_NAME_LEN 48
 /*
  * Attribute buffer sent to DSP starts at index 1, not 0.
  * Kernel attributes are offset by +1 to align with DSP attributes.
@@ -1428,7 +1430,7 @@ struct fastrpc_user {
 	/* Actual hlos pid of process offloading to dsp */
 	int tgid_app;
 	/* Process name of process offloading to dsp */
-	char name[TASK_COMM_LEN];
+	char name[PROCESS_NAME_LEN];
 	/* PD type of remote subsystem process */
 	u32 pd_type;
 	/* Flag to set if DSP remote process ran into exception or faulted */

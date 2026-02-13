@@ -337,8 +337,7 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 		vmcount = 0;
 	else if (!qcom_scm_is_available())
 		return -EPROBE_DEFER;
-
-	data = kzalloc(sizeof(*data), GFP_KERNEL);
+	data = kvzalloc(sizeof(*data), GFP_KERNEL);
 	if (!data)
 		return -ENOMEM;
 
@@ -444,7 +443,7 @@ populate_error:
 	if (data->fdevice)
 		misc_deregister(&data->fdevice->miscdev);
 
-	kfree(data);
+	kvfree(data);
 	return err;
 }
 

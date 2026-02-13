@@ -214,8 +214,7 @@ struct fastrpc_channel_ctx* get_current_channel_ctx(struct device *dev)
 
 	if (scctx)
 		return scctx;
-
-	scctx = kzalloc(sizeof(*scctx), GFP_KERNEL);
+	scctx = kvzalloc(sizeof(*scctx), GFP_KERNEL);
 	if (IS_ERR_OR_NULL(scctx)) {
 		dev_err(dev, "failed to get channel ctx\n");
 		return ERR_PTR(-ENOMEM);
@@ -633,7 +632,7 @@ bail:
 	if (err) {
 		kfree(scctx->domain);
 		scctx->domain = NULL;
-		kfree(scctx);
+		kvfree(scctx);
 		scctx = NULL;
 		pr_err("fastrpc_transport_init failed with err %d\n", err);
 	}

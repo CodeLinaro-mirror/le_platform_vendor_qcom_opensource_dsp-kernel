@@ -36,7 +36,7 @@
 #define CDSP1_DOMAIN_ID (4)
 #define NUM_LEGACY_ID_MAX	5 /* adsp, mdsp, slpi, cdsp, cdsp1 */
 #define FASTRPC_MAX_SESSIONS	50
-#define FASTRPC_MAX_SESSIONS_PER_PROCESS	4
+#define FASTRPC_MAX_SESSIONS_PER_PROCESS	6
 
 /* Check if given domain id is valid */
 #define IS_LEGACY_DOMAIN_ID(domain) (domain < NUM_LEGACY_ID_MAX)
@@ -541,6 +541,7 @@ enum fastrpc_process_method_ids {
 	FASTRPC_RMID_INIT_MDCTX_MANAGE  = 12,
 	FASTRPC_RMID_INIT_PROCESS_DUMP  = 13,
 	FASTRPC_RMID_KCOMM_REMOTE_CALL  = 14,
+	FASTRPC_RMID_INIT_ATTACH2       = 16,
 	FASTRPC_RMID_INIT_MAX,
 };
 
@@ -964,7 +965,7 @@ struct fastrpc_map {
 	struct kref refcount;
 	int secure;
 	atomic_t state;
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0))
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,16,0))
 	/* Retained IOVA address and size */
 	struct dma_iova_state iova_state;
 #endif
@@ -1404,6 +1405,8 @@ struct fastrpc_user {
 	char name[TASK_COMM_LEN];
 	/* PD type of remote subsystem process */
 	u32 pd_type;
+	/* Flag to set if DSP remote process ran into exception or faulted */
+	bool is_faulted;
 	/* total cached buffers */
 	u32 num_cached_buf;
 	/* total persistent headers */

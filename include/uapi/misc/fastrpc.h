@@ -18,6 +18,7 @@
 #define FASTRPC_IOCTL_MEM_UNMAP		_IOWR('R', 11, struct fastrpc_mem_unmap)
 #define FASTRPC_IOCTL_MULTIMODE_INVOKE	_IOWR('R', 12, struct fastrpc_ioctl_multimode_invoke)
 #define FASTRPC_IOCTL_GET_DSP_INFO	_IOWR('R', 13, struct fastrpc_ioctl_capability)
+#define FASTRPC_IOCTL_INIT_ATTACH2 	_IOWR('R', 14, struct fastrpc_ioctl_init_attach2)
 
 /* Reserved fields in mdxtx ioctl structs for 64-bit alignment */
 #define FASTRPC_MDCTX_IOCTL_RSVD 8
@@ -168,6 +169,13 @@ struct fastrpc_init_create_static {
 	__u32 namelen;	/* length of pd process name */
 	__u32 memlen;
 	__u64 name;	/* pd process name */
+};
+
+struct fastrpc_ioctl_init_attach2 {
+	__u32 filelen;	/* elf file length */
+	__s32 filefd;	/* fd for the file */
+	__u64 file;	/* pointer to elf file */
+	__s32 reserved[4];
 };
 
 struct fastrpc_alloc_dma_buf {

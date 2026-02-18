@@ -293,7 +293,7 @@ static void __fastrpc_free_map(struct fastrpc_map *map)
 
 	fl = map->fl;
 
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0))
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,16,0))
 	iova_in_use = dma_use_iova(&map->iova_state);
 #endif
 	retain_iova = (map->attr == FASTRPC_MAP_ATTR_RETAIN_IOVA);
@@ -341,7 +341,7 @@ static void __fastrpc_free_map(struct fastrpc_map *map)
 				goto free_map;
 			}
 
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0))
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,16,0))
 			if (iova_in_use) {
 				if (map->phys) {
 					/*
@@ -866,7 +866,7 @@ static void fastrpc_channel_ctx_free(struct kref *ref)
 		for (j = 0; j < cctx->session[i].smmucount; j++)
 			mutex_destroy(&cctx->session[i].smmucb[j].map_mutex);
 	ida_destroy(&cctx->tgid_frpc_ida);
-	kfree(cctx);
+	kvfree(cctx);
 }
 
 void fastrpc_channel_ctx_get(struct fastrpc_channel_ctx *cctx)
@@ -1480,7 +1480,7 @@ static int set_buffer_secure_type(struct fastrpc_map *map)
 	return err;
 }
 
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0))
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,16,0))
 /**
  * fastrpc_map_reserve_iova() -
  * Function to reserve iova region first (or use previously
@@ -1747,13 +1747,15 @@ map_retry:
 	}
 
 	if (retain_iova_attr) {
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0))
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,16,0))
 		err = fastrpc_map_reserve_iova(smmucb, map);
 #else
 		err = -EOPNOTSUPP;
 #endif
-		if (err)
+		if (err) {
+			mutex_unlock(&smmucb->map_mutex);
 			goto assign_err;
+		}
 	} else if (attr & FASTRPC_ATTR_SECUREMAP) {
 		map->phys = sg_phys(map->table->sgl);
 		for_each_sg(map->table->sgl, sgl, map->table->nents,
@@ -3657,6 +3659,73 @@ err_sharedbuf_fail:
 	return err;
 }
 
+/*
+ * fastrpc_get_and_copy_shell_file() - copy shell file into kernel
+ *
+ * @fl            : FastRPC user file pointer
+ * @user_file_ptr : pointer to user-space pointer for file data address
+ * @filelen       : pointer to length of the file data
+ * @filefd        : file descriptor if file is passed as a descriptor
+ *
+ * Behavior:
+ * - If filefd > 0, returns NULL (file provided via descriptor).
+ * - If either *filelen == 0 or *user_file_ptr == 0 when no descriptor
+ *   is provided, sets both to 0 and returns NULL, allowing the DSP to
+ *   load the shell via the daemon. If file pointer and size is given
+ *   allocate buffer copy the data from userspace to avoid invalid
+ *   access.
+ *
+ * Returns:
+ * - pointer to allocated buffer on success
+ * - NULL if no buffer is needed
+ * - ERR_PTR(-ENOMEM) or ERR_PTR(-EFAULT) on error
+ */
+static void *fastrpc_get_and_copy_shell_file(
+		struct fastrpc_user *fl,
+		u64 *user_file_ptr,
+		u32 *filelen,
+		s32 filefd)
+{
+	void *file = NULL;
+
+	/* File passed as fd; no need to copy */
+	if (filefd > 0)
+		return NULL;
+
+	if (!user_file_ptr || !filelen)
+		return NULL;
+
+	/*
+	 * If no file provided, normalize to zero for
+	 * daemon-based shell load.
+	 */
+	if (!(*filelen) || !(*user_file_ptr)) {
+		*user_file_ptr = 0;
+		*filelen = 0;
+		return NULL;
+	}
+
+	/*
+	 * In case file pointer and file length is valid and
+	 * fd is not valid, allocate buffer and copy the data
+	 * from userspace to avoid invalid access.
+	 */
+
+	file = kzalloc(*filelen, GFP_KERNEL);
+	if (!file)
+		return ERR_PTR(-ENOMEM);
+	if (copy_from_user(file,
+			(void __user *)(uintptr_t)(*user_file_ptr),
+			*filelen)) {
+		dev_err(fl->cctx->dev,
+			"%s: copy_from_user failed for shell file of len %u\n",
+			__func__, *filelen);
+		kfree(file);
+		return ERR_PTR(-EFAULT);
+	}
+	return file;
+}
+
 static int fastrpc_init_create_process(struct fastrpc_user *fl,
 					char __user *argp)
 {
@@ -3691,26 +3760,12 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 				DSP_CREATE_START) != DEFAULT_PROC_STATE)
 		return -EALREADY;
 
-	/* Verify shell file passed by user */
-	if (init.filefd <= 0) {
-		if (!init.filelen || !init.file) {
-		/*In this case shell will be loaded by DSP using daemon */
-			init.file = 0;
-			init.filelen = 0;
-		} else {
-			file = kzalloc(init.filelen, GFP_KERNEL);
-			if (!file) {
-				err = -ENOMEM;
-				goto err_out;
-			}
-			if (copy_from_user(file,
-				(void *)(uintptr_t)init.file,
-				init.filelen)) {
-				err = -EFAULT;
-				dev_err(fl->cctx->dev, "copy_from_user failed for shell file\n");
-				goto err_out;
-			}
-		}
+	file = fastrpc_get_and_copy_shell_file(fl, &init.file,
+			&init.filelen, init.filefd);
+	if (IS_ERR(file)) {
+		err = PTR_ERR(file);
+		file = NULL;
+		goto err_out;
 	}
 	/*
 	 * Third-party apps don't have permission to open the fastrpc device, so
@@ -4331,6 +4386,7 @@ static int fastrpc_user_obj_create(struct file *filp,
 	fl->config.user_fd = -1;
 	fl->pd_type = DEFAULT_UNUSED;
 	fl->dsp_recovery = false;
+	fl->is_faulted = false;
 
 	if (filp) {
 		fl->tgid = fl->tgid_app = current->tgid;
@@ -4499,33 +4555,61 @@ static int fastrpc_send_cpuinfo_to_dsp(struct fastrpc_user *fl)
 	return err;
 }
 
-static int fastrpc_init_attach(struct fastrpc_user *fl, int pd)
+
+/**
+ * fastrpc_init_attach_common() - Common initialization for attach
+ *                                 operations
+ *
+ * @fl: Pointer to fastrpc user context
+ * @pd: Process domain type
+ *
+ * This function performs common initialization steps for attaching to
+ * a DSP process domain. It validates security permissions, allocates
+ * a session context, and updates the process domain type if needed.
+ *
+ * Return: 0 on success, -EACCES if security check fails, -EBUSY if
+ *         no session is available
+ */
+static int fastrpc_init_attach_common(struct fastrpc_user *fl, int pd)
 {
-	struct fastrpc_invoke_args args[1];
-	struct fastrpc_enhanced_invoke ioctl;
 	struct fastrpc_pool_ctx *sctx = NULL;
-	int err, tgid = fl->tgid_frpc;
 
 	if (!fl->is_secure_dev) {
-		dev_err(fl->cctx->dev, "untrusted app trying to attach to privileged DSP PD\n");
+		dev_err(fl->cctx->dev,
+			"Error: %s: untrusted app trying to attach to privileged DSP PD\n (pid %d)",
+			__func__, fl->tgid_app);
 		return -EACCES;
 	}
 	sctx = fastrpc_session_alloc(fl, false, fl->pd_type);
 	if (!sctx) {
-		dev_err(fl->cctx->dev, "No session available\n");
+		dev_err(fl->cctx->dev,
+			"Error: %s: No session available for pid %d, pd type %d\n",
+			__func__, fl->tgid_app, fl->pd_type);
 		return -EBUSY;
 	}
 	fl->sctx = sctx;
 
 	/*
 	 * Default value at fastrpc_device_open is set as DEFAULT_UNUSED.
-	 * If pd_type is not configured by the process in fastrpc_set_session_info,
-	 * update the pd_type, so that messages are directed to right process,
-	 * when fastrpc_getpd_msgidx is queried.
-	 * Do this only after session allocation.
+	 * If pd_type is not configured by the process in
+	 * fastrpc_set_session_info, update the pd_type, so that messages
+	 * are directed to right process, when fastrpc_getpd_msgidx is
+	 * queried. Do this only after session allocation.
 	 */
 	if (fl->pd_type == DEFAULT_UNUSED)
 		fl->pd_type = pd;
+	return 0;
+}
+
+static int fastrpc_init_attach(struct fastrpc_user *fl, int pd)
+{
+	struct fastrpc_invoke_args args[1];
+	struct fastrpc_enhanced_invoke ioctl;
+	int err, tgid = fl->tgid_frpc;
+
+	err = fastrpc_init_attach_common(fl, pd);
+	if (err)
+		return err;
 
 	if (pd == SENSORS_STATICPD) {
 		if (fl->cctx->domain->type == FASTRPC_LPASS)
@@ -4559,6 +4643,93 @@ static int fastrpc_init_attach(struct fastrpc_user *fl, int pd)
 	return 0;
 }
 
+/**
+ * fastrpc_init_attach2() - Attach to a DSP process domain with shell file
+ *
+ * @fl: Pointer to fastrpc user context
+ * @pd: Process domain type
+ * @argp: User space pointer to init_attach2 arguments
+ *
+ * This function attaches a user process to a DSP process domain and
+ * optionally loads a shell file. It performs common initialization,
+ * validates input parameters, and sends the attach request to the DSP.
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+static int fastrpc_init_attach2(struct fastrpc_user *fl, int pd,
+				char __user *argp)
+{
+	struct fastrpc_invoke_args args[2] = {0};
+	struct fastrpc_enhanced_invoke ioctl = {0};
+	struct fastrpc_ioctl_init_attach2 attach = {0};
+	int err = 0;
+	void *file = NULL;
+
+	struct {
+		int pgid;
+		u32 filelen;
+	} inbuf;
+
+	err = fastrpc_init_attach_common(fl, pd);
+	if (err)
+		return err;
+
+	if (copy_from_user(&attach, argp, sizeof(attach)))
+		return -EFAULT;
+
+	if (attach.filelen > INIT_FILELEN_MAX)
+		return -EINVAL;
+
+	/* Validate that reserved fields are set to zero */
+	for (int i = 0; i < ARRAY_SIZE(attach.reserved); i++) {
+		if (attach.reserved[i])
+			return -EINVAL;
+	}
+	/* Get shell file to be passed to DSP */
+	file = fastrpc_get_and_copy_shell_file(fl, &attach.file,
+						&attach.filelen,
+						attach.filefd);
+	if (IS_ERR(file)) {
+		err = PTR_ERR(file);
+		file = NULL;
+		goto err_out;
+	}
+
+	/*
+	 * As part of attach2, pack tgid and shell file
+	 * to share with DSP.
+	 */
+	inbuf.pgid = fl->tgid_frpc;
+	inbuf.filelen = attach.filelen;
+
+	args[0].ptr = (u64)(uintptr_t)&inbuf;
+	args[0].length = sizeof(inbuf);
+	args[0].fd = -1;
+
+	args[1].ptr = file ? (u64)(uintptr_t)file : attach.file;
+	args[1].length = inbuf.filelen;
+	args[1].fd = attach.filefd;
+
+	ioctl.inv.handle = FASTRPC_INIT_HANDLE;
+	ioctl.inv.sc = FASTRPC_SCALARS(FASTRPC_RMID_INIT_ATTACH2,
+					2, 0);
+	ioctl.inv.args = (__u64)args;
+
+	err = fastrpc_internal_invoke(fl, KERNEL_MSG_WITH_ZERO_PID,
+				      &ioctl);
+	if (err)
+		goto err_out;
+
+#ifdef CONFIG_DEBUG_FS
+	if (fl != NULL)
+		fastrpc_create_session_debugfs(fl);
+#endif
+
+err_out:
+	kfree(file);
+	return err;
+}
+
 static int fastrpc_invoke(struct fastrpc_user *fl, char __user *argp)
 {
 	struct fastrpc_enhanced_invoke ioctl;
@@ -4589,6 +4760,10 @@ void fastrpc_queue_pd_status(struct fastrpc_user *fl, int domain, int status, in
 	notif_rsp->status = status;
 	notif_rsp->domain = domain;
 	notif_rsp->session = sessionid;
+
+	if (status == FASTRPC_USERPD_EXCEPTION) {
+		fl->is_faulted = true;
+	}
 
 	spin_lock_irqsave(&fl->proc_state_notif.nqlock, flags);
 	list_add_tail(&notif_rsp->notifn, &fl->notif_queue);
@@ -6900,6 +7075,11 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int cmd,
 		err = fastrpc_init_attach(fl, SENSORS_STATICPD);
 		process_init = 1;
 		break;
+	case FASTRPC_IOCTL_INIT_ATTACH2:
+		err = fastrpc_init_attach2(fl, ROOT_PD, argp);
+		fastrpc_send_cpuinfo_to_dsp(fl);
+		process_init = 1;
+		break;
 	case FASTRPC_IOCTL_INIT_CREATE_STATIC:
 		err = fastrpc_init_create_static_process(fl, argp);
 		process_init = 1;
@@ -7764,7 +7944,7 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 
 	list_for_each_entry_safe(user, n, active_users_list, active_user_ssr) {
 		total_size += DBG_FS_SIZE;
-		if (user->init_mem)
+		if (user->init_mem && user->is_faulted)
 			total_size += user->init_mem->size;
 	}
 
@@ -7818,7 +7998,7 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 			iter += 1;
 			offset += DBG_FS_SIZE;
 		}
-		if (user->init_mem) {
+		if (user->init_mem && user->is_faulted) {
 			if ((dump + total_size) - pos >= user->init_mem->size) {
 				memcpy(pos, user->init_mem->virt, user->init_mem->size);
 				populate_dump_metadata(&dinfo[iter], offset, user->init_mem->size,

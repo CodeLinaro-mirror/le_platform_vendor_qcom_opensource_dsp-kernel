@@ -4576,17 +4576,20 @@ static int fastrpc_user_obj_create(struct file *filp,
 			}
 		}
 
+		if (g_frpc.is_trusted_vm) {
+			err = fastrpc_reserve_dma_heap(&tvm_dma_heap);
+			if (err) {
+				dev_err(cctx->dev, "fastrpc_reserve_dma_heap failed with error %d\n",
+					err);
+				goto error;
+			}
+		}
+
+		fl->tvm_dma_heap = tvm_dma_heap;
 		spin_lock_irqsave(&cctx->lock, flags);
 		list_add_tail(&fl->user, &cctx->users);
 		spin_unlock_irqrestore(&cctx->lock, flags);
 
-		if (g_frpc.is_trusted_vm) {
-			err = fastrpc_reserve_dma_heap(&tvm_dma_heap);
-			if (err)
-				goto error;
-		}
-
-		fl->tvm_dma_heap = tvm_dma_heap;
 	} else {
 		/* No pid will be associated with the default user-object */
 		fl->tgid = fl->tgid_app = -1;

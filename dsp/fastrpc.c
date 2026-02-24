@@ -3608,31 +3608,6 @@ static int get_unique_hlos_process_id(struct fastrpc_channel_ctx *cctx)
 	return tgid_frpc;
 }
 
-static char *get_process_basename(void)
-{
-    struct file *exe_file;
-    const char *filename;
-    char *result = NULL;
-
-    if (!current->mm)
-        return NULL;
-
-    rcu_read_lock();
-    exe_file = get_file_rcu(&current->mm->exe_file);
-    rcu_read_unlock();
-
-    if (!exe_file)
-        return NULL;
-
-    if (exe_file->f_path.dentry) {
-        filename = exe_file->f_path.dentry->d_name.name;
-        if(filename)
-        	result = kstrdup(filename, GFP_KERNEL);
-    }
-    fput(exe_file);
-    return result;
-}
-
 /**
  * fastrpc_pack_root_sharedpage()- Packs shared page for rootPD.
  * @fl: fastrpc user instance.
@@ -3747,14 +3722,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	fl->tgid_app = current->tgid;
 	if (fl->tgid_app != fl->tgid) {
 		fl->untrusted_process = true;
-		char *pname = get_process_basename();
-		if (pname) {
-			snprintf(fl->name, sizeof(fl->name), "%s/%d/%s",
-					current->comm, fl->tgid_app, pname);
-			kfree(pname);
-		} else {
-			snprintf(fl->name, sizeof(fl->name), "%s/%d", current->comm, fl->tgid_app);
-		}
+		snprintf(fl->name, sizeof(fl->name), "%s", current->comm);
 	}
 
 	if (init.attrs & FASTRPC_MODE_UNSIGNED_MODULE)
@@ -3791,7 +3759,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	fastrpc_check_privileged_process(fl, &init);
 
 	inbuf.pgid = fl->tgid_frpc;
-	inbuf.namelen = strlen(fl->name) + 1;
+	inbuf.namelen = strlen(current->comm) + 1;
 	inbuf.filelen = init.filelen;
 	inbuf.pageslen = 1;
 	inbuf.attrs = init.attrs;
@@ -3858,7 +3826,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	args[0].length = sizeof(inbuf);
 	args[0].fd = -1;
 
-	args[1].ptr = (u64)(uintptr_t)fl->name;
+	args[1].ptr = (u64)(uintptr_t)current->comm;
 	args[1].length = inbuf.namelen;
 	args[1].fd = -1;
 
@@ -4370,14 +4338,7 @@ static int fastrpc_user_obj_create(struct file *filp,
 	if (filp) {
 		fl->tgid = fl->tgid_app = current->tgid;
 		fl->tgid_frpc = get_unique_hlos_process_id(cctx);
-		char *pname = get_process_basename();
-		if (pname) {
-			snprintf(fl->name, sizeof(fl->name), "%s/%d/%s",
-					current->comm, fl->tgid_app, pname);
-			kfree(pname);
-		} else {
-			snprintf(fl->name, sizeof(fl->name), "%s/%d", current->comm, fl->tgid_app);
-		}
+		snprintf(fl->name, sizeof(fl->name), "%s", current->comm);
 
 		if (fl->tgid_frpc == -1) {
 			dev_err(cctx->dev, "too many fastrpc clients, max %u allowed\n",

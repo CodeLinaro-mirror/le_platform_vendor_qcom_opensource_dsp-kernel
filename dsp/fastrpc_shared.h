@@ -1427,6 +1427,8 @@ struct fastrpc_user {
 	int tgid_frpc;
 	/* Actual hlos pid of process offloading to dsp */
 	int tgid_app;
+	/* UID of process offloading to dsp */
+	uid_t uid;
 	/* Process name of process offloading to dsp */
 	char name[TASK_COMM_LEN];
 	/* PD type of remote subsystem process */

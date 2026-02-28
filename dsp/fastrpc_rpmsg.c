@@ -427,6 +427,10 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	/* Update domain status and global ctx */
 	domain->status = DSP_STATUS_UP;
 	domain->cctx = data;
+
+	/* Notify user space about domain up */
+	fastrpc_sysfs_notify_domain_event();
+
 	dev_info(rdev, "Opened rpmsg channel for %s", domain->name);
 	return 0;
 
@@ -468,6 +472,12 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	spin_lock_irqsave(&cctx->lock, flags);
 	atomic_set(&cctx->teardown, 1);
 	domain->status = DSP_STATUS_DOWN;
+	spin_unlock_irqrestore(&cctx->lock, flags);
+
+	/* Notify userspace about domain DOWN event */
+	fastrpc_sysfs_notify_domain_event();
+
+	spin_lock_irqsave(&cctx->lock, flags);
 	domain->cctx = NULL;
 	cctx->staticpd_status = false;
 

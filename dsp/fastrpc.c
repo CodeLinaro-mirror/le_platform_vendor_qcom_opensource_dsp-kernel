@@ -39,6 +39,7 @@
 #include <linux/ring_buffer.h>
 #endif
 #include <linux/version.h>
+#include <linux/pci.h>
 #define CREATE_TRACE_POINTS
 #include "fastrpc_trace.h"
 #include "fastrpc_timeline.h"
@@ -1364,7 +1365,11 @@ static struct fastrpc_pool_ctx *fastrpc_session_alloc(
 	 * the process and it has been allocated already, then reuse that
 	 * session.
 	 */
-	if (fl->sctx && !secure && fl->sctx->pd_type == pd_type)
+	if (fl->sctx && !secure &&
+	    ((fl->sctx->pd_type == pd_type) ||
+	    (fl->sctx->pd_type == NS_CHANNEL_SHARED &&
+	    (pd_type == USER_UNSIGNEDPD_POOL || pd_type == USERPD ||
+	    pd_type == ROOT_PD))))
 		return fl->sctx;
 
 	spin_lock_irqsave(&cctx->lock, flags);
@@ -1388,14 +1393,23 @@ static struct fastrpc_pool_ctx *fastrpc_session_alloc(
 		 * 5. If pd_type is configured, then process pd_type needs to match with
 		 *    session pd_type, else pd_type check is ignored
 		 */
+		bool use_session = false;
 		isess = &cctx->session[i];
 
-		if ((isess->usecount == 0 || isess->smmucount > 1) &&
-			isess->smmucb[DEFAULT_SMMU_IDX].valid &&
-			isess->secure == secure &&
-			((isess->pd_type == EXT_MAP_PD_TYPE && isess->sharedcb) ||
-			(isess->sharedcb == sharedcb)) &&
-			(pd_type == DEFAULT_UNUSED || isess->pd_type == pd_type || secure)) {
+		if (isess->smmucb[DEFAULT_SMMU_IDX].valid && isess->secure == secure) {
+			if ((isess->usecount == 0 || isess->smmucount > 1) &&
+			    ((isess->pd_type == EXT_MAP_PD_TYPE && isess->sharedcb) ||
+			    (isess->sharedcb == sharedcb)) &&
+			    (pd_type == DEFAULT_UNUSED || isess->pd_type == pd_type ||
+			    secure))
+				use_session = true;
+			else if (isess->pd_type == NS_CHANNEL_SHARED &&
+			    (pd_type == USER_UNSIGNEDPD_POOL || pd_type == USERPD ||
+			     pd_type == ROOT_PD || pd_type == EXT_MAP_PD_TYPE))
+				use_session = true;
+		}
+
+		if (use_session) {
 			session = isess;
 			/*
 			 * Increment number of apps using session.
@@ -3721,7 +3735,8 @@ static int fastrpc_get_root_session(struct fastrpc_channel_ctx *cctx,
 	spin_lock_irqsave(&cctx->lock, flags);
 	for (i = 0; i < cctx->sesscount; i++) {
 		s = &cctx->session[i];
-		if (s->pd_type == ROOT_PD && s->smmucb[DEFAULT_SMMU_IDX].valid) {
+		if ((s->pd_type == ROOT_PD || s->pd_type == NS_CHANNEL_SHARED) &&
+		    s->smmucb[DEFAULT_SMMU_IDX].valid) {
 			*sess = s;
 			err = 0;
 			break;
@@ -10051,7 +10066,7 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 {
 	struct fastrpc_channel_ctx *cctx;
 	struct fastrpc_pool_ctx *sess = NULL;
-	struct device *dev = &pdev->dev;
+	struct device *dev = &pdev->dev, *shared_cb_dev = NULL;
 	int i, sessions = 0;
 	unsigned long flags;
 	u32 pd_type = DEFAULT_UNUSED, smmuidx = DEFAULT_SMMU_IDX;
@@ -10064,6 +10079,7 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 	u64 smmu_alloc_range64[2] = {0};
 	struct sg_table sgt;
 	struct fastrpc_smmu *smmucb = NULL;
+	struct device_node *shared_cb_dev_node = NULL;
 #ifdef CONFIG_DEBUG_FS
 	struct dentry *debugfs_root = g_frpc.debugfs_root;
 	struct dentry *debugfs_global_file = NULL;
@@ -10085,11 +10101,69 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 		cctx->pd_type = true;
 	}
 
+	/*
+	 * NS_CHANNEL_SHARED context banks do not own an SMMU
+	 * device of their own. Instead, they borrow the SMMU
+	 * device of an external PCI endpoint (e.g. a co-located
+	 * accelerator) so that DMA mappings created by fastrpc
+	 * are visible to that device.
+	 *
+	 * Resolve the shared device in two steps:
+	 *   1. of_parse_phandle() looks up the "qcom,shared_cb_dev"
+	 *      phandle in DT and returns the referenced device_node
+	 *      (with a refcount that must be released via
+	 *      of_node_put()).
+	 *   2. bus_find_device_by_of_node() walks the PCI bus to
+	 *      locate the struct device bound to that node, taking
+	 *      an additional reference on the device.
+	 */
+	if (pd_type == NS_CHANNEL_SHARED) {
+		shared_cb_dev_node = of_parse_phandle(dev->of_node,
+					"qcom,shared_cb_dev", 0);
+		if (!shared_cb_dev_node) {
+			err = -EINVAL;
+			dev_err(&pdev->dev, "missing qcom,shared_cb_dev property\n");
+			goto bail;
+		}
+		shared_cb_dev = bus_find_device_by_of_node(&pci_bus_type,
+			shared_cb_dev_node);
+		if (!shared_cb_dev) {
+			err = -EINVAL;
+			dev_err(&pdev->dev, "can't find shared cb device\n");
+			goto bail;
+		}
+	}
+
 	spin_lock_irqsave(&cctx->lock, flags);
 	if (cctx->sesscount >= FASTRPC_MAX_SESSIONS) {
 		dev_err(&pdev->dev, "too many sessions\n");
 		spin_unlock_irqrestore(&cctx->lock, flags);
-		return -ENOSPC;
+		err = -ENOSPC;
+		goto bail;
+	}
+
+	/*
+	 * Enforce NS_CHANNEL_SHARED exclusivity:
+	 * - A NS_CHANNEL_SHARED CB cannot be added to a
+	 *   channel that already has any CB registered.
+	 * - A non-NS_CHANNEL_SHARED CB cannot be added to
+	 *   a channel that has a NS_CHANNEL_SHARED CB.
+	 */
+	if (pd_type == NS_CHANNEL_SHARED && cctx->sesscount > 0) {
+		err = -EINVAL;
+		dev_err(&pdev->dev,
+			"NS_CHANNEL_SHARED: channel already has a CB\n");
+		spin_unlock_irqrestore(&cctx->lock, flags);
+		goto bail;
+	}
+	for (i = 0; i < cctx->sesscount; i++) {
+		if (cctx->session[i].pd_type == NS_CHANNEL_SHARED) {
+			err = -EINVAL;
+			dev_err(&pdev->dev,
+				"cannot add CB to NS_CHANNEL_SHARED channel\n");
+			spin_unlock_irqrestore(&cctx->lock, flags);
+			goto bail;
+		}
 	}
 
 	/* Find any existing session for pooling CBs with same PD type */
@@ -10114,16 +10188,37 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 	if (sess->smmucount == 0) {
 		sess->usecount = 0;
 		sess->pd_type = pd_type;
+		if (pd_type == NS_CHANNEL_SHARED) {
+			cctx->smmucb_pool = true;
+			sess->sharedcb = true;
+		}
 	}
 	/* Read secure flag for each context bank, even if part of CB pool */
 	sess->secure = of_property_read_bool(dev->of_node,
 						"qcom,secure-context-bank");
 
+	/*
+	 * NS_CHANNEL_SHARED context banks borrow an external SMMU
+	 * device and therefore cannot be configured as secure.
+	 * Reject such mis-configuration early to avoid undefined
+	 * behavior at runtime.
+	 */
+	if (pd_type == NS_CHANNEL_SHARED && sess->secure) {
+		err = -EINVAL;
+		dev_err(&pdev->dev,
+			"NS_CHANNEL_SHARED CB cannot be secure\n");
+		spin_unlock_irqrestore(&cctx->lock, flags);
+		goto bail;
+	}
+
 	/* Populate SMMU CB info at next available free SMMU index */
 	smmuidx = sess->smmucount++;
 	smmucb = &sess->smmucb[smmuidx];
 	smmucb->valid = true;
-	smmucb->dev = dev;
+	if (pd_type == NS_CHANNEL_SHARED)
+		smmucb->dev = shared_cb_dev;
+	else
+		smmucb->dev = dev;
 	smmucb->sess = sess;
 	smmucb->pa_bits = DSP_DEFAULT_BUS_WIDTH;
 	mutex_init(&smmucb->map_mutex);
@@ -10262,25 +10357,27 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "fastrpc_cb_probe qrtr-gen-pool end\n");
 	}
 
-	/* Mask determines range of addresses returned by smmu driver */
-	rc = dma_set_mask(dev, DMA_BIT_MASK(smmucb->pa_bits));
-	if (rc) {
-		dev_err(dev, "32-bit DMA enable failed\n");
-		return rc;
-	}
-	/* Set larger segment size to allow smmu to map > 4GB */
-	dma_set_max_seg_size(dev, DMA_BIT_MASK(32));
+	if (pd_type != NS_CHANNEL_SHARED) {
+		/* Mask determines range of addresses returned by smmu driver */
+		rc = dma_set_mask(dev, DMA_BIT_MASK(smmucb->pa_bits));
+		if (rc) {
+			dev_err(dev, "32-bit DMA enable failed\n");
+			return rc;
+		}
+		/* Set larger segment size to allow smmu to map > 4GB */
+		dma_set_max_seg_size(dev, DMA_BIT_MASK(32));
 
-	/*
-	 * Set the DMA mask for the SMMU parent device to 64-bit,
-	 * allowing the device to access the full range of DDR memory.
-	 * This is necessary for devices that need to perform DMA operations,
-	 * on high memory addresses beyond the 32-bit limit.
-	 */
-	rc = dma_set_mask(dev->parent, DMA_BIT_MASK(64));
-	if (rc) {
-		dev_err(dev, "64-bit parent SMMU dev DMA enable failed\n");
-		return rc;
+		/*
+		 * Set the DMA mask for the SMMU parent device to 64-bit,
+		 * allowing the device to access the full range of DDR memory.
+		 * This is necessary for devices that need to perform DMA operations,
+		 * on high memory addresses beyond the 32-bit limit.
+		 */
+		rc = dma_set_mask(dev->parent, DMA_BIT_MASK(64));
+		if (rc) {
+			dev_err(dev, "64-bit parent SMMU dev DMA enable failed\n");
+			return rc;
+		}
 	}
 
 #ifdef CONFIG_DEBUG_FS
@@ -10297,6 +10394,15 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 #endif
 
 bail:
+	/*
+	 * On success, keep the additional reference to shared_cb_dev;
+	 * it is released when the context bank is cleaned up in
+	 * fastrpc_cb_remove(). On error, drop it here.
+	 */
+	if (err && shared_cb_dev)
+		put_device(shared_cb_dev);
+	if (shared_cb_dev_node)
+		of_node_put(shared_cb_dev_node);
 	if (!err)
 		dev_info(dev, "Successfully added %s", dev->kobj.name);
 	return err;
@@ -10309,6 +10415,11 @@ iommu_map_bail:
 			IOVA_TO_PHYSADDR(buf->phys, smmucb->sid_pos));
 dma_alloc_bail:
 	kfree(buf);
+	if (shared_cb_dev)
+		put_device(shared_cb_dev);
+	if (shared_cb_dev_node)
+		of_node_put(shared_cb_dev_node);
+
 	return err;
 }
 
@@ -10352,7 +10463,7 @@ static int fastrpc_cb_remove(struct platform_device *pdev)
 	unsigned long flags;
 	int i = 0, j = 0;
 
-	if (sess->pd_type == ROOT_PD) {
+	if (sess->pd_type == ROOT_PD || sess->pd_type == NS_CHANNEL_SHARED) {
 		fastrpc_rootheap_buf_list_free(cctx);
 		fastrpc_preload_mem_free(cctx);
 	}
@@ -10367,6 +10478,13 @@ static int fastrpc_cb_remove(struct platform_device *pdev)
 			mutex_lock(&ismmucb->map_mutex);
 			if (ismmucb->frpc_genpool)
 				fastrpc_genpool_free(ismmucb);
+			/*
+			 * Release the reference taken on the shared cb
+			 * device during fastrpc_cb_probe().
+			 */
+			if (sess->pd_type == NS_CHANNEL_SHARED &&
+					ismmucb->dev)
+				put_device(ismmucb->dev);
 			ismmucb->dev = NULL;
 			mutex_unlock(&ismmucb->map_mutex);
 			spin_lock_irqsave(&cctx->lock, flags);

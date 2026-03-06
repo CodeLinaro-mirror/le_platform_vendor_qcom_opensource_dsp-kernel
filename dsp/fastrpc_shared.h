@@ -660,6 +660,10 @@ enum fastrpc_cb_pd_types {
 	USER_UNSIGNEDPD_POOL      = 9,  /* DSP User Dynamic Unsigned PD pool */
 	EXT_MAP_PD_TYPE           = 10, /* DSP extended mapping */
 	ASC_STATICPD              = 11, /* ADSP Camera static ASC PD */
+	NS_CHANNEL_SHARED         = 12, /* Non secure PD shared across channels
+	                                 * Allows multiple channels to share the
+	                                 * same context bank
+	                                 */
 	MAX_PD_TYPE,                    /* Max PD type */
 };
 

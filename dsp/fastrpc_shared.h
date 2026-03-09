@@ -517,6 +517,31 @@
  */
 #define DSP_ATTR_OFFSET (1)
 
+/*
+ * The kernel checks version before copying from userspace;
+ * if the version is different from this then ioctl will be rejected.
+ */
+#define NPU_APP_PRIO_CONFIG_VERSION 0
+
+/* Maximum number of per-UID priority entries the kernel table can hold */
+#define NPU_MAX_APP_PRIO_ENTRIES 1024
+
+/* Lowest possible scheduling priority */
+#define NPU_MIN_PRIORITY 0
+
+/* Highest possible scheduling priority */
+#define NPU_MAX_PRIORITY 1000
+
+/*
+ * On Android, PIDs are assigned sequentially. Typically, init-spawned
+ * platform services are assigned the lower values and 3rd-party apps
+ * that launch later are assigned higher values. This check does not
+ * guarantee 3rd-party apps from configuring app priorities in the NPU
+ * scheduler but will prevent most 3rd-party apps from doing so, until
+ * a clean check is implemented.
+ */
+#define THIRD_PARTY_APP_PID 10000
+
 enum fastrpc_reserved_ctx {
 	/*
 	 * Dynamic PD status notifications from DSP
@@ -1253,6 +1278,35 @@ struct fastrpc_log_context {
 };
 #endif
 
+struct fastrpc_npu_app_prio_config {
+	/* Android UID of the application this config applies to */
+	u32 uid;
+	/* Scheduling priority value; higher means more preferred */
+	u32 priority;
+	/* True if this UID is granted direct DSP access, bypassing arbitration */
+	u32 has_direct_access;
+	/* True if this UID may attribute work to other UIDs for priority purposes */
+	u32 can_attribute_other_uid;
+	/* Reserved for future use; must be zero */
+	u32 reserved[8];
+};
+
+/*
+ * NPU application priority table per channel.
+ * All fields are read and written under cctx->lock.
+ */
+struct npu_app_prio_table {
+	/* Number of valid entries in @entries */
+	u32 num_entries;
+	/*
+	 * Kernel buffer holding the per-UID priority configs.
+	 * NULL until the first FASTRPC_IOCTL_NPU_PRIORITY_WORKINFO call.
+	 * Replaced atomically under cctx->lock on every update;
+	 * the old pointer is freed after the lock is released.
+	 */
+	struct fastrpc_npu_app_prio_config *entries;
+};
+
 struct fastrpc_channel_ctx {
 	int domain_id;
 	int sesscount;
@@ -1333,6 +1387,8 @@ struct fastrpc_channel_ctx {
 	/* log context for storing kernel logs */
 	struct fastrpc_log_context log;
 #endif
+	/* NPU application priority table */
+	struct npu_app_prio_table *npu_app_prio;
 };
 
 struct fastrpc_ssr_handler {

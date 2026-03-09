@@ -20,6 +20,7 @@
 #define FASTRPC_IOCTL_GET_DSP_INFO	_IOWR('R', 13, struct fastrpc_ioctl_capability)
 #define FASTRPC_IOCTL_INIT_ATTACH2 	_IOWR('R', 14, struct fastrpc_ioctl_init_attach2)
 #define FASTRPC_IOCTL_GET_TIMELINE_BUFFER	_IOWR('R', 15, struct fastrpc_ioctl_timeline_buf)
+#define FASTRPC_IOCTL_NPU_PRIORITY_WORKINFO	_IOWR('R', 16, struct fastrpc_ioctl_npu_priority_workinfo)
 
 /* Reserved fields in mdxtx ioctl structs for 64-bit alignment */
 #define FASTRPC_MDCTX_IOCTL_RSVD 8
@@ -118,6 +119,12 @@ enum fastrpc_proc_attr {
 	FASTRPC_MODE_SYSTEM_UNSIGNED_PD	= 1 << 17,
 };
 
+/* Operation selector for FASTRPC_IOCTL_NPU_PRIORITY_WORKINFO */
+enum fastrpc_npu_priority_workinfo_op {
+	FASTRPC_NPU_OP_PRIORITY   = 0,
+	FASTRPC_NPU_OP_WORKINFO   = 1,
+};
+
 struct fastrpc_invoke_args {
 	__u64 ptr;
 	__u64 length;
@@ -147,6 +154,87 @@ struct fastrpc_ioctl_multimode_invoke {
 	/* Flag to notify if dynamic domain discovery is enabled */
 	__u32 dynamic_domains;
 	__u32 reserved[7];
+};
+
+/* Payload for FASTRPC_IOCTL_NPU_PRIORITY_WORKINFO */
+struct fastrpc_npu_priority {
+	/* Number of priority config entries */
+	__u32 num_configs;
+
+	/*
+	 * Version of the config struct pointed to by 'configs'.
+	 * Set to NPU_APP_PRIO_CONFIG_VERSION.
+	 */
+	__u32 version;
+
+	/* User-addr to array of fastrpc_npu_app_prio_config */
+	__u64 configs;
+
+	/* Reserved for future use */
+	__u32 reserved[8];
+};
+
+/*
+ * NPU workinfo structure added for compilation.
+ * This will be implemented in a separate change.
+ * The ioctl is a combined ioctl for priority sending and workinfo notification
+ * retrieval to ensure strict ordering of priority updates and work events.
+ */
+struct npu_work_info {
+	/* CLOCK_MONOTONIC ms at event time */
+	__u64  timestamp_ms;
+
+	/* userspace pointer to group ID string */
+	__u64 group_id;
+
+	/* userspace pointer to feature ID string */
+	__u64 debug_feature_id;
+
+	/* enum npu_work_event */
+	__u32 event;
+
+	/* monotonically increasing work id */
+	__s32  id;
+
+	/* UID of requesting app */
+	__s32  uid;
+
+	/* PID for debugging */
+	__s32  debug_pid;
+
+	/* original UID before attribution */
+	__s32  original_uid;
+
+	/* DSP domain; maps to WorkInfo.deviceNumber */
+	__s32  domain;
+
+	/* job-level priority */
+	__s32  job_priority;
+
+	/* uid + job priority */
+	__s32  effective_priority;
+
+	/* length of group_id string; 0 if not set */
+	__u32 group_id_len;
+
+	/* length of debug_feature_id string; 0 if not set */
+	__u32 debug_feature_id_len;
+
+	/* struct version; set to 0 for now */
+	__u32 version;
+
+	/* reserved for future use */
+	__u64 reserved[15];
+};
+
+/* Combined payload for FASTRPC_IOCTL_NPU_PRIORITY_WORKINFO */
+struct fastrpc_ioctl_npu_priority_workinfo {
+	__u32 op;
+	union {
+		struct fastrpc_npu_priority prio;     /* op == FASTRPC_NPU_OP_PRIORITY: input */
+		struct npu_work_info workinfo;        /* op == FASTRPC_NPU_OP_WORKINFO: output */
+	};
+	__u32 reserved[16];
 };
 
 enum fastrpc_multimode_invoke_type {

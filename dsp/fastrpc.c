@@ -866,6 +866,18 @@ static void fastrpc_channel_ctx_free(struct kref *ref)
 	fastrpc_channel_default_user_delete(cctx);
 	mutex_destroy(&cctx->wake_mutex);
 
+	/*
+	 * Free the NPU priority table. In the normal teardown path (no SSR)
+	 * this is the only place it gets freed. In the SSR path,
+	 * fastrpc_rpmsg_remove already freed it and NULLed the pointer,
+	 * so this block is skipped.
+	 */
+	if (cctx->npu_app_prio) {
+		kfree(cctx->npu_app_prio->entries);
+		kfree(cctx->npu_app_prio);
+		cctx->npu_app_prio = NULL;
+	}
+
 	for (i = 0; i < FASTRPC_MAX_SESSIONS; i++)
 		for (j = 0; j < cctx->session[i].smmucount; j++)
 			mutex_destroy(&cctx->session[i].smmucb[j].map_mutex);
@@ -7040,6 +7052,254 @@ static int fastrpc_request_thread_exit(struct fastrpc_user *fl,
 	return err;
 }
 
+/*
+ *	fastrpc_npu_app_prio_init - Allocate the per-channel NPU priority table
+ *
+ *	@cctx	: Channel context
+ *
+ *	Return	: 0 on success, negative error code on failure
+ *
+ *	Called lazily on the first FASTRPC_IOCTL_NPU_PRIORITY_WORKINFO request.
+ *	Only the table struct is allocated here; the entries buffer is NULL until
+ *	fastrpc_npu_app_prio_set installs it on the first priority update.
+ *	All subsequent access to the table (read and write) is serialised under
+ *	cctx->lock, so no additional lock is embedded in the table itself.
+ */
+static int fastrpc_npu_app_prio_init(struct fastrpc_channel_ctx *cctx)
+{
+	struct npu_app_prio_table *prio_tbl = NULL;
+	unsigned long flags = 0;
+
+	if (cctx->npu_app_prio)
+		return 0;
+
+	if (atomic_read(&cctx->teardown))
+		return -EPIPE;
+
+	/*
+	 * Allocate outside cctx->lock — GFP_KERNEL may sleep and cannot
+	 * be used in atomic (spinlock-held) context.
+	 */
+	prio_tbl = kzalloc(sizeof(*prio_tbl), GFP_KERNEL);
+	if (!prio_tbl) {
+		dev_err(cctx->dev, "Failed to allocate NPU app prio table\n");
+		return -ENOMEM;
+	}
+
+	/*
+	 * Two callers may both observe cctx->npu_app_prio == NULL before
+	 * either acquires the lock. The first to acquire installs the table;
+	 * the second discards its allocation. Both return 0.
+	 */
+	spin_lock_irqsave(&cctx->lock, flags);
+	if (!cctx->npu_app_prio)
+		cctx->npu_app_prio = prio_tbl;
+	else
+		kfree(prio_tbl);
+	spin_unlock_irqrestore(&cctx->lock, flags);
+
+	return 0;
+}
+
+/*
+ *	fastrpc_npu_app_prio_set - Replace the NPU application priority table
+ *
+ *	@cctx		: Channel context
+ *	@user_configs	: Userspace pointer to array of fastrpc_npu_app_prio_config
+ *	@num_configs	: Number of entries in the array
+ *
+ *	Return		: 0 on success, negative error code on failure
+ *
+ *	Allocates a kernel buffer, copies and validates the user-supplied
+ *	priority configs, then atomically swaps it into the shared table under
+ *	cctx->lock. The previous buffer is freed after the lock is released.
+ *
+ *	SSR safety: the teardown check and the swap both occur under cctx->lock,
+ *	the same lock fastrpc_rpmsg_remove uses to NULL the table pointer. Either
+ *	the writer completes before SSR (SSR frees the new buffer during channel
+ *	cleanup) or SSR runs first (writer sees NULL and returns -ENODEV).
+ */
+static int fastrpc_npu_app_prio_set(struct fastrpc_channel_ctx *cctx,
+				    u64 user_configs, u32 num_configs)
+{
+	struct fastrpc_npu_app_prio_config *new_buf = NULL, *old_buf = NULL;
+	unsigned long flags = 0;
+	uint32_t i = 0;
+	int err = 0;
+
+	if (!user_configs) {
+		pr_err("%s: invalid args: cctx=%pK user_configs=0x%llx num_configs=%u\n",
+		       __func__, cctx, user_configs, num_configs);
+		return -EINVAL;
+	}
+
+	err = fastrpc_npu_app_prio_init(cctx);
+	if (err)
+		return err;
+
+	/* Fast-path rejection before doing any expensive work */
+	if (atomic_read(&cctx->teardown))
+		return -EPIPE;
+
+	/* kcalloc(GFP_KERNEL) and copy_from_user can both sleep;
+	 * neither can be called while holding a spinlock.
+	 */
+	new_buf = kcalloc(num_configs, sizeof(*new_buf), GFP_KERNEL);
+	if (!new_buf)
+		return -ENOMEM;
+
+	if (copy_from_user(new_buf, (void __user *)(uintptr_t)user_configs,
+			   array_size(num_configs, sizeof(*new_buf)))) {
+		dev_err(cctx->dev, "Failed to copy configs from user\n");
+		err = -EFAULT;
+		goto bail;
+	}
+
+	for (i = 0; i < num_configs; i++) {
+		if (new_buf[i].priority < NPU_MIN_PRIORITY ||
+		    new_buf[i].priority > NPU_MAX_PRIORITY) {
+			dev_err(cctx->dev, "Invalid priority %d at index %u\n",
+				new_buf[i].priority, i);
+			err = -EINVAL;
+			goto bail;
+		}
+		/*
+		 * Reject any config entry that sets reserved fields to a
+		 * non-zero value. Reserved fields must be zero so that a
+		 * future kernel that repurposes them for new parameters does
+		 * not silently misinterpret data sent by an older userspace
+		 * that happened to leave garbage there. Enforcing zero here
+		 * ensures the ABI can be extended safely.
+		 */
+		if (memchr_inv(new_buf[i].reserved, 0,
+			       sizeof(new_buf[i].reserved))) {
+			dev_err(cctx->dev,
+				"Non-zero reserved fields in config at index %u\n", i);
+			err = -EINVAL;
+			goto bail;
+		}
+	}
+
+	/*
+	 * Atomically swap the validated buffer into the table under cctx->lock.
+	 * teardown is checked under the same lock that fastrpc_rpmsg_remove
+	 * uses to set it and NULL the table, so either we complete the swap
+	 * before SSR or we see teardown=1 and abort.
+	 * old_buf is freed after releasing the lock — kfree(NULL) is safe
+	 * on the first call when entries has not yet been set.
+	 */
+	spin_lock_irqsave(&cctx->lock, flags);
+	if (atomic_read(&cctx->teardown)) {
+		spin_unlock_irqrestore(&cctx->lock, flags);
+		err = -EPIPE;
+		goto bail;
+	}
+	if (cctx->npu_app_prio->num_entries > NPU_MAX_APP_PRIO_ENTRIES) {
+		spin_unlock_irqrestore(&cctx->lock, flags);
+		dev_err(cctx->dev, "Invalid num_entries: %u (max %u)\n",
+			cctx->npu_app_prio->num_entries, NPU_MAX_APP_PRIO_ENTRIES);
+		err = -EINVAL;
+		goto bail;
+	}
+	old_buf                         = cctx->npu_app_prio->entries;
+	cctx->npu_app_prio->entries     = new_buf;
+	cctx->npu_app_prio->num_entries = num_configs;
+	spin_unlock_irqrestore(&cctx->lock, flags);
+
+	kfree(old_buf);
+	new_buf = NULL;
+bail:
+	kfree(new_buf);
+	return err;
+}
+
+/*
+ * fastrpc_npu_priority - Handle NPU scheduling IOCTL
+ *
+ * @fl		: User context
+ * @npu_sched	: Kernel-space scheduling parameters
+ *
+ * Return	: 0 on success, negative error code on failure
+ */
+static int fastrpc_npu_priority(struct fastrpc_user *fl,
+				  struct fastrpc_npu_priority *npu_sched)
+{
+	int err = 0;
+
+	if (npu_sched->num_configs > NPU_MAX_APP_PRIO_ENTRIES) {
+		dev_err(fl->cctx->dev, "Invalid num_configs: %u (max %u)\n",
+			npu_sched->num_configs, NPU_MAX_APP_PRIO_ENTRIES);
+		return -EINVAL;
+	}
+
+	switch (npu_sched->version) {
+	case NPU_APP_PRIO_CONFIG_VERSION:
+		err = fastrpc_npu_app_prio_set(fl->cctx,
+					       npu_sched->configs,
+					       npu_sched->num_configs);
+		break;
+	default:
+		dev_err(fl->cctx->dev,
+			"NPU sched: unsupported config version %u\n",
+			npu_sched->version);
+		err = -EINVAL;
+		break;
+	}
+
+	return err;
+}
+
+/*
+ * fastrpc_npu_priority_workinfo - Handle FASTRPC_IOCTL_NPU_PRIORITY_WORKINFO
+ *
+ * Combines NPU scheduling and workinfo into a single dedicated ioctl.
+ * Dispatches to fastrpc_npu_priority or fastrpc_npu_workinfo based
+ * on the op field.  The user/kernel boundary crossing (copy_from/to_user)
+ * is centralised here.
+ *
+ * @fl   : User context
+ * @argp : Userspace pointer to struct fastrpc_ioctl_npu_priority_workinfo
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+static int fastrpc_npu_priority_workinfo(struct fastrpc_user *fl,
+				      struct file *file, char __user *argp)
+{
+	struct fastrpc_ioctl_npu_priority_workinfo args = {};
+	int err = 0;
+
+	if (copy_from_user(&args, argp, sizeof(args)))
+		return -EFAULT;
+
+	/* Reject non-zero reserved fields: a future userspace that repurposes
+	 * a reserved word for a new parameter must not silently succeed on an
+	 * older kernel that ignores it.
+	 */
+	if (memchr_inv(args.reserved, 0, sizeof(args.reserved)))
+		return -EINVAL;
+
+	switch (args.op) {
+	case FASTRPC_NPU_OP_PRIORITY:
+		if (memchr_inv(args.prio.reserved, 0, sizeof(args.prio.reserved)))
+			return -EINVAL;
+		if (args.prio.num_configs == 0)
+			return -EINVAL;
+		err = fastrpc_npu_priority(fl, &args.prio);
+		break;
+	/*
+ 	 * NPU workinfo case added for completeness.
+ 	 * This will be implemented in a separate change.
+ 	 * The ioctl is a combined ioctl for priority sending and workinfo notification
+ 	 * retrieval to ensure strict ordering of priority updates and work events.
+ 	 */
+	case FASTRPC_NPU_OP_WORKINFO:
+		break;
+	default:
+		err = -EINVAL;
+		break;
+	}
+	return err;
+}
 static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 {
 	struct fastrpc_enhanced_invoke inv2 ;
@@ -8011,6 +8271,27 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int cmd,
 		break;
 	case FASTRPC_IOCTL_GET_TIMELINE_BUFFER:
 		err = fastrpc_get_timeline_buffer(fl, argp);
+		break;
+	case FASTRPC_IOCTL_NPU_PRIORITY_WORKINFO:
+		/*
+	 	 * TODO: Add check to ensure that NPU HAL service is the only process that is
+	 	 * allowed to make this ioctl call.
+	 	 * ioctl call from any other application needs to be rejected.
+	 	 * For now, add this rudimentary check to block most 3rd-party apps from making
+	 	 * this ioctl. This is NOT expected to block 3rd party-apps and is only a
+	 	 * temporary placeholder.
+	 	 */
+		if (fl->tgid >= THIRD_PARTY_APP_PID) {
+			err = -EPERM;
+			break;
+		}
+		/*
+ 		 * NPU workinfo case added as a placeholder.
+ 		 * This will be implemented in a separate change.
+ 		 * The ioctl is a combined ioctl for priority sending and workinfo notification
+ 		 * retrieval to ensure strict ordering of priority updates and work events.
+ 		 */
+		err = fastrpc_npu_priority_workinfo(fl, file, argp);
 		break;
 	default:
 		err = -ENOTTY;

@@ -7314,6 +7314,9 @@ static int fastrpc_req_mmap(struct fastrpc_user *fl, char __user *argp)
 		if (req.flags == ADSP_MMAP_ADD_PAGES || req.flags == ADSP_MMAP_ADD_PAGES_TSTACK)
 			dev = buf->smmucb->dev;
 
+		/* Mark growheap-related stack memory to be included in coredump */
+		buf->flags = req.flags;
+
 		req_msg.pgid = fl->tgid_frpc;
 		req_msg.flags = req.flags;
 		req_msg.vaddr = req.vaddrin;
@@ -7401,6 +7404,10 @@ static int fastrpc_req_mmap(struct fastrpc_user *fl, char __user *argp)
 			err = -EALREADY;
 			goto err_invoke;
 		}
+
+		/* Mark growheap-related stack memory to be included in coredump */
+		map->flags = req.flags;
+
 		req_msg.pgid = fl->tgid_frpc;
 		req_msg.flags = req.flags;
 		req_msg.vaddr = req.vaddrin;
@@ -8552,6 +8559,37 @@ static inline void populate_dump_metadata(struct fastrpc_dump_info *entry,
 	entry->phys = addr;
 }
 
+static int fastrpc_get_mem_content(struct dma_buf *dbuf, void *dst, size_t size)
+{
+	struct iosys_map map = {0};
+	int ret = 0;
+
+	if (!dbuf || !dst || !size || (size > dbuf->size))
+		return -EINVAL;
+
+	ret = dma_buf_begin_cpu_access(dbuf, DMA_FROM_DEVICE);
+	if (ret)
+		return ret;
+
+	ret = dma_buf_vmap(dbuf, &map);
+	if (ret)
+		goto bail;
+
+	if (!map.vaddr) {
+		ret = -EFAULT;
+		goto bail;
+	}
+
+	memcpy(dst, map.vaddr, size);
+
+bail:
+	if(map.vaddr)
+		dma_buf_vunmap(dbuf, &map);
+
+	dma_buf_end_cpu_access(dbuf, DMA_FROM_DEVICE);
+	return ret;
+}
+
 void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 	struct list_head *active_users_list)
 {
@@ -8565,6 +8603,7 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 	struct seq_buf gmsgbuf;
 	struct fastrpc_dump_info *dinfo;
 	struct fastrpc_buf *buf, *b;
+	struct fastrpc_map *map;
 
 	list_for_each_entry_safe(buf, b, &cctx->gmaps, node)
 		total_size += buf->size;
@@ -8580,6 +8619,16 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 
 		if (user->dbglogbuf && user->dbglogbuf->virt)
 			total_size += user->dbglogbuf->size;
+
+		list_for_each_entry(buf, &user->mmaps, node) {
+			if (buf->flags == ADSP_MMAP_ADD_PAGES_TSTACK)
+				total_size += buf->size;
+		}
+
+		list_for_each_entry(map, &user->maps, node) {
+			if (map->flags == ADSP_MMAP_ADD_PAGES_TSTACK)
+				total_size += map->size;
+		}
 	}
 
 	total_size += RPMSG_LOG_SIZE;
@@ -8684,6 +8733,41 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 				pr_err("%s: Insufficient space for dbglogbuf, aborting coredump\n", __func__);
 				err = -EFAULT;
 				goto bail;
+			}
+		}
+
+		list_for_each_entry(buf, &user->mmaps, node) {
+			if (buf->flags == ADSP_MMAP_ADD_PAGES_TSTACK) {
+				if ((dump + total_size) - pos >= buf->size) {
+					memcpy(pos, buf->virt, buf->size);
+					populate_dump_metadata(&dinfo[iter], offset, buf->size,
+						TSTACK_MEM, buf->phys);
+					pos += buf->size;
+					iter++;
+					offset += buf->size;
+				} else {
+					err = -EFAULT;
+					goto bail;
+				}
+			}
+		}
+
+		list_for_each_entry(map, &user->maps, node) {
+			if (map->flags == ADSP_MMAP_ADD_PAGES_TSTACK) {
+				if ((dump + total_size) - pos >= map->size) {
+					err = fastrpc_get_mem_content(map->buf, pos, map->size);
+					if (err)
+						goto bail;
+
+					populate_dump_metadata(&dinfo[iter], offset, map->size,
+						TSTACK_MEM, map->phys);
+					pos += map->size;
+					iter++;
+					offset += map->size;
+				} else {
+					err = -EFAULT;
+					goto bail;
+				}
 			}
 		}
 	}

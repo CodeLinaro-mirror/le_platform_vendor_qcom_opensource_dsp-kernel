@@ -752,6 +752,7 @@ enum fastrpc_dump_type {
 	CMA = 0,
 	DEBUGFS = 1,
 	INIT_MEM = 2,
+	TSTACK_MEM = 3,
 };
 
 /* Enumeration for V2 TX payload data types */
@@ -1053,6 +1054,7 @@ struct fastrpc_buf {
 	uintptr_t raddr;
 	bool in_use;
 	u32 domain_id;
+	u32 flags;
 	/* time counter to trace buffer allocation latency */
 	struct timespec64 alloc_time;
 	/* time counter to trace scm assign latency */

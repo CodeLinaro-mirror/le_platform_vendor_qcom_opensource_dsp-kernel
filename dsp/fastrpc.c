@@ -3881,6 +3881,15 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	int err = 0;
 	int user_fd = fl->config.user_fd, user_size = fl->config.user_size;
 	void *file = NULL;
+	u32 *dsp_attributes = fl->cctx->dsp_attributes;
+
+	/*
+	 * DSP resource attribute and term variables for process resource
+	 * calculation
+	 */
+	u32 pd = 0, compute = 0, tg = 0, mem_thread = 0, threads = 0;
+	u64 compute_size = 0, thread_size = 0, proc_res_size = 0;
+
 	struct {
 		int pgid;
 		u32 namelen;
@@ -4005,7 +4014,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	 * If dbglogbuf is supported on DSP, allocate 1MB buffer and send it to DSP
 	 * Process spawn should not fail if unable to alloc debug log buffer
 	 */
-	if (fl->cctx->dsp_attributes[DBGLOGBUF_SUPPORT]) {
+	if (dsp_attributes[DBGLOGBUF_SUPPORT]) {
 		err = fastrpc_smmu_buf_alloc(fl, DBGLOGBUF_SIZE,
 				MAP_DEBUG_BUF, &fl->dbglogbuf);
 		if (err) {
@@ -4013,7 +4022,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 				fastrpc_buf_free(fl->dbglogbuf, false);
 				fl->dbglogbuf = NULL;
 			}
-			dev_err(fl->cctx->dev, "Error 0x%x: %s: Failed to allocate dbglogbuf buffer size %d\n",
+			dev_err(fl->cctx->dev, "Error %d: %s: Failed to allocate dbglogbuf buffer size %d\n",
 				err, __func__, DBGLOGBUF_SIZE);
 		} else {
 			pages[NUM_PAGES_WITH_MAP_DEBUG_BUF-1].addr = fl->dbglogbuf->phys;
@@ -4022,9 +4031,82 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 		}
 	}
 
+	/*
+	 * If FIRMWARE_MEM_PROTECTION_DOMAIN is supported on DSP,
+	 * allocate memory required for process resources and send it to DSP
+	 * Process spawn should fail if unable to alloc process resources buffer
+	 * BUF_SIZE should be >= (#threads * qdi_stack_size) +
+	 * (#hvx_contexts * hvx_ctx_size) + (#hlx_contexts * hlx_ctx_size).
+	 */
+	if (dsp_attributes[FIRMWARE_MEM_PROTECTION_DOMAIN] ||
+		dsp_attributes[FIRMWARE_MEM_COMPUTE_RESOURCE] ||
+		dsp_attributes[FIRMWARE_MEM_THREAD]) {
+		/* Overflow checks for each operation */
+		pd = dsp_attributes[FIRMWARE_MEM_PROTECTION_DOMAIN];
+		compute = dsp_attributes[FIRMWARE_MEM_COMPUTE_RESOURCE];
+		tg = dsp_attributes[HANDLE_PRIORITY_SUPPORT];
+		mem_thread = dsp_attributes[FIRMWARE_MEM_THREAD];
+		threads = dsp_attributes[MAX_THREAD_COUNT_PROTECTION_DOMAIN];
+
+		if (compute > 0 && tg > 0 && compute > (U64_MAX / tg)) {
+			dev_err(fl->cctx->dev,
+				"Error: %s: Overflow in compute_size: compute=%u tg=%u\n",
+				__func__, compute, tg);
+			err = -EINVAL;
+			goto err_alloc;
+		}
+		compute_size = (u64)compute * (u64)tg;
+
+		if (mem_thread > 0 && threads > 0 && mem_thread > (U64_MAX / threads)) {
+			dev_err(fl->cctx->dev,
+				"Error: %s: Overflow in thread_size: mem_thread=%u threads=%u\n",
+				__func__, mem_thread, threads);
+			err = -EINVAL;
+			goto err_alloc;
+		}
+		thread_size = (u64)mem_thread * (u64)threads;
+
+		if ((u64)pd > (U64_MAX - compute_size)) {
+			dev_err(fl->cctx->dev,
+				"Error: %s: Overflow in pd + compute_size: pd=%u compute_size=%llu\n",
+				__func__, pd, compute_size);
+			err = -EINVAL;
+			goto err_alloc;
+		}
+		proc_res_size = (u64)pd + compute_size;
+
+		if (proc_res_size > (U64_MAX - thread_size)) {
+			dev_err(fl->cctx->dev,
+				"Error: %s: Overflow in proc_res_size + thread_size: proc_res_size=%llu thread_size=%llu\n",
+				__func__, proc_res_size, thread_size);
+			err = -EINVAL;
+			goto err_alloc;
+		}
+		proc_res_size += thread_size;
+
+		dev_dbg(fl->cctx->dev,
+			"%s: DSP RTOS donation sizes pd=%u tg=%u compute=%u mem-thread=%u threads=%u total=%llu\n",
+			__func__, pd, tg, compute, mem_thread, threads, proc_res_size);
+
+		err = fastrpc_smmu_buf_alloc(fl, proc_res_size,
+				PROC_RESOURCES_BUF, &fl->proc_res_buf);
+		if (err) {
+			dev_err(fl->cctx->dev,
+				"Error %d: %s: Failed to allocate process resources buffer size %llu\n",
+				err, __func__, proc_res_size);
+			goto err_alloc;
+		} else {
+			pages[NUM_PAGES_WITH_DSP_RTOS_MEM_DONATION - 1].addr =
+				fl->proc_res_buf->phys;
+			pages[NUM_PAGES_WITH_DSP_RTOS_MEM_DONATION - 1].size =
+				fl->proc_res_buf->size;
+			inbuf.pageslen = NUM_PAGES_WITH_DSP_RTOS_MEM_DONATION;
+		}
+	}
+
 	err = fastrpc_preload_mem_alloc(fl->cctx, pages, &inbuf.pageslen, NUM_PAGES_WITH_PRELOAD_BUF);
 	if(err)
-		dev_err(fl->cctx->dev, "Error 0x%x: %s: Failed to allocate preload buffer\n",
+		dev_err(fl->cctx->dev, "Error %d: %s: Failed to allocate preload buffer\n",
 				err, __func__);
 
 	fl->init_mem = imem;
@@ -4099,6 +4181,10 @@ err_alloc:
 	if (fl->dbglogbuf) {
 		fastrpc_buf_free(fl->dbglogbuf, false);
 		fl->dbglogbuf = NULL;
+	}
+	if (fl->proc_res_buf) {
+		fastrpc_buf_free(fl->proc_res_buf, false);
+		fl->proc_res_buf = NULL;
 	}
 err_out:
 	kfree(file);
@@ -4192,6 +4278,11 @@ void fastrpc_free_user(struct fastrpc_user *fl)
 	if (fl->dbglogbuf) {
 		fastrpc_buf_free(fl->dbglogbuf, false);
 		fl->dbglogbuf = NULL;
+	}
+
+	if (fl->proc_res_buf) {
+		fastrpc_buf_free(fl->proc_res_buf, false);
+		fl->proc_res_buf = NULL;
 	}
 
 	if (fl->hdr_bufs) {

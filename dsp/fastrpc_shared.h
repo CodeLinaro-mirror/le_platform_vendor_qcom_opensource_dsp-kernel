@@ -246,12 +246,14 @@
  *     Page 3 : rootheap buf
  *     Page 4 : proc_init shared buf
  *     Page 5 : map debug log buf
- *     Page 6 : preload buf
+ *     Page 6 : DSP RTOS memory donation
+ *     Page 7 : preload buf
  */
 #define NUM_PAGES_WITH_SHARED_BUF 2
 #define NUM_PAGES_WITH_ROOTHEAP_BUF 3
 #define NUM_PAGES_WITH_PROC_INIT_SHAREDBUF 4
 #define NUM_PAGES_WITH_MAP_DEBUG_BUF 5
+#define NUM_PAGES_WITH_DSP_RTOS_MEM_DONATION 6
 #define NUM_PAGES_WITH_PRELOAD_BUF 7
 
 /*
@@ -572,11 +574,30 @@ enum fastrpc_process_method_ids {
  * on HLOS and DSP sides.
  */
 enum fastrpc_internal_attributes {
+	HANDLE_PRIORITY_SUPPORT	= 12 + DSP_ATTR_OFFSET,
+
 	/* DMA handle reverse RPC support */
 	DMA_HANDLE_REVERSE_RPC_CAP  = 128 + DSP_ATTR_OFFSET,
 	ROOTPD_RPC_HEAP_SUPPORT     = 131 + DSP_ATTR_OFFSET,
 	DBGLOGBUF_SUPPORT           = 133 + DSP_ATTR_OFFSET,
 	FASTRPC_IPCMSG_SUPPORT      = 135 + DSP_ATTR_OFFSET,
+
+	/* DSP RTOS memory donation support
+	 * FIRMWARE_MEM_PROTECTION_DOMAIN - Size of the DSP RTOS memory donation
+	 * 									required per-PD
+	 * FIRMWARE_MEM_COMPUTE_RESOURCE - Size of the DSP RTOS memory donation
+	 * 									required by a "preemptable entity"
+	 * 									(i.e. thread-group in thread
+	 * 									group-based solutions)
+	 * FIRMWARE_MEM_THREAD - Size of the DSP RTOS memory donation required
+	 * 							per-thread
+	 * MAX_THREAD_COUNT_PROTECTION_DOMAIN - Max thread count in a PD
+	 */
+	FIRMWARE_MEM_PROTECTION_DOMAIN = 137 + DSP_ATTR_OFFSET,
+	FIRMWARE_MEM_COMPUTE_RESOURCE = 138 + DSP_ATTR_OFFSET,
+	FIRMWARE_MEM_THREAD = 139 + DSP_ATTR_OFFSET,
+	MAX_THREAD_COUNT_PROTECTION_DOMAIN = 140 + DSP_ATTR_OFFSET,
+
 	/* Performance timeline DSP support */
 	TIMELINE_SUPPORT            = 141 + DSP_ATTR_OFFSET,
 	FASTRPC_PRELOAD_SUPPORT     = 142 + DSP_ATTR_OFFSET,
@@ -605,6 +626,8 @@ enum fastrpc_remote_domains_id {
 	ROOT_MEM_BUF,
 	/* Buffer to log DSP map/unmap debug info*/
 	MAP_DEBUG_BUF,
+	/* DSP RTOS process resources buffer */
+	PROC_RESOURCES_BUF,
 	/* Buffer donated to rootpd for preload */
 	ROOT_PRELOAD_BUF
 };
@@ -1410,6 +1433,8 @@ struct fastrpc_user {
 	struct fastrpc_buf *hdr_bufs;
 	/* dbglogbuf to log DSP map/unmap debug info */
 	struct fastrpc_buf *dbglogbuf;
+	/* DSP RTOS process resources memory */
+	struct fastrpc_buf *proc_res_buf;
 	/*
 	 * Unique device struct for each process, shared with
 	 * client drivers when attached to fastrpc driver.

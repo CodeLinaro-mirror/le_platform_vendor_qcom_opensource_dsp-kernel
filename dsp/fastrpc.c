@@ -3935,6 +3935,9 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 		}
 	}
 
+	/* Get the uid of the current process */
+	fl->uid = __kuid_val(current_euid());
+
 	if (init.attrs & FASTRPC_MODE_UNSIGNED_MODULE)
 		fl->is_unsigned_pd = true;
 
@@ -6605,7 +6608,7 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 		size = sizeof(struct fastrpc_internal_config);
 		/* Copy with which ever is miminum size, ensures backward compatibility */
 		if (invoke.size < size )
-			size = invoke.size; 
+			size = invoke.size;
 		if (copy_from_user(&config, (void __user *)(uintptr_t)invoke.invparam,
 			size))
 			return -EFAULT;

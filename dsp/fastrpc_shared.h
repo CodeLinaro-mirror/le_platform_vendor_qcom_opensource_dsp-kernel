@@ -16,6 +16,7 @@
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
 #include <linux/version.h>
+#include <linux/kconfig.h>
 #include <linux/soc/qcom/pdr.h>
 #include <linux/kobject.h>
 #include <linux/hashtable.h>
@@ -64,6 +65,17 @@
 #define SMMU_1M 0x100000ULL
 #define SMMU_2M 0x200000ULL
 #define SMMU_1G 0x40000000ULL
+
+/*
+ * Indicates whether FastRPC ring buffer support is available.
+ *
+ * Enabled only when the kernel is built with CONFIG_RING_BUFFER
+ * and the kernel version provides the required ring buffer APIs
+ * (>= v6.18).
+ */
+#define FRPC_RING_BUFFER_ENABLED \
+	(IS_ENABLED(CONFIG_RING_BUFFER) && \
+	(LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)))
 
 /* Max length of domain name */
 #define MAX_DOMAIN_NAMELEN 30
@@ -357,6 +369,8 @@
 
 #define DBG_FS_SIZE (200*1024)
 #define NUM_DUMPED (128)
+/* Size of the ring buffer used for storing log messages (256 KB) */
+#define RING_BUFFER_SIZE (256*1024)
 
 #define PERF_END ((void)0)
 
@@ -499,6 +513,60 @@ enum fastrpc_reserved_ctx {
 	FASTRPC_ROOT_CTX_RESERVED	= 0xAABBCCDD,
 	/* Static PD notifications from DSP will be sent with this unique context */
 	FASTRPC_STATICPD_RSP_CTX = 0xABCDDCAB,
+};
+
+/* FASTRPC_LOG_RINGBUF - Enable logging to the in-memory ring buffer */
+#define FASTRPC_LOG_RINGBUF (1 << 0)
+
+/* FASTRPC_LOG_DMESG - Enable logging to the kernel log (dmesg) */
+#define FASTRPC_LOG_DMESG (1 << 1)
+
+/* FASTRPC_LOG_DMESG_RINGBUF - Enable logging to both ring buffer and dmesg */
+#define FASTRPC_LOG_DMESG_RINGBUF (FASTRPC_LOG_RINGBUF | FASTRPC_LOG_DMESG)
+
+/**
+ * FASTRPC_LOG_INFO - Log an info-level message
+ * @dev: Device pointer
+ * @cctx: FastRPC channel context
+ * @dest: Logging destination mask
+ * @fmt: Format string with optional arguments
+ */
+#define FASTRPC_LOG_INFO(dev, cctx, dest, fmt, ...) \
+	fastrpc_log_internal(dev, cctx, dest, FASTRPC_LOG_LEVEL_INFO, \
+	fmt, ##__VA_ARGS__)
+
+/**
+ * FASTRPC_LOG_WARN - Log a warning-level message
+ * @dev: Device pointer
+ * @cctx: FastRPC channel context
+ * @dest: Logging destination mask
+ * @fmt: Format string with optional arguments
+ */
+#define FASTRPC_LOG_WARN(dev, cctx, dest, fmt, ...) \
+	fastrpc_log_internal(dev, cctx, dest, FASTRPC_LOG_LEVEL_WARN, \
+	fmt, ##__VA_ARGS__)
+
+/**
+ * FASTRPC_LOG_ERROR - Log an error-level message
+ * @dev: Device pointer
+ * @cctx: FastRPC channel context
+ * @dest: Logging destination mask
+ * @fmt: Format string with optional arguments
+ */
+#define FASTRPC_LOG_ERROR(dev, cctx, dest, fmt, ...) \
+	fastrpc_log_internal(dev, cctx, dest, FASTRPC_LOG_LEVEL_ERROR, \
+	fmt, ##__VA_ARGS__)
+
+/**
+ * enum fastrpc_log_level - Logging severity levels
+ * @FASTRPC_LOG_LEVEL_INFO: Informational messages
+ * @FASTRPC_LOG_LEVEL_WARN: Warnings that may indicate potential issues
+ * @FASTRPC_LOG_LEVEL_ERROR: Errors that require attention
+ */
+enum fastrpc_log_level {
+	FASTRPC_LOG_LEVEL_INFO = 1,
+	FASTRPC_LOG_LEVEL_WARN = 2,
+	FASTRPC_LOG_LEVEL_ERROR = 3,
 };
 
 /*
@@ -1151,6 +1219,24 @@ struct fastrpc_kcomm_channel {
 	u32 served_msg_index;
 };
 
+#if FRPC_RING_BUFFER_ENABLED
+/* Structure to hold event log data */
+struct fastrpc_event_log {
+	/* Length of the log data */
+	u32 data_len;
+	/* Flexible array member to hold log data */
+	char data[];
+};
+
+/* Structure to manage kernel log context */
+struct fastrpc_log_context {
+	/* Pointer to ring buffer used for storing logs */
+	struct trace_buffer *rb;
+	/* Wait queue used to signal logger thread for new log events */
+	wait_queue_head_t wq;
+};
+#endif
+
 struct fastrpc_channel_ctx {
 	int domain_id;
 	int sesscount;
@@ -1227,7 +1313,10 @@ struct fastrpc_channel_ctx {
 	struct completion rpmsg_remove_start;
 	/* Buffer donated for preloading operations */
 	struct fastrpc_buf *preload_buf;
-
+#if FRPC_RING_BUFFER_ENABLED
+	/* log context for storing kernel logs */
+	struct fastrpc_log_context log;
+#endif
 };
 
 struct fastrpc_ssr_handler {
@@ -1748,6 +1837,24 @@ void fastrpc_file_put(struct fastrpc_user *fl, bool worker);
  *			disabled, otherwise false.
  */
 bool fastrpc_is_device_crashing(struct fastrpc_channel_ctx *cctx);
+
+/*
+ * fastrpc_log_internal - Log messages to ring buffer and/or kernel log
+ *
+ * Logs formatted messages based on the destination mask. Supports logging to
+ * an in-memory ring buffer, kernel log (dmesg), or both. Typically used via
+ * FASTRPC_LOG_* macros.
+ *
+ * @param dev: Device pointer for contextual logging (can be NULL)
+ * @param cctx: FastRPC channel context
+ * @param dest_mask: Bitmask for log destinations (e.g., RINGBUF, DMESG)
+ * @param level: Log severity level (INFO, WARN, ERROR)
+ * @param fmt: Format string with optional arguments
+ *
+ * @return: None
+ */
+void fastrpc_log_internal(struct device *dev, struct fastrpc_channel_ctx *cctx,
+	int dest_mask, enum fastrpc_log_level level, const char *fmt, ...);
 
 /*
  * fastrpc_sysfs_notify_domain_event - Generate kernel uevent for domain

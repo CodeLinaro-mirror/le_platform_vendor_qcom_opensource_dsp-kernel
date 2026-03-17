@@ -4636,6 +4636,7 @@ static int fastrpc_user_obj_create(struct file *filp,
 	fl->config.user_fd = -1;
 	fl->pd_type = DEFAULT_UNUSED;
 	fl->dsp_recovery = false;
+	fl->logger_exit = false;
 	fl->is_faulted = false;
 
 	if (filp) {
@@ -6540,6 +6541,117 @@ static int fastrpc_invoke_dspsignal(struct fastrpc_user *fl, struct fastrpc_inte
 	return err;
 }
 
+/**
+ * Retrieve kernel log data from ring buffer
+ *
+ * Copies available log entries from the ring buffer to the user-provided
+ * buffer in the ioctl payload.
+ *
+ * @param[in]  klog   : Pointer to ioctl kernel log structure
+ * @param[in]  fl : Pointer to user context
+ *
+ * @return 0 on success, error code on failure
+ */
+#if FRPC_RING_BUFFER_ENABLED
+static int fastrpc_retrieve_kernel_logs(struct fastrpc_user *fl,
+	struct fastrpc_ioctl_kernel_log *klog)
+{
+	int err = 0, copied = 0, cpu, data_len;
+	struct ring_buffer_event *event;
+	struct fastrpc_event_log *entry;
+	const char *data;
+	char __user *ubuf = (char __user*)(uintptr_t)klog->buffer;
+	u32 capacity = klog->buffer_size;
+	struct fastrpc_channel_ctx *cctx = fl->cctx;
+	unsigned long lost;
+
+	if (!cctx->log.rb || !ubuf || !capacity) {
+		err = -EINVAL;
+		goto bail;
+	}
+
+	err = wait_event_interruptible(cctx->log.wq,
+		READ_ONCE(fl->logger_exit) ||
+		!ring_buffer_empty(cctx->log.rb));
+
+	if (atomic_read(&cctx->teardown)) {
+		err = -EPIPE;
+		goto bail;
+	}
+
+	if (READ_ONCE(fl->logger_exit)) {
+		err = -ESHUTDOWN;
+		goto bail;
+	}
+
+	if (err)
+		goto bail;
+
+	for_each_possible_cpu(cpu) {
+		while(1) {
+			event = ring_buffer_peek(cctx->log.rb, cpu, NULL, &lost);
+			if (lost)
+				dev_warn(cctx->dev, "%s: %lu kernel log events lost on cpu %d\n",
+					__func__, lost, cpu);
+
+			if (!event)
+				break;
+
+			entry = ring_buffer_event_data(event);
+			data_len = entry->data_len;
+			data = entry->data;
+			if ((copied + data_len) > capacity) {
+				goto bail;
+			}
+
+			if (copy_to_user((void __user *)(ubuf + copied), data,
+				data_len)) {
+				err = -EFAULT;
+				goto bail;
+			}
+			copied += data_len;
+
+			event = ring_buffer_consume(cctx->log.rb, cpu, NULL, NULL);
+			if (!event) {
+				dev_err(cctx->dev, "%s: consume failed, but peek returned event",
+					__func__);
+				break;
+			}
+		}
+	}
+bail:
+	klog->out_copied = (u32)copied;
+	if (err)
+		dev_err(cctx->dev, "%s failed with err 0x%x", __func__, err);
+	return err;
+}
+#else
+	static int fastrpc_retrieve_kernel_logs(struct fastrpc_user *fl,
+	struct fastrpc_ioctl_kernel_log *klog)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
+static int fastrpc_request_thread_exit(struct fastrpc_user *fl,
+	struct fastrpc_thread_exit *exit_info)
+{
+	int err = 0;
+
+	switch (exit_info->thread_type) {
+		case FASTRPC_THREAD_LOGGER:
+#if FRPC_RING_BUFFER_ENABLED
+			WRITE_ONCE(fl->logger_exit, true);
+			wake_up_interruptible(&fl->cctx->log.wq);
+#endif
+			break;
+		default:
+			err = -EINVAL;
+	}
+
+	return err;
+}
+
 static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 {
 	struct fastrpc_enhanced_invoke inv2 ;
@@ -6552,6 +6664,8 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 	struct fastrpc_ioctl_mdctx_manage ctxm = {0};
 	struct fastrpc_ioctl_remote_proc_state_dump proc = {0};
 	struct fastrpc_internal_proc_timeout rpc = {0};
+	struct fastrpc_ioctl_kernel_log klog = {0};
+	struct fastrpc_thread_exit exit_info = {0};
 	u32 multisession, size = 0;
 	u64 *perf_kernel;
 	bool legacy_domains = true;
@@ -6649,6 +6763,20 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 			(void __user *)(uintptr_t)invoke.invparam, sizeof(recovery)))
 			return -EFAULT;
 		err = fastrpc_set_dsp_recovery_mode(fl, recovery);
+		break;
+	case FASTRPC_INVOKE_RETRIEVE_KERNEL_LOG:
+		if (copy_from_user(&klog, (void __user *)(uintptr_t)invoke.invparam,
+				sizeof(klog)))
+			return -EFAULT;
+		err = fastrpc_retrieve_kernel_logs(fl, &klog);
+		if (copy_to_user((void __user *)invoke.invparam, &klog, sizeof(klog)))
+			return -EFAULT;
+		break;
+	case FASTRPC_INVOKE_THREAD_EXIT:
+		if (copy_from_user(&exit_info, (void __user *)(uintptr_t)invoke.invparam,
+				sizeof(exit_info)))
+			return -EFAULT;
+		err = fastrpc_request_thread_exit(fl, &exit_info);
 		break;
 	default:
 		err = -ENOTTY;
@@ -7987,6 +8115,13 @@ void fastrpc_notify_users(struct fastrpc_user *user)
 	}
 
 	fastrpc_dspsignal_cancel_all(user);
+#if FRPC_RING_BUFFER_ENABLED
+	if (user->pd_type == ROOT_PD &&
+		user->cctx->domain->type == FASTRPC_NSP) {
+		WRITE_ONCE(user->logger_exit, true);
+		wake_up_interruptible(&user->cctx->log.wq);
+	}
+#endif
 	spin_unlock(&user->lock);
 }
 

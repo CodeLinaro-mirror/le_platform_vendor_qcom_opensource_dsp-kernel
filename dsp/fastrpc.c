@@ -8070,6 +8070,7 @@ static void fastrpc_reset_staticpd_session(struct fastrpc_static_pd *spd)
 {
 	struct fastrpc_channel_ctx *cctx = spd->cctx;
 
+	spd->pdrcount++;
 	atomic_set(&spd->ispdup, 0);
 	atomic_set(&spd->is_attached, 0);
 
@@ -8180,9 +8181,6 @@ static void fastrpc_pdr_cb(int state, char *service_path, void *priv)
 		spin_lock_irqsave(&cctx->lock, flags);
 		fastrpc_reset_staticpd_session(spd);
 
-		spd->pdrcount++;
-		atomic_set(&spd->ispdup, 0);
-		atomic_set(&spd->is_attached, 0);
 		spin_unlock_irqrestore(&cctx->lock, flags);
 		if (!strcmp(spd->servloc_name,
 				AUDIO_PDR_SERVICE_LOCATION_CLIENT_NAME))

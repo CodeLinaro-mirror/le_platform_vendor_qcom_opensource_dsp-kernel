@@ -3170,6 +3170,15 @@ static void print_ctx_info(struct seq_file *s_file, struct fastrpc_channel_ctx *
 	seq_printf(s_file,"%s %2s %d\n", "staticpd_status", ":", ctx->staticpd_status);
 	seq_printf(s_file,"%s %11s %d\n", "secure", ":", ctx->secure);
 	seq_printf(s_file,"%s %s %d\n", "unsigned_support", ":", ctx->unsigned_support);
+	seq_printf(s_file,"%s %4s %d\n",  "startshutdown", ":", ctx->startshutdown);
+	seq_printf(s_file,"%s %9s %d\n",  "teardown", ":", atomic_read(&ctx->teardown));
+	seq_printf(s_file,"%s %7s %u\n",  "invoke_cnt", ":", ctx->invoke_cnt);
+
+	if (ctx->valid_attributes) {
+		seq_printf(s_file, "\n=============== DSP Attributes ===============\n");
+		for (int i = 0; i < FASTRPC_MAX_DSP_ATTRIBUTES; i++)
+			seq_printf(s_file, "dsp_attributes[%d] : %u\n", i, ctx->dsp_attributes[i]);
+	}
 }
 
 static void print_map_info(struct seq_file *s_file, struct fastrpc_map *map)
@@ -3197,6 +3206,85 @@ void print_session_info(struct seq_file *s_file, struct fastrpc_user *fl)
 	seq_printf(s_file,"%s %7s %d\n",  "sessionid", ":", fl->sessionid);
 	seq_printf(s_file,"%s %9s %d\n", "pd_type", ":", fl->pd_type);
 	seq_printf(s_file,"%s %9s %d\n",  "profile", ":", fl->profile);
+	seq_printf(s_file,"%s %7s %d\n", "poll_mode", ":", fl->poll_mode);
+	seq_printf(s_file,"%s %8s %d\n", "sharedcb", ":", fl->sharedcb);
+	seq_printf(s_file,"%s %11s %d\n", "state", ":", atomic_read(&fl->state));
+	seq_printf(s_file,"%s %9s %u\n", "timeout", ":", fl->timeout);
+	seq_printf(s_file,"%s %s %d\n", "multi_session_support", ":", fl->multi_session_support);
+	seq_printf(s_file,"%s %4s %d\n", "dsp_recovery", ":", fl->dsp_recovery);
+}
+
+static void print_tx_msgs(struct seq_buf *gmsgbuf, struct fastrpc_tx_msg *tx_msg)
+{
+	int i;
+
+	seq_buf_printf(gmsgbuf, "\n=============== glink tx_msgs ===============\n");
+
+	for (i = 0; i < GLINK_MSG_HISTORY_LEN; i++) {
+		seq_buf_printf(gmsgbuf,
+			"pid = %d, tid = %d, ctx = %llu, handle = %u, sc = %u, addr = %llu, size = %llu, rpmsg_send_err = %d, ns = %lld\n",
+			tx_msg[i].msg.pid,
+			tx_msg[i].msg.tid,
+			(unsigned long long)tx_msg[i].msg.ctx,
+			tx_msg[i].msg.handle,
+			tx_msg[i].msg.sc,
+			(unsigned long long)tx_msg[i].msg.addr,
+			(unsigned long long)tx_msg[i].msg.size,
+			tx_msg[i].rpmsg_send_err,
+			(long long)tx_msg[i].ns);
+	}
+}
+
+static void print_rx_msgs(struct seq_buf *gmsgbuf, struct fastrpc_rx_msg *rx_msg)
+{
+	int i;
+
+	seq_buf_printf(gmsgbuf, "\n=============== glink rx_msgs ===============\n");
+
+	for (i = 0; i < GLINK_MSG_HISTORY_LEN; i++) {
+		seq_buf_printf(gmsgbuf,
+			"ctx = %llu, retval = %d, flags = %u, early_wake_time = %u, version = %u, ns = %lld\n",
+			(unsigned long long)rx_msg[i].rsp.ctx,
+			rx_msg[i].rsp.retval,
+			rx_msg[i].rsp.flags,
+			rx_msg[i].rsp.early_wake_time,
+			rx_msg[i].rsp.version,
+			(long long)rx_msg[i].ns);
+	}
+}
+
+static void print_rpmsg_glink_logs(struct seq_buf *gmsgbuf, struct fastrpc_rpmsg_log *log)
+{
+	unsigned long flags_tx, flags_rx;
+	struct fastrpc_tx_msg *tx_copy;
+	struct fastrpc_rx_msg *rx_copy;
+
+	tx_copy = vmalloc(sizeof(struct fastrpc_tx_msg) * GLINK_MSG_HISTORY_LEN);
+	if (!tx_copy) {
+		pr_warn("%s: Failed to allocate tx_copy, skipping RPMSG logs\n", __func__);
+		return;
+	}
+
+	rx_copy = vmalloc(sizeof(struct fastrpc_rx_msg) * GLINK_MSG_HISTORY_LEN);
+	if (!rx_copy) {
+		pr_warn("%s: Failed to allocate rx_copy, skipping RPMSG logs\n", __func__);
+		vfree(tx_copy);
+		return;
+	}
+
+	spin_lock_irqsave(&log->tx_lock, flags_tx);
+	memcpy(tx_copy, log->tx_msgs, sizeof(struct fastrpc_tx_msg) * GLINK_MSG_HISTORY_LEN);
+	spin_unlock_irqrestore(&log->tx_lock, flags_tx);
+	spin_lock_irqsave(&log->rx_lock, flags_rx);
+	memcpy(rx_copy, log->rx_msgs, sizeof(struct fastrpc_rx_msg) * GLINK_MSG_HISTORY_LEN);
+	spin_unlock_irqrestore(&log->rx_lock, flags_rx);
+
+	seq_buf_printf(gmsgbuf, "\n=============== RPMSG GLINK Logs ===============\n");
+	print_tx_msgs(gmsgbuf, tx_copy);
+	print_rx_msgs(gmsgbuf, rx_copy);
+
+	vfree(tx_copy);
+	vfree(rx_copy);
 }
 
 static int fastrpc_debugfs_show(struct seq_file *s_file, void *data)
@@ -8474,6 +8562,7 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 	u64 total_size = 0, offset = 0;
 	struct fastrpc_user *user, *n;
 	struct seq_file *s_file = NULL;
+	struct seq_buf gmsgbuf;
 	struct fastrpc_dump_info *dinfo;
 	struct fastrpc_buf *buf, *b;
 
@@ -8482,10 +8571,18 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 
 	list_for_each_entry_safe(user, n, active_users_list, active_user_ssr) {
 		total_size += DBG_FS_SIZE;
-		if (user->init_mem && user->is_faulted)
+
+		if (!user->is_faulted)
+			continue;
+
+		if (user->init_mem)
 			total_size += user->init_mem->size;
+
+		if (user->dbglogbuf && user->dbglogbuf->virt)
+			total_size += user->dbglogbuf->size;
 	}
 
+	total_size += RPMSG_LOG_SIZE;
 	total_size += NUM_DUMPED * sizeof(struct fastrpc_dump_info);
 	dump = vmalloc(total_size);
 	if (!dump) {
@@ -8510,9 +8607,29 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 			pos += buf->size;
 			iter += 1;
 			offset += buf->size;
+		} else {
+			pr_err("%s: Insufficient space for gmaps buf, aborting coredump\n", __func__);
+			err = -EFAULT;
+			goto bail;
 		}
 	}
 	scm_done = true;
+
+	if ((dump + total_size) - pos >= RPMSG_LOG_SIZE) {
+		seq_buf_init(&gmsgbuf, pos, RPMSG_LOG_SIZE);
+		print_rpmsg_glink_logs(&gmsgbuf, &cctx->gmsg_log);
+		if (seq_buf_has_overflowed(&gmsgbuf))
+			pr_warn("%s: RPMSG log buffer overflow, logs truncated\n", __func__);
+		populate_dump_metadata(&dinfo[iter], offset, RPMSG_LOG_SIZE, DEBUGFS, 0);
+		pos    += RPMSG_LOG_SIZE;
+		iter   += 1;
+		offset += RPMSG_LOG_SIZE;
+	} else {
+		pr_err("%s: Insufficient space for RPMSG logs, aborting coredump\n", __func__);
+		err = -EFAULT;
+		goto bail;
+	}
+
 	s_file = kzalloc(sizeof(*s_file), GFP_KERNEL);
 	if (!s_file) {
 		err = -ENOMEM;
@@ -8525,6 +8642,7 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 		if ((dump + total_size) - pos >= DBG_FS_SIZE)
 			s_file->buf = pos;
 		else {
+			pr_err("%s: Insufficient space for debugfs, aborting coredump\n", __func__);
 			err = -EFAULT;
 			goto bail;
 		}
@@ -8536,7 +8654,11 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 			iter += 1;
 			offset += DBG_FS_SIZE;
 		}
-		if (user->init_mem && user->is_faulted) {
+
+		if (!user->is_faulted)
+			continue;
+
+		if (user->init_mem) {
 			if ((dump + total_size) - pos >= user->init_mem->size) {
 				memcpy(pos, user->init_mem->virt, user->init_mem->size);
 				populate_dump_metadata(&dinfo[iter], offset, user->init_mem->size,
@@ -8545,6 +8667,21 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 				iter += 1;
 				offset += user->init_mem->size;
 			} else {
+				pr_err("%s: Insufficient space for init_mem, aborting coredump\n", __func__);
+				err = -EFAULT;
+				goto bail;
+			}
+		}
+		if (user->dbglogbuf && user->dbglogbuf->virt && user->dbglogbuf->size > 0) {
+			if ((dump + total_size) - pos >= user->dbglogbuf->size) {
+				memcpy(pos, user->dbglogbuf->virt, user->dbglogbuf->size);
+				populate_dump_metadata(&dinfo[iter], offset, user->dbglogbuf->size,
+					DEBUGFS, user->dbglogbuf->phys);
+				pos += user->dbglogbuf->size;
+				iter += 1;
+				offset += user->dbglogbuf->size;
+			} else {
+				pr_err("%s: Insufficient space for dbglogbuf, aborting coredump\n", __func__);
 				err = -EFAULT;
 				goto bail;
 			}

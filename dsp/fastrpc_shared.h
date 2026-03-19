@@ -367,6 +367,8 @@
 #define OIS_PDR_ADSP_SERVICE_NAME              "tms/servreg"
 #define ADSP_OISPD_NAME                        "msm/adsp/ois_pd"
 
+/* Buffer size reserved in the minidump to store RPMSG. */
+#define RPMSG_LOG_SIZE (64*1024)
 #define DBG_FS_SIZE (200*1024)
 #define NUM_DUMPED (128)
 /* Size of the ring buffer used for storing log messages (256 KB) */

@@ -536,6 +536,8 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 			user->sessionid);
 		fastrpc_notify_users(user);
 	}
+	if (cctx->kcomm_user.obj)
+		fastrpc_notify_users(cctx->kcomm_user.obj);
 	spin_unlock_irqrestore(&cctx->lock, flags);
 	fastrpc_remove_device_nodes(cctx);
 	for (i = 0; i < FASTRPC_MAX_SPD; i++) {

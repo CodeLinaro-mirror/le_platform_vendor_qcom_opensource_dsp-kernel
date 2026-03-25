@@ -19,21 +19,6 @@
 #include <linux/remoteproc.h>
 #include <linux/rpmsg/qcom_glink.h>
 
-void fastrpc_channel_ctx_put(struct fastrpc_channel_ctx *cctx);
-void fastrpc_channel_ctx_get(struct fastrpc_channel_ctx *cctx);
-void fastrpc_update_gctx(struct fastrpc_channel_ctx *cctx, int flag);
-void fastrpc_lowest_capacity_corecount(struct device *dev, struct fastrpc_channel_ctx *cctx);
-int fastrpc_init_privileged_gids(struct device *dev, char *prop_name,
-						struct gid_list *gidlist);
-int fastrpc_setup_service_locator(struct fastrpc_channel_ctx *cctx, char *client_name,
-					char *service_name, char *service_path, int spd_session);
-void fastrpc_register_wakeup_source(struct device *dev,
-	const char *client_name, struct wakeup_source **device_wake_source);
-int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx, bool is_pdr);
-void fastrpc_queue_pd_status(struct fastrpc_user *fl, int domain, int status, int sessionid);
-void frpc_coredump(struct fastrpc_channel_ctx *cctx,
-	struct list_head *active_users_list);
-
 struct fastrpc_channel_ctx* get_current_channel_ctx(struct device *dev)
 {
 	return dev_get_drvdata(dev->parent);
@@ -442,6 +427,10 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	/* Update domain status and global ctx */
 	domain->status = DSP_STATUS_UP;
 	domain->cctx = data;
+
+	/* Notify user space about domain up */
+	fastrpc_sysfs_notify_domain_event();
+
 	dev_info(rdev, "Opened rpmsg channel for %s", domain->name);
 	return 0;
 
@@ -483,6 +472,12 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	spin_lock_irqsave(&cctx->lock, flags);
 	atomic_set(&cctx->teardown, 1);
 	domain->status = DSP_STATUS_DOWN;
+	spin_unlock_irqrestore(&cctx->lock, flags);
+
+	/* Notify userspace about domain DOWN event */
+	fastrpc_sysfs_notify_domain_event();
+
+	spin_lock_irqsave(&cctx->lock, flags);
 	domain->cctx = NULL;
 	cctx->staticpd_status = false;
 

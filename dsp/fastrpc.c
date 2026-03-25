@@ -1976,6 +1976,12 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 	outbufs = REMOTE_SCALARS_OUTBUFS(ctx->sc);
 	metalen = fastrpc_get_meta_size(ctx);
 	pkt_size = fastrpc_get_payload_size(ctx, metalen);
+	outbufslen = sizeof(struct fastrpc_remote_buf) * outbufs;
+	ctx->outbufs = kzalloc(outbufslen, GFP_KERNEL);
+	if (!ctx->outbufs) {
+		err = -ENOMEM;
+		goto bail;
+	}
 	if (!pkt_size) {
 		dev_err(dev, "invalid payload size for handle 0x%x, sc 0x%x\n",
 			ctx->handle, ctx->sc);
@@ -2096,6 +2102,11 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 				goto bail;
 			}
 
+			if (i >= inbufs) {
+				int j = i - inbufs;
+				ctx->outbufs[j].buf.pv = args - ctx->olaps[oix].offset;
+				ctx->outbufs[j].buf.len = len;
+			}
 			rpra[i].buf.pv = args - ctx->olaps[oix].offset;
 			pages[i].addr = ctx->buf->phys -
 					ctx->olaps[oix].offset +
@@ -2152,13 +2163,6 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 		rpra[i].dma.len = ctx->args[i].length;
 		rpra[i].dma.offset = (u64) ctx->args[i].ptr;
 	}
-	outbufslen = sizeof(struct fastrpc_remote_buf) * outbufs;
-	ctx->outbufs = kzalloc(outbufslen, GFP_KERNEL);
-	if (!ctx->outbufs) {
-		err = -ENOMEM;
-		goto bail;
-	}
-	memcpy(ctx->outbufs, rpra + inbufs, outbufslen);
 
 bail:
 	if (err)
@@ -3095,7 +3099,7 @@ static int fastrpc_init_sensor_static_pd_status(struct fastrpc_user *fl)
 	return err;
 }
 
-void print_buf_info(struct seq_file *s_file, struct fastrpc_buf *buf)
+static void print_buf_info(struct seq_file *s_file, struct fastrpc_buf *buf)
 {
     seq_printf(s_file,"\n %s %2s 0x%p", "virt", ":", buf->virt);
 	seq_printf(s_file,"\n %s %2s 0x%llx", "phys", ":", buf->phys);
@@ -3105,7 +3109,7 @@ void print_buf_info(struct seq_file *s_file, struct fastrpc_buf *buf)
 	seq_printf(s_file,"\n %s %s %d", "in_use", ":", buf->in_use);
 }
 
-void print_ictx_info(struct seq_file *s_file, struct fastrpc_invoke_ctx *ictx)
+static void print_ictx_info(struct seq_file *s_file, struct fastrpc_invoke_ctx *ictx)
 {
 	seq_printf(s_file,"\n %s %7s %d", "nscalars", ":", ictx->nscalars);
 	seq_printf(s_file,"\n %s %10s %d", "nbufs", ":", ictx->nbufs);
@@ -3122,7 +3126,7 @@ void print_ictx_info(struct seq_file *s_file, struct fastrpc_invoke_ctx *ictx)
 	seq_printf(s_file,"\n %s %9s %llu", "msg_sz", ":", ictx->msg_sz);
 }
 
-void print_sctx_info(struct seq_file *s_file, struct fastrpc_pool_ctx *sctx)
+static void print_sctx_info(struct seq_file *s_file, struct fastrpc_pool_ctx *sctx)
 {
 	int i;
 	struct fastrpc_smmu *s = NULL;
@@ -3152,7 +3156,7 @@ void print_sctx_info(struct seq_file *s_file, struct fastrpc_pool_ctx *sctx)
 	}
 }
 
-void print_ctx_info(struct seq_file *s_file, struct fastrpc_channel_ctx *ctx)
+static void print_ctx_info(struct seq_file *s_file, struct fastrpc_channel_ctx *ctx)
 {
 	seq_printf(s_file,"%s %8s %d\n", "domain_id", ":", ctx->domain_id);
 	seq_printf(s_file,"%s %8s %d\n", "sesscount", ":", ctx->sesscount);
@@ -3165,7 +3169,7 @@ void print_ctx_info(struct seq_file *s_file, struct fastrpc_channel_ctx *ctx)
 	seq_printf(s_file,"%s %s %d\n", "unsigned_support", ":", ctx->unsigned_support);
 }
 
-void print_map_info(struct seq_file *s_file, struct fastrpc_map *map)
+static void print_map_info(struct seq_file *s_file, struct fastrpc_map *map)
 {
 	seq_printf(s_file,"%s %4s %d\n", "fd", ":", map->fd);
 	seq_printf(s_file,"%s %s 0x%llx\n", "phys", ":", map->phys);
@@ -3343,7 +3347,7 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 	char *name;
 	int err = 0;
 	bool scm_done = false;
-	bool is_oispd = false, is_audiopd = false;
+	bool is_audiopd = false;
 	unsigned long flags;
 	struct {
 		int pgid;
@@ -3376,22 +3380,24 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 	fl->sctx = sctx;
 
 	smmucb = &fl->sctx->smmucb[DEFAULT_SMMU_IDX];
-	is_oispd = !strcmp(name, OISPD);
-	is_audiopd = !strcmp(name, AUDIOPD);
 
 	/*
 	 * Update the pd_type, to direct the messages to correct PD, when
 	 * fastrpc_getpd_msgidx is queried. Update pd_type only after session
 	 * allocation. Session is allocated based on user configured pd_type
 	 */
-	if (is_audiopd) {
+	if (!strcmp(name, AUDIOPD)) {
 		fl->pd_type = AUDIO_STATICPD;
 		fl->servloc_name = AUDIO_PDR_SERVICE_LOCATION_CLIENT_NAME;
 		fl->spd_id = AUDIO_STATIC_ID;
-	} else if (is_oispd) {
+		is_audiopd = true;
+	} else if (!strcmp(name, OISPD)) {
 		fl->pd_type = OIS_STATICPD;
 		fl->servloc_name = OIS_PDR_ADSP_SERVICE_LOCATION_CLIENT_NAME;
 		fl->spd_id = OIS_STATIC_ID;
+	} else if (!strcmp(name, ASCPD)) {
+		fl->pd_type = ASC_STATICPD;
+		fl->spd_id = ASC_STATIC_ID;
 	} else {
 		dev_err(smmucb->dev,
 		"Create static process is failed for proc_name %s", name);
@@ -3404,7 +3410,7 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 		goto err_name;
 	if (is_audiopd && IS_PDR(fl)) {
 		/*
-		 * Remove any previous mappings in case process is trying
+		 * Remove any previous remote heap mappings in case process is trying
 		 * to reconnect after a PD restart on remote subsystem.
 		 */
 		err = fastrpc_mmap_remove_ssr(fl->cctx, true);
@@ -3422,7 +3428,7 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 	inbuf.pageslen = 0;
 
 	// Remote heap feature is available only for audio static PD
-	if (!fl->cctx->staticpd_status && !is_oispd) {
+	if (!fl->cctx->staticpd_status && is_audiopd) {
 		inbuf.pageslen = 1;
 		err = fastrpc_buf_alloc(fl, NULL, init.memlen, REMOTEHEAP_BUF, &buf);
 		if (err)
@@ -3540,6 +3546,122 @@ static int fastrpc_get_root_session(struct fastrpc_channel_ctx *cctx,
 	return err;
 }
 
+
+/**
+ * fastrpc_alloc_root_session_buf() - Allocate buffer using root PD session
+ *
+ * @cctx: Channel context pointer
+ * @obuf: Output pointer to allocated buffer
+ * @size: Size of buffer to allocate
+ * @buf_type: Type of buffer to allocate
+ *
+ * This function allocates a buffer using the context bank/session reserved
+ * for root PD. It retrieves the root session from the channel context and
+ * uses it to allocate the requested buffer.
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+static int fastrpc_alloc_root_session_buf(
+	struct fastrpc_channel_ctx *cctx,
+	struct fastrpc_buf **obuf, u64 size, u32 buf_type)
+{
+	struct fastrpc_buf *buf = NULL;
+	struct fastrpc_pool_ctx *sess = NULL;
+	struct fastrpc_smmu *smmucb = NULL;
+	int err = 0;
+
+	/* Get context bank / session reserved for rootPD */
+	err = fastrpc_get_root_session(cctx, &sess);
+	if (err)
+		goto bail;
+
+	smmucb = &sess->smmucb[DEFAULT_SMMU_IDX];
+	err = __fastrpc_buf_alloc(NULL, smmucb, cctx->domain_id, size, &buf,
+				 buf_type);
+	if (err)
+		goto bail;
+	*obuf = buf;
+
+bail:
+	if (err) {
+		dev_err(cctx->dev,
+			"Error 0x%x: %s: failed to allocate buffer domain id %u size 0x%llx type %d\n",
+			err, __func__, cctx->domain_id, size, buf_type);
+	}
+	return err;
+}
+
+/**
+ * fastrpc_preload_mem_free() - Free preloaded memory buffer for a channel
+ *
+ * @cctx: Pointer to the fastrpc channel context
+ *
+ * This function frees the preloaded memory buffer associated with the given
+ * channel context. It safely releases the buffer under spinlock protection
+ * with interrupts disabled to prevent race conditions.
+ *
+ * Context: Can be called from any context. Disables interrupts internally.
+ */
+static void fastrpc_preload_mem_free(struct fastrpc_channel_ctx *cctx)
+{
+	if (!cctx->preload_buf)
+		return;
+	__fastrpc_buf_free(cctx->preload_buf);
+	cctx->preload_buf = NULL;
+}
+
+/**
+ * fastrpc_preload_mem_alloc() - Allocate preload memory buffer for DSP
+ * @cctx: Pointer to the FastRPC channel context
+ * @pages: Array of physical page descriptors to be populated
+ * @pageslen: Pointer to the length of pages array, updated on success
+ * @page_idx: Current index in the pages array
+ *
+ * This function allocates a preload memory buffer for the DSP if preload
+ * support is enabled and the buffer doesn't already exist. The buffer is
+ * allocated as a root session buffer and stored in the channel context.
+ * Thread-safe allocation is ensured using spinlocks to prevent race
+ * conditions. On success, the physical address and size of the buffer
+ * are stored in the pages array at the specified index.
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+static int fastrpc_preload_mem_alloc(struct fastrpc_channel_ctx *cctx,
+	struct fastrpc_phy_page *pages, u32 *pageslen, u32 page_num)
+{
+	int err = 0;
+	unsigned long flags = 0;
+	struct fastrpc_buf *buf = NULL;
+
+
+	if (!cctx->dsp_attributes[FASTRPC_PRELOAD_SUPPORT])
+		return err;
+
+	if (!cctx->preload_buf) {
+		err = fastrpc_alloc_root_session_buf(cctx, &buf,
+						     FASTRPC_DEFAULT_PRELOAD_BUF_SIZE,
+						     ROOT_PRELOAD_BUF);
+		if (err)
+			goto bail;
+	}
+
+	spin_lock_irqsave(&cctx->lock, flags);
+	if (!cctx->preload_buf) {
+		cctx->preload_buf = buf;
+		/* Set buf as NULL to indicate it is being used */
+		buf = NULL;
+	}
+	spin_unlock_irqrestore(&cctx->lock, flags);
+	*pageslen = page_num;
+	pages[page_num-1].addr = cctx->preload_buf->phys;
+	pages[page_num-1].size = cctx->preload_buf->size;
+
+bail:
+	if (buf)
+		__fastrpc_buf_free(buf);
+	return err;
+}
+
 /*
  * Allocate buffer for growing rootheap on DSP
  * @arg1: channel context.
@@ -3552,8 +3674,6 @@ static int fastrpc_alloc_rootheap_buf(struct fastrpc_channel_ctx *cctx,
 	struct fastrpc_phy_page *pages, u32 *pageslen)
 {
 	struct fastrpc_buf *buf = NULL;
-	struct fastrpc_pool_ctx *sess = NULL;
-	struct fastrpc_smmu *smmucb = NULL;
 	int err = 0;
 	unsigned long flags = 0;
 	const unsigned int ROOTHEAP_BUF_SIZE =
@@ -3568,14 +3688,10 @@ static int fastrpc_alloc_rootheap_buf(struct fastrpc_channel_ctx *cctx,
 		cctx->rootheap_bufs.num >= NUM_ROOTHEAP_BUFS)
 		return err;
 
-	/* Get context bank / session reserved for rootPD */
-	err = fastrpc_get_root_session(cctx, &sess);
-	if (err)
-		goto bail;
-
-	smmucb = &sess->smmucb[DEFAULT_SMMU_IDX];
-	err = __fastrpc_buf_alloc(NULL, smmucb, cctx->domain_id,
-				ROOTHEAP_BUF_SIZE, &buf, ROOTHEAP_BUF);
+	/* Allocate buffer from context bank / session reserved for rootPD */
+	err = fastrpc_alloc_root_session_buf(cctx, &buf,
+						ROOTHEAP_BUF_SIZE,
+						ROOTHEAP_BUF);
 	if (err)
 		goto bail;
 
@@ -3606,6 +3722,31 @@ static int get_unique_hlos_process_id(struct fastrpc_channel_ctx *cctx)
 	}
 	tgid_frpc = ((cctx->domain_id) * FASTRPC_UNIQUE_ID_CONST) + ret;
 	return tgid_frpc;
+}
+
+static char *get_process_basename(void)
+{
+    struct file *exe_file;
+    const char *filename;
+    char *result = NULL;
+
+    if (!current->mm)
+        return NULL;
+
+    rcu_read_lock();
+    exe_file = get_file_rcu(&current->mm->exe_file);
+    rcu_read_unlock();
+
+    if (!exe_file)
+        return NULL;
+
+    if (exe_file->f_path.dentry) {
+        filename = exe_file->f_path.dentry->d_name.name;
+        if(filename)
+        	result = kstrdup(filename, GFP_KERNEL);
+    }
+    fput(exe_file);
+    return result;
 }
 
 /**
@@ -3732,7 +3873,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	struct fastrpc_init_create init;
 	struct fastrpc_invoke_args args[FASTRPC_CREATE_PROCESS_NARGS] = {0};
 	struct fastrpc_enhanced_invoke ioctl;
-	struct fastrpc_phy_page pages[NUM_PAGES_WITH_MAP_DEBUG_BUF] = {0};
+	struct fastrpc_phy_page pages[NUM_PAGES_WITH_PRELOAD_BUF] = {0};
 	struct fastrpc_map *configmap = NULL;
 	struct fastrpc_buf *imem = NULL;
 	struct fastrpc_pool_ctx *sctx = NULL;
@@ -3775,7 +3916,14 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	fl->tgid_app = current->tgid;
 	if (fl->tgid_app != fl->tgid) {
 		fl->untrusted_process = true;
-		snprintf(fl->name, sizeof(fl->name), "%s", current->comm);
+		char *pname = get_process_basename();
+		if (pname) {
+			snprintf(fl->name, sizeof(fl->name), "%s-%d-%s",
+					current->comm, fl->tgid_app, pname);
+			kfree(pname);
+		} else {
+			snprintf(fl->name, sizeof(fl->name), "%s-%d", current->comm, fl->tgid_app);
+		}
 	}
 
 	if (init.attrs & FASTRPC_MODE_UNSIGNED_MODULE)
@@ -3802,7 +3950,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 
 	sctx = fastrpc_session_alloc(fl, false, fl->pd_type);
 	if (!sctx) {
-		dev_err(fl->cctx->dev, "No session available\n");
+		dev_warn_ratelimited(fl->cctx->dev, "No session available\n");
 		err = -EBUSY;
 		goto err_out;
 	}
@@ -3812,7 +3960,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	fastrpc_check_privileged_process(fl, &init);
 
 	inbuf.pgid = fl->tgid_frpc;
-	inbuf.namelen = strlen(current->comm) + 1;
+	inbuf.namelen = strlen(fl->name) + 1;
 	inbuf.filelen = init.filelen;
 	inbuf.pageslen = 1;
 	inbuf.attrs = init.attrs;
@@ -3874,12 +4022,17 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 		}
 	}
 
+	err = fastrpc_preload_mem_alloc(fl->cctx, pages, &inbuf.pageslen, NUM_PAGES_WITH_PRELOAD_BUF);
+	if(err)
+		dev_err(fl->cctx->dev, "Error 0x%x: %s: Failed to allocate preload buffer\n",
+				err, __func__);
+
 	fl->init_mem = imem;
 	args[0].ptr = (u64)(uintptr_t)&inbuf;
 	args[0].length = sizeof(inbuf);
 	args[0].fd = -1;
 
-	args[1].ptr = (u64)(uintptr_t)current->comm;
+	args[1].ptr = (u64)(uintptr_t)fl->name;
 	args[1].length = inbuf.namelen;
 	args[1].fd = -1;
 
@@ -4391,7 +4544,14 @@ static int fastrpc_user_obj_create(struct file *filp,
 	if (filp) {
 		fl->tgid = fl->tgid_app = current->tgid;
 		fl->tgid_frpc = get_unique_hlos_process_id(cctx);
-		snprintf(fl->name, sizeof(fl->name), "%s", current->comm);
+		char *pname = get_process_basename();
+		if (pname) {
+			snprintf(fl->name, sizeof(fl->name), "%s-%d-%s",
+					current->comm, fl->tgid_app, pname);
+			kfree(pname);
+		} else {
+			snprintf(fl->name, sizeof(fl->name), "%s-%d", current->comm, fl->tgid_app);
+		}
 
 		if (fl->tgid_frpc == -1) {
 			dev_err(cctx->dev, "too many fastrpc clients, max %u allowed\n",
@@ -4412,17 +4572,20 @@ static int fastrpc_user_obj_create(struct file *filp,
 			}
 		}
 
+		if (g_frpc.is_trusted_vm) {
+			err = fastrpc_reserve_dma_heap(&tvm_dma_heap);
+			if (err) {
+				dev_err(cctx->dev, "fastrpc_reserve_dma_heap failed with error %d\n",
+					err);
+				goto error;
+			}
+		}
+
+		fl->tvm_dma_heap = tvm_dma_heap;
 		spin_lock_irqsave(&cctx->lock, flags);
 		list_add_tail(&fl->user, &cctx->users);
 		spin_unlock_irqrestore(&cctx->lock, flags);
 
-		if (g_frpc.is_trusted_vm) {
-			err = fastrpc_reserve_dma_heap(&tvm_dma_heap);
-			if (err)
-				goto error;
-		}
-
-		fl->tvm_dma_heap = tvm_dma_heap;
 	} else {
 		/* No pid will be associated with the default user-object */
 		fl->tgid = fl->tgid_app = -1;
@@ -4659,15 +4822,17 @@ static int fastrpc_init_attach(struct fastrpc_user *fl, int pd)
 static int fastrpc_init_attach2(struct fastrpc_user *fl, int pd,
 				char __user *argp)
 {
-	struct fastrpc_invoke_args args[2] = {0};
+	struct fastrpc_invoke_args args[FASTRPC_INIT_ATTACH2_NARGS] = {0};
 	struct fastrpc_enhanced_invoke ioctl = {0};
 	struct fastrpc_ioctl_init_attach2 attach = {0};
+	struct fastrpc_phy_page pages[ATTACH2_NUM_PAGES_WITH_PRELOAD_BUF] = {0};
 	int err = 0;
 	void *file = NULL;
 
 	struct {
 		int pgid;
 		u32 filelen;
+		u32 pageslen;
 	} inbuf;
 
 	err = fastrpc_init_attach_common(fl, pd);
@@ -4695,9 +4860,18 @@ static int fastrpc_init_attach2(struct fastrpc_user *fl, int pd,
 		goto err_out;
 	}
 
+	/* Allocate memory for preloading and pack it as page for sharing */
+	err = fastrpc_preload_mem_alloc(fl->cctx, pages, &inbuf.pageslen,
+					ATTACH2_NUM_PAGES_WITH_PRELOAD_BUF);
+	if(err) {
+		dev_err(fl->cctx->dev, "Error 0x%x: %s: Failed to allocate preload buffer\n",
+				err, __func__);
+		goto err_out;
+	}
+
 	/*
-	 * As part of attach2, pack tgid and shell file
-	 * to share with DSP.
+	 * As part of attach2, pack tgid, shell file
+	 * and memory to share with DSP.
 	 */
 	inbuf.pgid = fl->tgid_frpc;
 	inbuf.filelen = attach.filelen;
@@ -4710,9 +4884,13 @@ static int fastrpc_init_attach2(struct fastrpc_user *fl, int pd,
 	args[1].length = inbuf.filelen;
 	args[1].fd = attach.filefd;
 
+	args[2].ptr = (u64)(uintptr_t) pages;
+	args[2].length = inbuf.pageslen * sizeof(*pages);
+	args[2].fd = -1;
+
 	ioctl.inv.handle = FASTRPC_INIT_HANDLE;
 	ioctl.inv.sc = FASTRPC_SCALARS(FASTRPC_RMID_INIT_ATTACH2,
-					2, 0);
+					3, 0);
 	ioctl.inv.args = (__u64)args;
 
 	err = fastrpc_internal_invoke(fl, KERNEL_MSG_WITH_ZERO_PID,
@@ -4817,7 +4995,7 @@ static void fastrpc_notif_find_process(int domain, struct fastrpc_channel_ctx *c
  * times out on the DSP.
  */
 
-void fastrpc_handle_dsp_root_request(struct work_struct *work)
+static void fastrpc_handle_dsp_root_request(struct work_struct *work)
 {
 	const unsigned int ROOT_RESPONSE_ARG_LENGTH = 2, ROOT_MEM_MSG_SIZE = 4,
                        ROOT_ERROR_MSG_SIZE = 1;
@@ -6014,7 +6192,7 @@ static int fastrpc_dspsignal_signal(struct fastrpc_user *fl,
 	return err;
 }
 
-int fastrpc_dspsignal_wait(struct fastrpc_user *fl,
+static int fastrpc_dspsignal_wait(struct fastrpc_user *fl,
 			     struct fastrpc_internal_dspsignal *fsig)
 {
 	int err = 0;
@@ -6468,6 +6646,12 @@ static int fastrpc_get_dsp_info(struct fastrpc_user *fl, char __user *argp)
 		return -ECHRNG;
 	}
 
+	if (cap.attribute_id == KERNEL_TSTACK_FLAG_SUPPORT) {
+		/* Kernel-only attribute, no DSP query needed */
+		cap.capability = 1;
+		goto done;
+	}
+
 	if (cap.attribute_id >= FASTRPC_MAX_DSP_ATTRIBUTES) {
 		dev_err(fl->cctx->dev, "Error: invalid attribute: %d, err: %d\n",
 			cap.attribute_id, err);
@@ -6478,6 +6662,7 @@ static int fastrpc_get_dsp_info(struct fastrpc_user *fl, char __user *argp)
 	if (err)
 		return err;
 
+done:
 	if (copy_to_user(argp, &cap, sizeof(cap)))
 		return -EFAULT;
 
@@ -6674,7 +6859,8 @@ static int fastrpc_req_mmap(struct fastrpc_user *fl, char __user *argp)
 	smmucb = &fl->sctx->smmucb[DEFAULT_SMMU_IDX];
 	dev = smmucb->dev;
 	if ((req.flags == ADSP_MMAP_ADD_PAGES ||
-		req.flags == ADSP_MMAP_REMOTE_HEAP_ADDR) && !fl->is_unsigned_pd) {
+		req.flags == ADSP_MMAP_REMOTE_HEAP_ADDR ||
+		req.flags == ADSP_MMAP_ADD_PAGES_TSTACK) && !fl->is_unsigned_pd) {
 		if (req.vaddrin) {
 			dev_err(dev,
 			"adding user allocated pages is only supported for unsigned PD\n");
@@ -6696,7 +6882,7 @@ static int fastrpc_req_mmap(struct fastrpc_user *fl, char __user *argp)
 		 * Update dev with correct SMMU device,
 		 * on which the memory is allocated.
 		 */
-		if (req.flags == ADSP_MMAP_ADD_PAGES)
+		if (req.flags == ADSP_MMAP_ADD_PAGES || req.flags == ADSP_MMAP_ADD_PAGES_TSTACK)
 			dev = buf->smmucb->dev;
 
 		req_msg.pgid = fl->tgid_frpc;
@@ -7178,7 +7364,7 @@ union fastrpc_dev_param {
 	* Return: 0 on success.
 	*
 	*/
-long fastrpc_dev_map_dma(struct fastrpc_device *dev,
+static long fastrpc_dev_map_dma(struct fastrpc_device *dev,
 			unsigned long invoke_param)
 {
 	int err = 0;
@@ -7303,7 +7489,7 @@ error:
 	* Return: 0 on success.
 	*
 	*/
-long fastrpc_dev_unmap_dma(struct fastrpc_device *dev,
+static long fastrpc_dev_unmap_dma(struct fastrpc_device *dev,
 			unsigned long invoke_param)
 {
 	int err = 0;
@@ -7417,7 +7603,7 @@ error:
 	* Return: void.
 	*
 	*/
-long fastrpc_dev_get_hlos_pid(struct fastrpc_device *dev,
+static long fastrpc_dev_get_hlos_pid(struct fastrpc_device *dev,
 			unsigned long invoke_param)
 {
 	int err = 0;
@@ -7547,6 +7733,11 @@ void fastrpc_driver_unregister(struct fastrpc_driver *frpc_driver){
 	struct fastrpc_user *fl = NULL;
 	spinlock_t *glock = &g_frpc.glock;
 
+	if (!frpc_driver) {
+		pr_err("%s : invalid driver passed", __func__);
+		return;
+	}
+
 	spin_lock_irqsave(glock, irq_flags);
 	frpc_dev = (struct fastrpc_device *)frpc_driver->device;
 	if (!frpc_dev) {
@@ -7557,6 +7748,7 @@ void fastrpc_driver_unregister(struct fastrpc_driver *frpc_driver){
 
 	// If device is already closed, free the device
 	if (frpc_dev->dev_close) {
+		frpc_driver->device = NULL;
 		spin_unlock_irqrestore(glock, irq_flags);
 		kfree(frpc_dev);
 		pr_info("Un-registering fastrpc driver with handle 0x%x\n",
@@ -8339,8 +8531,10 @@ static int fastrpc_cb_remove(struct platform_device *pdev)
 	unsigned long flags;
 	int i = 0, j = 0;
 
-	if (sess->pd_type == ROOT_PD)
+	if (sess->pd_type == ROOT_PD) {
 		fastrpc_rootheap_buf_list_free(cctx);
+		fastrpc_preload_mem_free(cctx);
+	}
 
 	spin_lock_irqsave(&cctx->lock, flags);
 	for (i = 0; i < FASTRPC_MAX_SESSIONS; i++) {

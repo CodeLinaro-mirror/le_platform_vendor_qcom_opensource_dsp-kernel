@@ -172,6 +172,8 @@
 #define DSP_MMAP_ADD_ROOT_POOL_MEM  0x7000
 /* Map buffer in case of root mem request for DSP heap */
 #define DSP_MMAP_ADD_ROOT_HEAP_MEM  0x8000
+/* Map buffer for additional region when threadstackpool grows */
+#define ADSP_MMAP_ADD_PAGES_TSTACK  0x9000
 
 /* Size of dbglogbuf to log map/unmap calls on DSP*/
 #define DBGLOGBUF_SIZE (1*1024*1024)
@@ -228,6 +230,7 @@
 
 #define FASTRPC_CREATE_PROCESS_NARGS	6
 #define FASTRPC_CREATE_STATIC_PROCESS_NARGS	3
+#define FASTRPC_INIT_ATTACH2_NARGS 3
 
 /* DSP status macros */
 #define DSP_STATUS_UP true
@@ -243,11 +246,19 @@
  *     Page 3 : rootheap buf
  *     Page 4 : proc_init shared buf
  *     Page 5 : map debug log buf
+ *     Page 6 : preload buf
  */
 #define NUM_PAGES_WITH_SHARED_BUF 2
 #define NUM_PAGES_WITH_ROOTHEAP_BUF 3
 #define NUM_PAGES_WITH_PROC_INIT_SHAREDBUF 4
 #define NUM_PAGES_WITH_MAP_DEBUG_BUF 5
+#define NUM_PAGES_WITH_PRELOAD_BUF 7
+
+/*
+ * Num of pages shared with init attach 2 call
+ * Page 1 : Preload buf
+ */
+#define ATTACH2_NUM_PAGES_WITH_PRELOAD_BUF 1
 
 #define miscdev_to_fdevice(d) container_of(d, struct fastrpc_device_node, miscdev)
 
@@ -272,6 +283,9 @@
 /* Default root heap buffer size and count */
 #define FASTRPC_DEFAULT_ROOTHEAP_BUF_SIZE (0x140000)
 #define FASTRPC_DEFAULT_ROOTHEAP_BUF_COUNT (3)
+
+/* Default buffer size for preload memory */
+#define FASTRPC_DEFAULT_PRELOAD_BUF_SIZE (0x500000)
 
 /* Position of priority in frpc tid for glink msg packet */
 #define PRIORITY_POS_IN_FRPC_TID 26
@@ -321,6 +335,7 @@
 #define AUDIOPD      "audiopd"
 #define SENSORSPD     "sensorspd"
 #define OISPD        "oispd"
+#define ASCPD        "ascpd"
 
 #define AUDIO_PDR_SERVICE_LOCATION_CLIENT_NAME   AUDIOPD
 #define AUDIO_PDR_ADSP_SERVICE_NAME              "avs/audio"
@@ -463,6 +478,9 @@
 /* Max RX version supported for fastrpc_ipcmsg */
 #define KERNEL_MAX_IPC_RX_VER (MAX_RX_DATATYPE_VAL - 1)
 
+/* process name length of process offloading to dsp */
+#define PROCESS_NAME_LEN 48
+
 /*
  * Attribute buffer sent to DSP starts at index 1, not 0.
  * Kernel attributes are offset by +1 to align with DSP attributes.
@@ -492,7 +510,7 @@ enum fastrpc_reserved_ctx {
 
 /*
  * Pool types on remote subsystem
- * Always add new pool types at the end, before POOL_MAX_PD_TYPE
+ * Always add new pool types at the end, before MAX_PD_TYPE
  */
 enum fastrpc_cb_pd_types {
 	DEFAULT_UNUSED            = 0,  /* PD type not configured for context banks */
@@ -506,6 +524,7 @@ enum fastrpc_cb_pd_types {
 	GUEST_OS_SHARED           = 8,  /* Legacy Guest OS Shared */
 	USER_UNSIGNEDPD_POOL      = 9,  /* DSP User Dynamic Unsigned PD pool */
 	EXT_MAP_PD_TYPE           = 10, /* DSP extended mapping */
+	ASC_STATICPD              = 11, /* ADSP Camera static ASC PD */
 	MAX_PD_TYPE,                    /* Max PD type */
 };
 
@@ -518,6 +537,7 @@ enum static_process_type {
 	AUDIO_STATIC_ID = 1,
 	SENSORS_STATIC_ID = 2,
 	OIS_STATIC_ID = 3,
+	ASC_STATIC_ID = 4,
 	INVALID_STATIC_ID = -1,
 };
 
@@ -557,6 +577,10 @@ enum fastrpc_internal_attributes {
 	ROOTPD_RPC_HEAP_SUPPORT     = 131 + DSP_ATTR_OFFSET,
 	DBGLOGBUF_SUPPORT           = 133 + DSP_ATTR_OFFSET,
 	FASTRPC_IPCMSG_SUPPORT      = 135 + DSP_ATTR_OFFSET,
+	/* Performance timeline DSP support */
+	TIMELINE_SUPPORT            = 141 + DSP_ATTR_OFFSET,
+	FASTRPC_PRELOAD_SUPPORT     = 142 + DSP_ATTR_OFFSET,
+	KERNEL_TSTACK_FLAG_SUPPORT  = 259 + DSP_ATTR_OFFSET,
 };
 
 enum fastrpc_remote_domains_id {
@@ -581,6 +605,8 @@ enum fastrpc_remote_domains_id {
 	ROOT_MEM_BUF,
 	/* Buffer to log DSP map/unmap debug info*/
 	MAP_DEBUG_BUF,
+	/* Buffer donated to rootpd for preload */
+	ROOT_PRELOAD_BUF
 };
 
 /* Types of RPC calls to DSP */
@@ -1176,6 +1202,9 @@ struct fastrpc_channel_ctx {
 	unsigned int rootheap_buf_count;
 	/* Completion object for the threads to wait for device to crash */
 	struct completion rpmsg_remove_start;
+	/* Buffer donated for preloading operations */
+	struct fastrpc_buf *preload_buf;
+
 };
 
 struct fastrpc_ssr_handler {
@@ -1402,7 +1431,7 @@ struct fastrpc_user {
 	/* Actual hlos pid of process offloading to dsp */
 	int tgid_app;
 	/* Process name of process offloading to dsp */
-	char name[TASK_COMM_LEN];
+	char name[PROCESS_NAME_LEN];
 	/* PD type of remote subsystem process */
 	u32 pd_type;
 	/* Flag to set if DSP remote process ran into exception or faulted */
@@ -1694,6 +1723,19 @@ void fastrpc_file_put(struct fastrpc_user *fl, bool worker);
 bool fastrpc_is_device_crashing(struct fastrpc_channel_ctx *cctx);
 
 /*
+ * fastrpc_sysfs_notify_domain_event - Generate kernel uevent for domain
+ *                                      state changes
+ *
+ * Triggers a uevent on the dummy event attribute under /sys/kernel/fastrpc
+ * to notify userspace of potential domain state transitions (UP/DOWN events).
+ * Userspace watchers (e.g., fastrpc_sysfs_watcher) receive this notification
+ * and initiate re-enumeration of available domains in the sysfs tree.
+ *
+ * @return: None
+ */
+void fastrpc_sysfs_notify_domain_event(void);
+
+/*
  * fastrpc_get_domain_pid_info - Retrieves process ID information for a domain
  *
  * This function returns a string containing the list of hlos pids of all
@@ -1724,5 +1766,20 @@ int fastrpc_get_domain_pid_info(struct fastrpc_domain *domain, char **out_buf,
  * @return: None
  */
 void fastrpc_sysfs_notify_pids(struct fastrpc_domain *domain);
+
+void fastrpc_register_wakeup_source(struct device *dev, const char *client_name,
+				struct wakeup_source **device_wake_source);
+
+void fastrpc_channel_ctx_get(struct fastrpc_channel_ctx *cctx);
+void fastrpc_channel_ctx_put(struct fastrpc_channel_ctx *cctx);
+void fastrpc_update_gctx(struct fastrpc_channel_ctx *cctx, int flag);
+void fastrpc_queue_pd_status(struct fastrpc_user *fl, int domain, int status, int sessionid);
+void frpc_coredump(struct fastrpc_channel_ctx *cctx, struct list_head *active_users_list);
+void fastrpc_lowest_capacity_corecount(struct device *dev, struct fastrpc_channel_ctx *cctx);
+
+int fastrpc_init_privileged_gids(struct device *dev, char *prop_name, struct gid_list *gidlist);
+int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx, bool is_pdr);
+int fastrpc_setup_service_locator(struct fastrpc_channel_ctx *cctx, char *client_name,
+				char *service_name, char *service_path, int spd_session);
 
 #endif /* __FASTRPC_SHARED_H__ */

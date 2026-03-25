@@ -115,11 +115,25 @@ static ssize_t domain_legacy_id_show(struct kobject *kobj,
 
 /*
  * Callback function whenever user app reads
+ * /sys/kernel/fastrpc/event
+ *
+ * Returns 0. This is a dummy trigger node - actual event data is not
+ * returned here. The node exists solely to generate inotify events when kernel
+ * detects domain UP/DOWN transitions, signaling userspace to scan sysfs.
+ */
+static ssize_t event_show(struct kobject *kobj,
+	struct kobj_attribute *attr, char *buf)
+{
+	return 0;
+}
+
+/*
  * /sys/kernel/fastrpc/nsp_info/pids_remote_sessions
  *
  * Returns comma-separated list of hlos pids of apps
  * with active remote sessions on given domain
  */
+
 static ssize_t domain_pid_info_show(struct kobject *kobj,
 	struct kobj_attribute *attr, char *buf)
 {
@@ -140,6 +154,10 @@ static ssize_t domain_pid_info_show(struct kobject *kobj,
 
 /* Parent sysfs kobject for "/sys/kernel/fastrpc" */
 static struct kset *fastrpc_kset = NULL;
+
+/* Dummy event attribute under /sys/kernel/fastrpc for inotify event generation */
+static struct kobj_attribute event_attr = __ATTR(event, 0444,
+	event_show, NULL);
 
 /* Attributes for each channel */
 static struct kobj_attribute name_attr = __ATTR(name, 0444,
@@ -282,6 +300,7 @@ void fastrpc_sysfs_domain_remove(struct fastrpc_domain *domain)
 	/* Remove the domain sysfs node */
 	if (obj->state_initialized)
 		kobject_put(obj);
+
 	pr_info("%s: removed sysfs group for %s\n",
 		__func__, domain->name);
 }
@@ -303,11 +322,29 @@ void fastrpc_sysfs_notify_pids(struct fastrpc_domain *domain)
 
 int fastrpc_sysfs_register_kset(void)
 {
-	/* Create kset to create a parent directory fastrpc under /sys/kernel */
+	int err = 0;
+
+	/* Create kset to create a parent directory fastrpc
+	 * under /sys/kernel
+	 */
 	fastrpc_kset = kset_create_and_add(FASTRPC_DEVICE_NAME, NULL, kernel_kobj);
 	if (!fastrpc_kset) {
 		pr_err("Error: %s: failed to create parent kobj\n", __func__);
 		return -ENOMEM;
+	}
+
+	/*
+	 * Create dummy event attribute file under fastrpc sysfs base folder.
+	 * This will be used to generate an inotify event to notify any userspace
+	 * threads waiting for dynamic domain notifications.
+	 */
+	err = sysfs_create_file(&fastrpc_kset->kobj, &event_attr.attr);
+	if (err) {
+		pr_err("Error %d: %s: failed to create event attr\n",
+			err, __func__);
+		kset_unregister(fastrpc_kset);
+		fastrpc_kset = NULL;
+		return err;
 	}
 
 	return 0;
@@ -316,6 +353,22 @@ int fastrpc_sysfs_register_kset(void)
 void fastrpc_sysfs_deregister_kset(void)
 {
 	/* Delete the parent kset */
-	if (fastrpc_kset)
+	if (fastrpc_kset) {
+		sysfs_remove_file(&fastrpc_kset->kobj, &event_attr.attr);
 		kset_unregister(fastrpc_kset);
+	}
+}
+
+/*
+ * fastrpc_sysfs_notify_domain_event - Notify domain event
+ *
+ * This function notifies a domain event by triggering an
+ * inotify event.
+ * @return: None
+ */
+void fastrpc_sysfs_notify_domain_event(void)
+{
+	if (fastrpc_kset) {
+		sysfs_notify(&fastrpc_kset->kobj, NULL, event_attr.attr.name);
+	}
 }

@@ -15,6 +15,7 @@
 #include <linux/miscdevice.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
+#include <linux/seq_buf.h>
 #include <linux/version.h>
 #include <linux/kconfig.h>
 #include <linux/soc/qcom/pdr.h>

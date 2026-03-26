@@ -169,6 +169,12 @@
 /* Fastrpc attribute for no mapping of fd  */
 #define FASTRPC_ATTR_NOMAP (16)
 
+/* Fastrpc attribute to skip flush by fastrpc */
+#define FASTRPC_ATTR_FORCE_NOFLUSH  (32)
+
+/* Fastrpc attribute to skip invalidate by fastrpc */
+#define FASTRPC_ATTR_FORCE_NOINVALIDATE (64)
+
 /* This flag is used to skip CPU mapping  */
 #define  FASTRPC_MAP_FD_NOMAP (16)
 
@@ -734,6 +740,7 @@ struct fastrpc_buf_overlap {
 	u64 mstart;
 	u64 mend;
 	u64 offset;
+	bool do_cmo;
 };
 
 struct fastrpc_buf {
@@ -847,6 +854,7 @@ struct fastrpc_pool_ctx {
 	u32 smmucount;
 	/* Number of applications using the pool */
 	int usecount;
+	bool coherent;
 };
 
 struct fastrpc_static_pd {

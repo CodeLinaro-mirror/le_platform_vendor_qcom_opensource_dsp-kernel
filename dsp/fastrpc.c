@@ -3688,7 +3688,8 @@ static int fastrpc_alloc_rootheap_buf(struct fastrpc_channel_ctx *cctx,
 
 	/* Allocate buffer only if DSP supports growing of rootheap */
 	if (!cctx->dsp_attributes[ROOTPD_RPC_HEAP_SUPPORT] ||
-		cctx->rootheap_bufs.num >= NUM_ROOTHEAP_BUFS)
+		cctx->rootheap_bufs.num >= NUM_ROOTHEAP_BUFS ||
+		g_frpc.is_trusted_vm)
 		return err;
 
 	/* Allocate buffer from context bank / session reserved for rootPD */

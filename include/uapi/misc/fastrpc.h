@@ -19,12 +19,19 @@
 #define FASTRPC_IOCTL_MULTIMODE_INVOKE	_IOWR('R', 12, struct fastrpc_ioctl_multimode_invoke)
 #define FASTRPC_IOCTL_GET_DSP_INFO	_IOWR('R', 13, struct fastrpc_ioctl_capability)
 #define FASTRPC_IOCTL_INIT_ATTACH2 	_IOWR('R', 14, struct fastrpc_ioctl_init_attach2)
+#define FASTRPC_IOCTL_GET_TIMELINE_BUFFER	_IOWR('R', 15, struct fastrpc_ioctl_timeline_buf)
 
 /* Reserved fields in mdxtx ioctl structs for 64-bit alignment */
 #define FASTRPC_MDCTX_IOCTL_RSVD 8
 
 /* Reserved fields in fastrpc_internal_proc_timeout ioctl structs */
 #define FASTRPC_RPC_TIMEOUT_IOCTL_RSVD 5
+
+/* Reserved space for timeline arguments structs */
+#define FASTRPC_TIMELINE_ARGS_RSVD 8
+
+/* Reserved fields in timeline buffer ioctl structs */
+#define FASTRPC_IOCTL_TIMELINE_BUF_RSVD 8
 
 /**
  * enum fastrpc_map_flags - control flags for mapping memory on DSP user process
@@ -157,6 +164,8 @@ enum fastrpc_multimode_invoke_type {
 	FASTRPC_INVOKE_DISABLE_DSP_RECOVERY = 12,
 	FASTRPC_INVOKE_RETRIEVE_KERNEL_LOG = 13,
 	FASTRPC_INVOKE_THREAD_EXIT = 14,
+	FASTRPC_SET_TIMELINE_INFO = 15,
+	FASTRPC_GET_TIMELINE_VERSION = 16,
 };
 
 struct fastrpc_init_create {
@@ -165,6 +174,33 @@ struct fastrpc_init_create {
 	__u32 attrs;
 	__u32 siglen;
 	__u64 file;	/* pointer to elf file */
+};
+
+/* payload for FASTRPC_SET_TIMELINE_INFO type */
+struct fastrpc_timeline_arguments {
+	/**
+	 * Number of events the timeline buffer can hold.
+	 * Set to 0 if timeline is not supported.
+	 */
+	__u32 num_events;
+	/**
+	 * (In) FastRPC timeline version. Negotiates minimum
+	 * supported version between HLOS and kernel during init.
+	 */
+	__u32 version;
+	/* Reserved space */
+	__u64 reserved[FASTRPC_TIMELINE_ARGS_RSVD];
+};
+
+struct fastrpc_ioctl_timeline_buf {
+	/* User buf to copy timeline events */
+	__u64 addr;
+	/* Max timeline events stored in buf */
+	__u32 total_events_cnt;
+	/* Pointing to current write index */
+	__u32 buf_write_index;
+	/* Reserved space */
+	__u64 reserved[FASTRPC_IOCTL_TIMELINE_BUF_RSVD];
 };
 
 struct fastrpc_init_create_static {

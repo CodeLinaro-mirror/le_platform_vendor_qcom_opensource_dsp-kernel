@@ -1404,6 +1404,8 @@ static void fastrpc_pm_awake(struct fastrpc_user *fl)
 	 */
 	if (wake_source)
 		pm_wakeup_ws_event(wake_source, fl->ws_timeout, true);
+	else
+		dev_warn_ratelimited(cctx->dev, "wake_source is not registered\n");
 }
 
 static void fastrpc_pm_relax(struct fastrpc_user *fl)
@@ -1417,6 +1419,8 @@ static void fastrpc_pm_relax(struct fastrpc_user *fl)
 	mutex_lock(&cctx->wake_mutex);
 	if (wake_source)
 		__pm_relax(wake_source);
+	else
+		dev_warn_ratelimited(cctx->dev, "wake_source is not registered\n");
 	mutex_unlock(&cctx->wake_mutex);
 }
 

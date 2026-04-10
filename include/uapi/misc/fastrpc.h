@@ -155,6 +155,8 @@ enum fastrpc_multimode_invoke_type {
 	FASTRPC_INVOKE_REMOTE_PROCESS_STATE_DUMP = 10,
 	FASTRPC_INVOKE_SET_RPC_TIMEOUT = 11,
 	FASTRPC_INVOKE_DISABLE_DSP_RECOVERY = 12,
+	FASTRPC_INVOKE_RETRIEVE_KERNEL_LOG = 13,
+	FASTRPC_INVOKE_THREAD_EXIT = 14,
 };
 
 struct fastrpc_init_create {
@@ -276,6 +278,31 @@ struct fastrpc_internal_proc_timeout {
 	__u32 timeout;
 	/* Reserved for future use */
 	__u32 reserved[FASTRPC_RPC_TIMEOUT_IOCTL_RSVD];
+};
+
+/* Payload for FASTRPC_INVOKE_KERNEL_LOG_RETRIEVE type */
+struct fastrpc_ioctl_kernel_log {
+	/*
+	 * User-space address of buffer where kernel log data
+	 * will be copied to
+	 */
+	__u64 buffer;
+	/* Size of the buffer in bytes */
+	__u32 buffer_size;
+	/* number of bytes copied into 'buffer' */
+	__u32 out_copied;
+};
+
+/* Thread types used with FASTRPC_INVOKE_THREAD_EXIT */
+enum fastrpc_thread_type {
+	/* User-space logger thread */
+	FASTRPC_THREAD_LOGGER = 1,
+};
+
+/* Payload for FASTRPC_INVOKE_THREAD_EXIT */
+struct fastrpc_thread_exit {
+	/* Thread type that is exiting (logger, worker, etc.) */
+	__u32 thread_type;
 };
 
 enum fastrpc_control_type {

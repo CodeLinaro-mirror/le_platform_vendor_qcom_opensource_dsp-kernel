@@ -34,6 +34,9 @@
 #include "fastrpc_shared.h"
 #include <linux/platform_device.h>
 #include <linux/types.h>
+#if FRPC_RING_BUFFER_ENABLED
+#include <linux/ring_buffer.h>
+#endif
 #include <linux/version.h>
 #define CREATE_TRACE_POINTS
 #include "fastrpc_trace.h"
@@ -3881,6 +3884,15 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	int err = 0;
 	int user_fd = fl->config.user_fd, user_size = fl->config.user_size;
 	void *file = NULL;
+	u32 *dsp_attributes = fl->cctx->dsp_attributes;
+
+	/*
+	 * DSP resource attribute and term variables for process resource
+	 * calculation
+	 */
+	u32 pd = 0, compute = 0, tg = 0, mem_thread = 0, threads = 0;
+	u64 compute_size = 0, thread_size = 0, proc_res_size = 0;
+
 	struct {
 		int pgid;
 		u32 namelen;
@@ -3925,6 +3937,9 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 			snprintf(fl->name, sizeof(fl->name), "%s-%d", current->comm, fl->tgid_app);
 		}
 	}
+
+	/* Get the uid of the current process */
+	fl->uid = __kuid_val(current_euid());
 
 	if (init.attrs & FASTRPC_MODE_UNSIGNED_MODULE)
 		fl->is_unsigned_pd = true;
@@ -4005,7 +4020,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	 * If dbglogbuf is supported on DSP, allocate 1MB buffer and send it to DSP
 	 * Process spawn should not fail if unable to alloc debug log buffer
 	 */
-	if (fl->cctx->dsp_attributes[DBGLOGBUF_SUPPORT]) {
+	if (dsp_attributes[DBGLOGBUF_SUPPORT]) {
 		err = fastrpc_smmu_buf_alloc(fl, DBGLOGBUF_SIZE,
 				MAP_DEBUG_BUF, &fl->dbglogbuf);
 		if (err) {
@@ -4013,7 +4028,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 				fastrpc_buf_free(fl->dbglogbuf, false);
 				fl->dbglogbuf = NULL;
 			}
-			dev_err(fl->cctx->dev, "Error 0x%x: %s: Failed to allocate dbglogbuf buffer size %d\n",
+			dev_err(fl->cctx->dev, "Error %d: %s: Failed to allocate dbglogbuf buffer size %d\n",
 				err, __func__, DBGLOGBUF_SIZE);
 		} else {
 			pages[NUM_PAGES_WITH_MAP_DEBUG_BUF-1].addr = fl->dbglogbuf->phys;
@@ -4022,9 +4037,82 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 		}
 	}
 
+	/*
+	 * If FIRMWARE_MEM_PROTECTION_DOMAIN is supported on DSP,
+	 * allocate memory required for process resources and send it to DSP
+	 * Process spawn should fail if unable to alloc process resources buffer
+	 * BUF_SIZE should be >= (#threads * qdi_stack_size) +
+	 * (#hvx_contexts * hvx_ctx_size) + (#hlx_contexts * hlx_ctx_size).
+	 */
+	if (dsp_attributes[FIRMWARE_MEM_PROTECTION_DOMAIN] ||
+		dsp_attributes[FIRMWARE_MEM_COMPUTE_RESOURCE] ||
+		dsp_attributes[FIRMWARE_MEM_THREAD]) {
+		/* Overflow checks for each operation */
+		pd = dsp_attributes[FIRMWARE_MEM_PROTECTION_DOMAIN];
+		compute = dsp_attributes[FIRMWARE_MEM_COMPUTE_RESOURCE];
+		tg = dsp_attributes[HANDLE_PRIORITY_SUPPORT];
+		mem_thread = dsp_attributes[FIRMWARE_MEM_THREAD];
+		threads = dsp_attributes[MAX_THREAD_COUNT_PROTECTION_DOMAIN];
+
+		if (compute > 0 && tg > 0 && compute > (U64_MAX / tg)) {
+			dev_err(fl->cctx->dev,
+				"Error: %s: Overflow in compute_size: compute=%u tg=%u\n",
+				__func__, compute, tg);
+			err = -EINVAL;
+			goto err_alloc;
+		}
+		compute_size = (u64)compute * (u64)tg;
+
+		if (mem_thread > 0 && threads > 0 && mem_thread > (U64_MAX / threads)) {
+			dev_err(fl->cctx->dev,
+				"Error: %s: Overflow in thread_size: mem_thread=%u threads=%u\n",
+				__func__, mem_thread, threads);
+			err = -EINVAL;
+			goto err_alloc;
+		}
+		thread_size = (u64)mem_thread * (u64)threads;
+
+		if ((u64)pd > (U64_MAX - compute_size)) {
+			dev_err(fl->cctx->dev,
+				"Error: %s: Overflow in pd + compute_size: pd=%u compute_size=%llu\n",
+				__func__, pd, compute_size);
+			err = -EINVAL;
+			goto err_alloc;
+		}
+		proc_res_size = (u64)pd + compute_size;
+
+		if (proc_res_size > (U64_MAX - thread_size)) {
+			dev_err(fl->cctx->dev,
+				"Error: %s: Overflow in proc_res_size + thread_size: proc_res_size=%llu thread_size=%llu\n",
+				__func__, proc_res_size, thread_size);
+			err = -EINVAL;
+			goto err_alloc;
+		}
+		proc_res_size += thread_size;
+
+		dev_dbg(fl->cctx->dev,
+			"%s: DSP RTOS donation sizes pd=%u tg=%u compute=%u mem-thread=%u threads=%u total=%llu\n",
+			__func__, pd, tg, compute, mem_thread, threads, proc_res_size);
+
+		err = fastrpc_smmu_buf_alloc(fl, proc_res_size,
+				PROC_RESOURCES_BUF, &fl->proc_res_buf);
+		if (err) {
+			dev_err(fl->cctx->dev,
+				"Error %d: %s: Failed to allocate process resources buffer size %llu\n",
+				err, __func__, proc_res_size);
+			goto err_alloc;
+		} else {
+			pages[NUM_PAGES_WITH_DSP_RTOS_MEM_DONATION - 1].addr =
+				fl->proc_res_buf->phys;
+			pages[NUM_PAGES_WITH_DSP_RTOS_MEM_DONATION - 1].size =
+				fl->proc_res_buf->size;
+			inbuf.pageslen = NUM_PAGES_WITH_DSP_RTOS_MEM_DONATION;
+		}
+	}
+
 	err = fastrpc_preload_mem_alloc(fl->cctx, pages, &inbuf.pageslen, NUM_PAGES_WITH_PRELOAD_BUF);
 	if(err)
-		dev_err(fl->cctx->dev, "Error 0x%x: %s: Failed to allocate preload buffer\n",
+		dev_err(fl->cctx->dev, "Error %d: %s: Failed to allocate preload buffer\n",
 				err, __func__);
 
 	fl->init_mem = imem;
@@ -4099,6 +4187,10 @@ err_alloc:
 	if (fl->dbglogbuf) {
 		fastrpc_buf_free(fl->dbglogbuf, false);
 		fl->dbglogbuf = NULL;
+	}
+	if (fl->proc_res_buf) {
+		fastrpc_buf_free(fl->proc_res_buf, false);
+		fl->proc_res_buf = NULL;
 	}
 err_out:
 	kfree(file);
@@ -4192,6 +4284,11 @@ void fastrpc_free_user(struct fastrpc_user *fl)
 	if (fl->dbglogbuf) {
 		fastrpc_buf_free(fl->dbglogbuf, false);
 		fl->dbglogbuf = NULL;
+	}
+
+	if (fl->proc_res_buf) {
+		fastrpc_buf_free(fl->proc_res_buf, false);
+		fl->proc_res_buf = NULL;
 	}
 
 	if (fl->hdr_bufs) {
@@ -4539,6 +4636,7 @@ static int fastrpc_user_obj_create(struct file *filp,
 	fl->config.user_fd = -1;
 	fl->pd_type = DEFAULT_UNUSED;
 	fl->dsp_recovery = false;
+	fl->logger_exit = false;
 	fl->is_faulted = false;
 
 	if (filp) {
@@ -6443,6 +6541,117 @@ static int fastrpc_invoke_dspsignal(struct fastrpc_user *fl, struct fastrpc_inte
 	return err;
 }
 
+/**
+ * Retrieve kernel log data from ring buffer
+ *
+ * Copies available log entries from the ring buffer to the user-provided
+ * buffer in the ioctl payload.
+ *
+ * @param[in]  klog   : Pointer to ioctl kernel log structure
+ * @param[in]  fl : Pointer to user context
+ *
+ * @return 0 on success, error code on failure
+ */
+#if FRPC_RING_BUFFER_ENABLED
+static int fastrpc_retrieve_kernel_logs(struct fastrpc_user *fl,
+	struct fastrpc_ioctl_kernel_log *klog)
+{
+	int err = 0, copied = 0, cpu, data_len;
+	struct ring_buffer_event *event;
+	struct fastrpc_event_log *entry;
+	const char *data;
+	char __user *ubuf = (char __user*)(uintptr_t)klog->buffer;
+	u32 capacity = klog->buffer_size;
+	struct fastrpc_channel_ctx *cctx = fl->cctx;
+	unsigned long lost;
+
+	if (!cctx->log.rb || !ubuf || !capacity) {
+		err = -EINVAL;
+		goto bail;
+	}
+
+	err = wait_event_interruptible(cctx->log.wq,
+		READ_ONCE(fl->logger_exit) ||
+		!ring_buffer_empty(cctx->log.rb));
+
+	if (atomic_read(&cctx->teardown)) {
+		err = -EPIPE;
+		goto bail;
+	}
+
+	if (READ_ONCE(fl->logger_exit)) {
+		err = -ESHUTDOWN;
+		goto bail;
+	}
+
+	if (err)
+		goto bail;
+
+	for_each_possible_cpu(cpu) {
+		while(1) {
+			event = ring_buffer_peek(cctx->log.rb, cpu, NULL, &lost);
+			if (lost)
+				dev_warn(cctx->dev, "%s: %lu kernel log events lost on cpu %d\n",
+					__func__, lost, cpu);
+
+			if (!event)
+				break;
+
+			entry = ring_buffer_event_data(event);
+			data_len = entry->data_len;
+			data = entry->data;
+			if ((copied + data_len) > capacity) {
+				goto bail;
+			}
+
+			if (copy_to_user((void __user *)(ubuf + copied), data,
+				data_len)) {
+				err = -EFAULT;
+				goto bail;
+			}
+			copied += data_len;
+
+			event = ring_buffer_consume(cctx->log.rb, cpu, NULL, NULL);
+			if (!event) {
+				dev_err(cctx->dev, "%s: consume failed, but peek returned event",
+					__func__);
+				break;
+			}
+		}
+	}
+bail:
+	klog->out_copied = (u32)copied;
+	if (err)
+		dev_err(cctx->dev, "%s failed with err 0x%x", __func__, err);
+	return err;
+}
+#else
+	static int fastrpc_retrieve_kernel_logs(struct fastrpc_user *fl,
+	struct fastrpc_ioctl_kernel_log *klog)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
+static int fastrpc_request_thread_exit(struct fastrpc_user *fl,
+	struct fastrpc_thread_exit *exit_info)
+{
+	int err = 0;
+
+	switch (exit_info->thread_type) {
+		case FASTRPC_THREAD_LOGGER:
+#if FRPC_RING_BUFFER_ENABLED
+			WRITE_ONCE(fl->logger_exit, true);
+			wake_up_interruptible(&fl->cctx->log.wq);
+#endif
+			break;
+		default:
+			err = -EINVAL;
+	}
+
+	return err;
+}
+
 static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 {
 	struct fastrpc_enhanced_invoke inv2 ;
@@ -6455,6 +6664,8 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 	struct fastrpc_ioctl_mdctx_manage ctxm = {0};
 	struct fastrpc_ioctl_remote_proc_state_dump proc = {0};
 	struct fastrpc_internal_proc_timeout rpc = {0};
+	struct fastrpc_ioctl_kernel_log klog = {0};
+	struct fastrpc_thread_exit exit_info = {0};
 	u32 multisession, size = 0;
 	u64 *perf_kernel;
 	bool legacy_domains = true;
@@ -6514,7 +6725,7 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 		size = sizeof(struct fastrpc_internal_config);
 		/* Copy with which ever is miminum size, ensures backward compatibility */
 		if (invoke.size < size )
-			size = invoke.size; 
+			size = invoke.size;
 		if (copy_from_user(&config, (void __user *)(uintptr_t)invoke.invparam,
 			size))
 			return -EFAULT;
@@ -6552,6 +6763,20 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 			(void __user *)(uintptr_t)invoke.invparam, sizeof(recovery)))
 			return -EFAULT;
 		err = fastrpc_set_dsp_recovery_mode(fl, recovery);
+		break;
+	case FASTRPC_INVOKE_RETRIEVE_KERNEL_LOG:
+		if (copy_from_user(&klog, (void __user *)(uintptr_t)invoke.invparam,
+				sizeof(klog)))
+			return -EFAULT;
+		err = fastrpc_retrieve_kernel_logs(fl, &klog);
+		if (copy_to_user((void __user *)invoke.invparam, &klog, sizeof(klog)))
+			return -EFAULT;
+		break;
+	case FASTRPC_INVOKE_THREAD_EXIT:
+		if (copy_from_user(&exit_info, (void __user *)(uintptr_t)invoke.invparam,
+				sizeof(exit_info)))
+			return -EFAULT;
+		err = fastrpc_request_thread_exit(fl, &exit_info);
 		break;
 	default:
 		err = -ENOTTY;
@@ -7890,6 +8115,13 @@ void fastrpc_notify_users(struct fastrpc_user *user)
 	}
 
 	fastrpc_dspsignal_cancel_all(user);
+#if FRPC_RING_BUFFER_ENABLED
+	if (user->pd_type == ROOT_PD &&
+		user->cctx->domain->type == FASTRPC_NSP) {
+		WRITE_ONCE(user->logger_exit, true);
+		wake_up_interruptible(&user->cctx->log.wq);
+	}
+#endif
 	spin_unlock(&user->lock);
 }
 
@@ -7976,6 +8208,7 @@ static void fastrpc_reset_staticpd_session(struct fastrpc_static_pd *spd)
 {
 	struct fastrpc_channel_ctx *cctx = spd->cctx;
 
+	spd->pdrcount++;
 	atomic_set(&spd->ispdup, 0);
 	atomic_set(&spd->is_attached, 0);
 
@@ -8086,9 +8319,6 @@ static void fastrpc_pdr_cb(int state, char *service_path, void *priv)
 		spin_lock_irqsave(&cctx->lock, flags);
 		fastrpc_reset_staticpd_session(spd);
 
-		spd->pdrcount++;
-		atomic_set(&spd->ispdup, 0);
-		atomic_set(&spd->is_attached, 0);
 		spin_unlock_irqrestore(&cctx->lock, flags);
 		if (!strcmp(spd->servloc_name,
 				AUDIO_PDR_SERVICE_LOCATION_CLIENT_NAME))
@@ -9037,6 +9267,70 @@ static int fastrpc_retrieve_legacy_info(struct fastrpc_domain *domain)
 		break;
 	}
 	return err;
+}
+
+void fastrpc_log_internal(struct device *dev,
+	struct fastrpc_channel_ctx *cctx, int dest_mask,
+	enum fastrpc_log_level level, const char *fmt, ...)
+{
+#if FRPC_RING_BUFFER_ENABLED
+	if ((dest_mask & FASTRPC_LOG_RINGBUF) && cctx && cctx->log.rb) {
+		int msg_len;
+		va_list arg;
+
+		/* Measure formatted length (excluding NULL terminator). */
+		va_start(arg, fmt);
+		msg_len = vsnprintf(NULL, 0, fmt, arg);
+		va_end(arg);
+
+		if (msg_len >= 0) {
+			/* rb_data_len : level + string + NULL terminator */
+			const int rb_data_len = 1 + msg_len + 1;
+			const size_t event_len   =
+				sizeof(struct fastrpc_event_log) + rb_data_len;
+			struct ring_buffer_event *event =
+				ring_buffer_lock_reserve(cctx->log.rb, event_len);
+
+			if (event) {
+				struct fastrpc_event_log *entry = ring_buffer_event_data(event);
+				entry->data_len = rb_data_len;
+				entry->data[0]  = (char)level;
+
+				va_list arg_rb;
+				va_start(arg_rb, fmt);
+				vsnprintf(&entry->data[1], rb_data_len - 1, fmt, arg_rb);
+				va_end(arg_rb);
+
+				ring_buffer_unlock_commit(cctx->log.rb);
+				wake_up_interruptible(&cctx->log.wq);
+			}
+		}
+	}
+#endif /* >= 6.18 */
+
+	if (dest_mask & FASTRPC_LOG_DMESG) {
+		va_list arg_dmesg;
+		struct va_format vaf;
+
+		va_start(arg_dmesg, fmt);
+		vaf.fmt = fmt;
+		vaf.va  = &arg_dmesg;
+
+		switch (level) {
+		case FASTRPC_LOG_LEVEL_INFO:
+			dev ? dev_info(dev, "%pV\n", &vaf) : pr_info("%pV\n", &vaf);
+			break;
+		case FASTRPC_LOG_LEVEL_WARN:
+			dev ? dev_warn(dev, "%pV\n", &vaf) : pr_warn("%pV\n", &vaf);
+			break;
+		case FASTRPC_LOG_LEVEL_ERROR:
+		default:
+			dev ? dev_err(dev, "%pV\n", &vaf) : pr_err("%pV\n", &vaf);
+			break;
+		}
+
+		va_end(arg_dmesg);
+	}
 }
 
 /*

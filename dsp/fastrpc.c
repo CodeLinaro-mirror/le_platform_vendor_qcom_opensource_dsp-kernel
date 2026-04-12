@@ -93,6 +93,13 @@ int fastrpc_file_get(struct fastrpc_user *fl)
 	return kref_get_unless_zero(&fl->refcount) ? 0 : -ENOENT;
 }
 
+static inline uint64_t buf_page_size(uint64_t size)
+{
+	uint64_t sz = (size + (PAGE_SIZE - 1)) & PAGE_MASK;
+
+	return sz > PAGE_SIZE ? sz : PAGE_SIZE;
+}
+
 void fastrpc_file_put(struct fastrpc_user *fl, bool worker)
 {
 	if (worker) {
@@ -256,6 +263,168 @@ struct sg_table *__dma_buf_map_attachment_wrap(struct dma_buf_attachment *attach
 #endif
 
 	return table;
+}
+
+/**
+ * Ensures  cache coherency for input buffers before DSP execution.
+ * This function performs cache flush operations.
+ *
+ * @param[in] ctx          : FastRPC invocation context containing buffer maps
+ * 							 and overlap info.
+ * @param[in] rpra         : Remote argument array with buffer
+ * 						 	 virtual addresses and lengths.
+ * @param[in] perf_counter : Pointer to performance counter for
+ * 							 profiling cache maintenance.
+ * @return 0 on success, or -EFAULT on failure.
+ */
+
+static int fastrpc_flush_args(struct fastrpc_invoke_ctx *ctx,
+	union fastrpc_remote_arg *rpra)
+{
+	int oix, inbufs, outbufs;
+	inbufs = REMOTE_SCALARS_INBUFS(ctx->sc);
+	outbufs = REMOTE_SCALARS_OUTBUFS(ctx->sc);
+	struct device *dev = ctx->fl->sctx->smmucb[DEFAULT_SMMU_IDX].dev;
+
+	for (oix = 0; oix < inbufs+outbufs; ++oix) {
+		int i = ctx->olaps[oix].raix;
+		struct fastrpc_map *map = ctx->maps[i];
+
+		if (i+1 > inbufs)
+			continue;
+		if (!map || map->attr & FASTRPC_ATTR_FORCE_NOFLUSH)
+			continue;
+		if (rpra[i].buf.len && (ctx->olaps[oix].mstart ||
+			ctx->olaps[oix].do_cmo == 1)) {
+			if (map->buf) {
+				if ((buf_page_size(ctx->olaps[oix].mend -
+				ctx->olaps[oix].mstart)) == map->size ||
+				ctx->olaps[oix].do_cmo) {
+					dma_buf_begin_cpu_access(map->buf, DMA_TO_DEVICE);
+					dma_buf_end_cpu_access(map->buf, DMA_TO_DEVICE);
+					dev_dbg(dev,
+						"sc 0x%x pv 0x%llx, mend 0x%llx mstart 0x%llx, len %llu size %llx\n",
+						ctx->sc, rpra[i].buf.pv, ctx->olaps[oix].mend,
+						ctx->olaps[oix].mstart, rpra[i].buf.len, map->size);
+				} else {
+					uintptr_t offset;
+					uint64_t flush_len;
+					unsigned long vm_start;
+					struct vm_area_struct *vma;
+
+					mmap_read_lock(current->mm);
+					vma = find_vma(current->mm, rpra[i].buf.pv);
+					if (!vma) {
+						mmap_read_unlock(current->mm);
+						dev_err(dev,"fastrpc_flush_args: vma not found for pv 0x%llx\n",
+								rpra[i].buf.pv);
+						return -EFAULT;
+					}
+					vm_start = vma->vm_start;
+					if (ctx->olaps[oix].do_cmo) {
+						offset = rpra[i].buf.pv - vma->vm_start;
+						flush_len = rpra[i].buf.len;
+					} else {
+						offset = ctx->olaps[oix].mstart - vma->vm_start;
+						flush_len =
+						ctx->olaps[oix].mend - ctx->olaps[oix].mstart;
+					}
+					mmap_read_unlock(current->mm);
+					dma_buf_begin_cpu_access_partial(
+						map->buf, DMA_TO_DEVICE, offset, flush_len);
+					dma_buf_end_cpu_access_partial(
+						map->buf, DMA_TO_DEVICE, offset,flush_len);
+					dev_dbg(dev,
+							"sc 0x%x vm_start 0x%lx pv 0x%llx, offset 0x%lx, mend 0x%llx mstart 0x%llx, len %llu size %llx\n",
+							ctx->sc, vm_start, rpra[i].buf.pv, offset,
+							ctx->olaps[oix].mend, ctx->olaps[oix].mstart,
+							rpra[i].buf.len, map->size);
+				}
+			}
+		}
+	}
+	return 0;
+}
+
+/**
+* Performs cache invalidation.
+*
+* @param[in] ctx : FastRPC context with scalar, rpra, maps,
+					 and overlap info.
+* @return 0 on success, or -EFAULT on failure.
+*/
+static int fastrpc_inv_args(struct fastrpc_invoke_ctx *ctx)
+{
+	int i , inbufs, outbufs;
+	uint32_t sc = ctx->sc;
+	union fastrpc_remote_arg *rpra = ctx->rpra;
+	struct device *dev = ctx->fl->sctx->smmucb[DEFAULT_SMMU_IDX].dev;
+
+	inbufs = REMOTE_SCALARS_INBUFS(sc);
+	outbufs = REMOTE_SCALARS_OUTBUFS(sc);
+	for (i = 0; i < inbufs+outbufs; ++i) {
+		int over = ctx->olaps[i].raix;
+		struct fastrpc_map *map = ctx->maps[over];
+		if (over +1 <= inbufs)
+			continue;
+		if (!rpra[over].buf.len)
+			continue;
+		if(!map || map->attr & FASTRPC_ATTR_FORCE_NOINVALIDATE)
+			continue;
+		if (((uintptr_t)rpra & PAGE_MASK) ==
+			((uintptr_t)rpra[over].buf.pv & PAGE_MASK))
+			continue;
+		if (ctx->olaps[i].mstart || ctx->olaps[i].do_cmo == 1) {
+			if (map->buf) {
+				if (((buf_page_size(ctx->olaps[i].mend -
+					ctx->olaps[i].mstart)) == map->size) ||
+					ctx->olaps[i].do_cmo) {
+					dma_buf_begin_cpu_access(map->buf, DMA_FROM_DEVICE);
+					dma_buf_end_cpu_access(map->buf, DMA_TO_DEVICE);
+					dev_dbg(dev,
+						"sc 0x%x pv 0x%llx, mend 0x%llx mstart 0x%llx, len %llu size %llx\n",
+						ctx->sc, rpra[i].buf.pv, ctx->olaps[i].mend,
+						ctx->olaps[i].mstart, rpra[over].buf.len,
+						map->size);
+				} else {
+					uintptr_t offset;
+					uint64_t inv_len;
+					unsigned long vm_start;
+					struct vm_area_struct *vma;
+
+					mmap_read_lock(current->mm);
+					vma = find_vma(current->mm, rpra[over].buf.pv);
+					if (!vma) {
+						mmap_read_unlock(current->mm);
+						dev_err(dev,
+							"fastrpc_inv_args: vma not found for pv 0x%llx\n",
+							rpra[over].buf.pv);
+						return -EFAULT;
+					}
+					vm_start = vma->vm_start;
+					if (ctx->olaps[i].do_cmo) {
+						offset = rpra[over].buf.pv-vma->vm_start;
+						inv_len = rpra[over].buf.len;
+
+					} else {
+						offset = ctx->olaps[i].mstart - vma->vm_start;
+						inv_len = ctx->olaps[i].mend - ctx->olaps[i].mstart;
+					}
+					mmap_read_unlock(current->mm);
+					dma_buf_begin_cpu_access_partial(
+						map->buf, DMA_FROM_DEVICE, offset, inv_len);
+					dma_buf_end_cpu_access_partial(
+						map->buf, DMA_TO_DEVICE, offset, inv_len);
+					dev_dbg(dev,
+						"sc 0x%x vm_start 0x%lx pv 0x%llx, mend 0x%llx mstart 0x%llx, len %llu size %llx\n",
+						ctx->sc, vm_start, rpra[i].buf.pv, ctx->olaps[i].mend,
+						ctx->olaps[i].mstart, rpra[over].buf.len,
+						map->size);
+				}
+			}
+		}
+	}
+	return 0;
 }
 
 static int dma_buf_map_attachment_wrap(struct fastrpc_map *map)
@@ -979,8 +1148,11 @@ static int olaps_cmp(const void *a, const void *b)
  */
 static int fastrpc_get_buff_overlaps(struct fastrpc_invoke_ctx *ctx)
 {
-	u64 ion_buf_end_pos = 0, non_ion_buf_end_pos = 0;
-	int i;
+	u64 ion_buf_end_pos = 0, non_ion_buf_end_pos = 0 ;
+	u64 *last_buf_end = NULL;
+	int i, max_ion_raix = -1, max_nonion_raix = -1;
+	int *last_raix = NULL;
+	int inbufs = REMOTE_SCALARS_INBUFS(ctx->sc);
 	struct device *dev = ctx->fl->sctx->smmucb[DEFAULT_SMMU_IDX].dev;
 
 	for (i = 0; i < ctx->nbufs; ++i) {
@@ -999,10 +1171,14 @@ static int fastrpc_get_buff_overlaps(struct fastrpc_invoke_ctx *ctx)
 	sort(ctx->olaps, ctx->nbufs, sizeof(*ctx->olaps), olaps_cmp, NULL);
 
 	for (i = 0; i < ctx->nbufs; ++i) {
-		/* Separate ION and non-ION buffers; fd <= 0 indicates non-ION */
-		u64 *last_buf_end = (ctx->args[ctx->olaps[i].raix].fd <= 0) ?
-				&non_ion_buf_end_pos : &ion_buf_end_pos;
-
+		if (ctx->args[ctx->olaps[i].raix].fd <= 0) {
+			/* Separate ION and non-ION buffers; fd <= 0 indicates non-ION */
+			last_buf_end = &non_ion_buf_end_pos;
+			last_raix = &max_nonion_raix;
+		} else {
+			last_buf_end = &ion_buf_end_pos;
+			last_raix = &max_ion_raix;
+		}
 		if (ctx->olaps[i].start < *last_buf_end) {
 			/* Overlap detected within same buffer type */
 			ctx->olaps[i].mstart = *last_buf_end;
@@ -1012,6 +1188,9 @@ static int fastrpc_get_buff_overlaps(struct fastrpc_invoke_ctx *ctx)
 			if (ctx->olaps[i].end > *last_buf_end) {
 				*last_buf_end = ctx->olaps[i].end;
 			} else {
+				if ((*last_raix < inbufs && ctx->olaps[i].raix + 1 > inbufs) ||
+					(ctx->olaps[i].raix < inbufs && *last_raix + 1 > inbufs))
+						ctx->olaps[i].do_cmo = 1;
 				ctx->olaps[i].mend = 0;
 				ctx->olaps[i].mstart = 0;
 			}
@@ -1023,6 +1202,7 @@ static int fastrpc_get_buff_overlaps(struct fastrpc_invoke_ctx *ctx)
 			ctx->olaps[i].offset = 0;
 			*last_buf_end = ctx->olaps[i].end;
 		}
+		*last_raix = ctx->olaps[i].raix;
 	}
 	return 0;
 }
@@ -1046,6 +1226,7 @@ static struct fastrpc_invoke_ctx *fastrpc_context_alloc(
 	ctx->nbufs = REMOTE_SCALARS_INBUFS(sc) +
 		     REMOTE_SCALARS_OUTBUFS(sc);
 
+	ctx->sc = sc;
 	if (ctx->nscalars) {
 		ctx->maps = kcalloc(ctx->nscalars,
 				    sizeof(*ctx->maps), GFP_KERNEL);
@@ -1098,7 +1279,6 @@ static struct fastrpc_invoke_ctx *fastrpc_context_alloc(
 		ctx->perf->tid = ctx->fl->tgid_app;
 	}
 	ctx->handle = invoke->inv.handle;
-	ctx->sc = sc;
 	ctx->retval = -1;
 	ctx->pid = current->pid;
 	ctx->tgid = user->tgid_app;
@@ -1716,7 +1896,8 @@ map_retry:
 		mutex_unlock(&smmucb->map_mutex);
 		goto attach_err;
 	}
-
+	if (!sess->coherent)
+		map->attach->dma_map_attrs |= DMA_ATTR_SKIP_CPU_SYNC;
 	err = dma_buf_map_attachment_wrap(map);
 	/*
 	 * Retry allocation on next availale IOMMU CB,
@@ -2112,7 +2293,13 @@ static int fastrpc_get_args(u32 kernel, struct fastrpc_invoke_ctx *ctx)
 	}
 	trace_fastrpc_get_args((uint64_t)ctx,
 		ctx->ctxid, ctx->handle, ctx->sc);
-
+	if (!ctx->fl->sctx->coherent) {
+		PERF(ctx->fl->profile, GET_COUNTER(perf_counter, PERF_FLUSH),
+		err =  fastrpc_flush_args(ctx, rpra);
+		if (err)
+			goto bail;
+		PERF_END);
+	}
 	for (i = ctx->nbufs; i < ctx->nscalars; ++i) {
 		list[i].num = ctx->args[i].length ? 1 : 0;
 		list[i].pgidx = i;
@@ -2646,6 +2833,14 @@ static int fastrpc_internal_invoke(struct fastrpc_user *fl,  u32 kernel,
 		goto bail;
 	PERF_END);
 	trace_fastrpc_msg("get_args: end");
+	if (!fl->sctx->coherent) {
+		PERF(fl->profile, GET_COUNTER(perf_counter, PERF_INVARGS),
+		err = fastrpc_inv_args(ctx);
+		if (err)
+			goto bail;
+		PERF_END);
+		trace_fastrpc_msg("fastrpc_inv_args_1: end");
+	}
 	/* make sure that all CPU memory writes are seen by DSP */
 	dma_wmb();
 	/* Send invoke buffer to remote dsp */
@@ -2679,6 +2874,14 @@ wait:
 
 	/* make sure that all memory writes by DSP are seen by CPU */
 	dma_rmb();
+	if (!fl->sctx->coherent) {
+		PERF(fl->profile, GET_COUNTER(perf_counter, PERF_INVARGS),
+		err = fastrpc_inv_args(ctx);
+		if (err)
+			goto bail;
+		PERF_END);
+		trace_fastrpc_msg("fastrpc_inv_args_2: end");
+	}
 	/* populate all the output buffers with results */
 	PERF(fl->profile, GET_COUNTER(perf_counter, PERF_PUTARGS),
 	err = fastrpc_put_args(ctx, kernel);
@@ -7719,7 +7922,8 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 	/* Read secure flag for each context bank, even if part of CB pool */
 	sess->secure = of_property_read_bool(dev->of_node,
 						"qcom,secure-context-bank");
-
+	/* Read cache coherancy for each CB */
+	sess->coherent = of_property_read_bool(dev->of_node, "dma-coherent");
 	/* Populate SMMU CB info at next available free SMMU index */
 	smmuidx = sess->smmucount++;
 	smmucb = &sess->smmucb[smmuidx];

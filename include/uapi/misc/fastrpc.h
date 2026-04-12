@@ -326,13 +326,13 @@ struct fastrpc_ioctl_capability {
 
 enum fastrpc_perfkeys {
 	PERF_COUNT = 0,
-	PERF_RESERVED1 = 1,
+	PERF_FLUSH = 1,
 	PERF_MAP = 2,
 	PERF_COPY = 3,
 	PERF_LINK = 4,
 	PERF_GETARGS = 5,
 	PERF_PUTARGS = 6,
-	PERF_RESERVED2 = 7,
+	PERF_INVARGS = 7,
 	PERF_INVOKE = 8,
 	PERF_RESERVED3 = 9,
 	PERF_KEY_MAX = 10,

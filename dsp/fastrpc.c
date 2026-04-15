@@ -463,6 +463,7 @@ static int fastrpc_map_lookup(struct fastrpc_user *fl, int fd,
 		(retained_map && (kref_read(&map->refcount) != 0))) {
 		found = NULL;
 		ret = -EBADFD;
+		goto bail;
 	}
 
 	/*

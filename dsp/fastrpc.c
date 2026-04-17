@@ -7486,8 +7486,11 @@ static int fastrpc_get_info_from_kernel(struct fastrpc_ioctl_capability *cap,
 	uint32_t *dsp_attributes;
 	unsigned long flags;
 	uint32_t domain = cap->domain;
-	struct fastrpc_user *default_user = cctx->kcomm_user.obj;
+	struct fastrpc_user *user_obj = cctx->kcomm_user.obj;
 	int err;
+
+	if (!user_obj)
+		user_obj = fl;
 
 	spin_lock_irqsave(&cctx->lock, flags);
 	/* check if we already have queried dsp for attributes */
@@ -7501,7 +7504,7 @@ static int fastrpc_get_info_from_kernel(struct fastrpc_ioctl_capability *cap,
 	if (!dsp_attributes)
 		return -ENOMEM;
 
-	err = fastrpc_get_info_from_dsp(default_user, dsp_attributes, FASTRPC_MAX_DSP_ATTRIBUTES);
+	err = fastrpc_get_info_from_dsp(user_obj, dsp_attributes, FASTRPC_MAX_DSP_ATTRIBUTES);
 	if (err == DSP_UNSUPPORTED_API) {
 		dev_info(cctx->dev,
 			 "Warning: DSP capabilities not supported on domain: %d\n", domain);

@@ -10133,8 +10133,10 @@ static void fastrpc_genpool_free(struct fastrpc_smmu *smmucb)
 	}
 	if (buf && smmucb->dev) {
 		domain = iommu_get_domain_for_dev(smmucb->dev);
-		iommu_unmap(domain, smmucb->genpool_iova,
-					smmucb->genpool_size);
+		if (domain) {
+			iommu_unmap(domain, smmucb->genpool_iova,
+						smmucb->genpool_size);
+		}
 		if (buf->phys)
 			dma_free_coherent(buf->dev, buf->size, buf->virt,
 				IOVA_TO_PHYSADDR(buf->phys, smmucb->sid_pos));

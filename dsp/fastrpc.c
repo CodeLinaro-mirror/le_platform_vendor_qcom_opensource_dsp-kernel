@@ -1398,6 +1398,9 @@ static void fastrpc_pm_awake(struct fastrpc_user *fl)
 	struct fastrpc_channel_ctx *cctx = fl->cctx;
 	struct wakeup_source *wake_source = cctx->wake_source;
 
+	if (!fl->wake_enable)
+		return;
+
 	/*
 	 * Vote with PM to abort any suspend in progress and
 	 * keep system awake for specified timeout

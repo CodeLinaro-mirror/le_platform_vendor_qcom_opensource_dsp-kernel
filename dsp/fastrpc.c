@@ -3228,7 +3228,7 @@ static void print_map_info(struct seq_file *s_file, struct fastrpc_map *map)
 	seq_printf(s_file,"%s %2s 0x%x\n", "flags", ":", map->flags);
 }
 
-void print_session_info(struct seq_file *s_file, struct fastrpc_user *fl)
+static void print_session_info(struct seq_file *s_file, struct fastrpc_user *fl)
 {
 	seq_printf(s_file,"%s %2s %s\n", "process_name", ":", fl->name);
 	seq_printf(s_file,"%s %12s %d\n", "tgid", ":", fl->tgid);

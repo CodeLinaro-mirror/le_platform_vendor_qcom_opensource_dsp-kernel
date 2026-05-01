@@ -152,6 +152,21 @@ static ssize_t domain_pid_info_show(struct kobject *kobj,
 	return len_written;
 }
 
+/*
+ * Callback function whenever user app reads
+ * /sys/kernel/fastrpc/<dsp>/card
+ *
+ * Returns card id of domain
+ */
+static ssize_t domain_card_show(struct kobject *kobj,
+	struct kobj_attribute *attr, char *buf)
+{
+	struct fastrpc_domain *domain = container_of(kobj,
+		struct fastrpc_domain, kobj_sysfs);
+
+	return sysfs_emit(buf, "%d\n", domain->card);
+}
+
 /* Parent sysfs kobject for "/sys/kernel/fastrpc" */
 static struct kset *fastrpc_kset = NULL;
 
@@ -176,6 +191,8 @@ static struct kobj_attribute legacy_id_attr = __ATTR(legacy_id, 0444,
 	domain_legacy_id_show, NULL);
 static struct kobj_attribute pids_remote_sessions_attr = __ATTR(pids_remote_sessions, 0444,
 	domain_pid_info_show, NULL);
+static struct kobj_attribute card_attr = __ATTR(card, 0444, domain_card_show,
+	NULL);
 
 /* Define default attribute list for a domain */
 static struct attribute *dsp_attrs[] = {
@@ -185,6 +202,7 @@ static struct attribute *dsp_attrs[] = {
 	&type_attr.attr,
 	&instance_id_attr.attr,
 	&pids_remote_sessions_attr.attr,
+	&card_attr.attr,
 	NULL, /* Null terminator for the attribute array */
 };
 

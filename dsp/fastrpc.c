@@ -73,8 +73,8 @@ struct fastrpc_common {
 	 */
 	DECLARE_HASHTABLE(fastrpc_domains_table, DOMAINS_TABLE_SIZE);
 
-	/* Global counter for number of dsp's of each type that booted up */
-	int dsp_counter[FASTRPC_MAX_DSP_TYPE];
+	/* Global counter for number of dsp's of each type that booted up, per card */
+	int dsp_counter[MAX_FW_CARD_ID + 1][FASTRPC_MAX_DSP_TYPE];
 
 	/* global list of multidomain context ids */
 	struct idr mdctx_idr;
@@ -10854,6 +10854,10 @@ static int fastrpc_retrieve_legacy_info(struct fastrpc_domain *domain)
 		domain->legacy_id = ADSP_DOMAIN_ID;
 		break;
 	case FASTRPC_NSP:
+		if (domain->card != SOC_CARD_ID) {
+			err = -EINVAL;
+			break;
+		}
 		if (domain->instance_id == 0) {
 			domain->legacy_name = (char *)legacy_domains[CDSP_DOMAIN_ID];
 			domain->legacy_id = CDSP_DOMAIN_ID;
@@ -10944,14 +10948,14 @@ void fastrpc_log_internal(struct device *dev,
  * @return 0 on success, negative error code on failure.
  */
 static int fastrpc_add_domain_to_table(struct fastrpc_domain **domain,
-	u32 type, const char* label, u32 instance_id)
+	u32 type, const char* label, u32 instance_id, u32 card_id)
 {
 	struct fastrpc_domain *entry = NULL;
 	struct mutex *hmut = &g_frpc.hmut;
 	u32 phy_id = 0;
 	int err = 0;
 
-	phy_id = GENERATE_DSP_PHYSICAL_ID(type, instance_id);
+	phy_id = GENERATE_DSP_PHYSICAL_ID(card_id, type, instance_id);
 
 	/* Validate if there is an exisitng entry for phy_id */
 	entry = fastrpc_lookup_domain_in_table(phy_id, true);
@@ -10969,6 +10973,7 @@ static int fastrpc_add_domain_to_table(struct fastrpc_domain **domain,
 		entry->phy_id = phy_id;
 		entry->instance_id = instance_id;
 		entry->type = type;
+		entry->card = card_id;
 
 		/* Channel name will be generated as <dsp-type-name><physical-id> */
 		err = snprintf(entry->name, sizeof(entry->name), "%s%d", label, phy_id);
@@ -10979,7 +10984,8 @@ static int fastrpc_add_domain_to_table(struct fastrpc_domain **domain,
 			goto bail;
 		}
 
-		if (instance_id == 0 || (type == FASTRPC_NSP && instance_id == 1))  {
+		if (card_id == SOC_CARD_ID &&
+			(instance_id == 0 || (type == FASTRPC_NSP && instance_id == 1)))  {
 			/*
 			 * For LPASS, SDSP types only the dsp with instance_id 0 is
 			 *                 assigned as legacy adsp, slpi domains
@@ -11003,8 +11009,9 @@ static int fastrpc_add_domain_to_table(struct fastrpc_domain **domain,
 		}
 
 		mutex_lock(hmut);
-		g_frpc.dsp_counter[type]++;
-		entry->id = GENERATE_LOGICAL_DOMAIN_ID(type, g_frpc.dsp_counter[type]);
+		g_frpc.dsp_counter[card_id][type]++;
+		entry->id = (entry->card * 1000000)
+			+ GENERATE_LOGICAL_DOMAIN_ID(type, g_frpc.dsp_counter[card_id][type]);
 		hash_add(g_frpc.fastrpc_domains_table, &entry->node, phy_id);
 		mutex_unlock(hmut);
 	} else {
@@ -11130,8 +11137,9 @@ int fastrpc_populate_domain_from_dt(struct device *rdev,
 				struct fastrpc_domain **domain)
 {
 	const char *label = NULL;
-	u32 type = 0, instance_id = U32_MAX;
+	u32 type = 0, instance_id = U32_MAX, card_id = SOC_CARD_ID;
 	int err = 0;
+	struct device_node *card_node = NULL;
 	bool valid_label = false;
 
 	/* Retrieve the label of DSP from DT */
@@ -11178,6 +11186,37 @@ int fastrpc_populate_domain_from_dt(struct device *rdev,
 		return err;
 	}
 
+	/*
+	 * Retrieve card-id from the fastrpc DT node. Two forms accepted:
+	 *   qcom,card-id = <N>;             literal integer on this node
+	 *   qcom,card-id = <&parent_node>;  phandle to a parent that owns
+	 *                                   qcom,card-id = <N>
+	 * Integrated NSPs omit the property entirely; card_id stays
+	 * SOC_CARD_ID(0).
+	 */
+	card_node = of_parse_phandle(rdev->of_node, "qcom,card-id", 0);
+	if (card_node) {
+		err = of_property_read_u32(card_node, "qcom,card-id", &card_id);
+		if (err < 0) {
+			dev_err(rdev, "Error %d: %s: qcom,card-id phandle target %pOF has no qcom,card-id\n",
+				err, __func__, card_node);
+			of_node_put(card_node);
+			return err;
+		}
+		of_node_put(card_node);
+	} else {
+		err = of_property_read_u32(rdev->of_node, "qcom,card-id", &card_id);
+		if (err < 0) {
+			err = 0;
+			card_id = SOC_CARD_ID;
+		}
+	}
+	if (card_id > MAX_FW_CARD_ID) {
+		dev_err(rdev, "Error: %s: card-id %u from DT exceeds max supported %u\n",
+			__func__, card_id, MAX_FW_CARD_ID);
+		return -EINVAL;
+	}
+
 	/* Retrieve the instance id of the DSP, fail the call if not specified */
 	err = of_property_read_u32(rdev->of_node, "instance-id", &instance_id);
 	if (err < 0) {
@@ -11187,7 +11226,7 @@ int fastrpc_populate_domain_from_dt(struct device *rdev,
 	}
 
 	/* Add the info to the domain table */
-	err = fastrpc_add_domain_to_table(domain, type, label, instance_id);
+	err = fastrpc_add_domain_to_table(domain, type, label, instance_id, card_id);
 	if (err < 0) {
 		dev_err(rdev, "Error %d: %s: failed to add domain %s to table (type %u, instance id %u)",
 			err, __func__, label, type, instance_id);
@@ -11276,7 +11315,7 @@ bail:
 
 static int fastrpc_init(void)
 {
-	int ret, i;
+	int ret, i, j;
 #ifdef CONFIG_DEBUG_FS
 	struct dentry *debugfs_root = NULL;
 #endif
@@ -11286,8 +11325,9 @@ static int fastrpc_init(void)
 	idr_init(&g_frpc.mdctx_idr);
 	hash_init(g_frpc.fastrpc_domains_table);
 	fastrpc_sysfs_register_kset();
-	for (i = 0; i < FASTRPC_MAX_DSP_TYPE; i++) {
-		g_frpc.dsp_counter[i] = -1;
+	for (i = 0; i <= MAX_FW_CARD_ID; i++) {
+		for (j = 0; j < FASTRPC_MAX_DSP_TYPE; j++)
+			g_frpc.dsp_counter[i][j] = -1;
 	}
 	ret = platform_driver_register(&fastrpc_cb_driver);
 	if (ret < 0) {

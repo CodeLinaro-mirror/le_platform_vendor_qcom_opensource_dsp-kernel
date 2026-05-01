@@ -463,19 +463,33 @@
 	(flag == FASTRPC_MAP_FD_EXTENDED || \
 	flag == FASTRPC_MAP_FD_DELAYED_EXTENDED)
 
+/* Card ID for the integrated SoC DSP. Discrete Firewheel cards use card >= 1. */
+#define SOC_CARD_ID 0
+
+/*
+ * Maximum Firewheel card index supported (cards 1 and 2, plus integrated card 0).
+ * Supports up to two discrete Firewheel (CPN3050) PCIe cards alongside the
+ * integrated NSP (card 0). Userspace (MAX_DYNAMIC_DOMAINS in fastrpc_internal.h)
+ * is sized accordingly — both constants must be updated together when scaling.
+ * dsp_counter is sized [MAX_FW_CARD_ID + 1] to cover indices 0..MAX_FW_CARD_ID.
+ */
+#define MAX_FW_CARD_ID 2
+
 /*
  * Generates a physical ID for a DSP (Digital Signal Processor) device.
  *
  * The resulting physical ID is a composite value consisting of:
- *   Type identifier multiplied by 1000, plus the instance identifier
+ *   Card id multiplied by 1000000, plus type identifier multiplied by
+ *   1000, plus the instance identifier
  *
+ * @param card        : Card id
  * @param type        : Type identifier for the DSP device
  * @param instance_id : Instance identifier for the DSP device
  *
  * @return The generated physical ID for the DSP device
  */
-#define GENERATE_DSP_PHYSICAL_ID(type, instance_id) \
-	((type * 1000) + instance_id)
+#define GENERATE_DSP_PHYSICAL_ID(card, type, instance_id) \
+	((card * 1000000) + (type * 1000) + instance_id)
 
 /*
  * Generates a unique logical domain ID by combining a type and counter.
@@ -1489,6 +1503,10 @@ struct fastrpc_domain {
 	 * using old legacy domain ids
 	 */
 	u32 legacy_id;
+
+	/* card id on which DSP is present */
+	u32 card;
+
 	/* Sysfs object for domain */
 	struct kobject kobj_sysfs;
 	/* Channel context for domain */

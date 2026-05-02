@@ -471,6 +471,7 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	struct fastrpc_channel_ctx *cctx = dev_get_drvdata(&rpdev->dev);
 	struct fastrpc_domain *domain = cctx->domain;
 	struct fastrpc_user *user, *n;
+	struct npu_app_prio_table *prio_tbl;
 	unsigned long flags;
 	int i = 0, err;
 	struct list_head active_users_list;
@@ -576,6 +577,24 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 
 	dev_info(cctx->dev, "Closing rpmsg channel for %s", cctx->domain->name);
 	kfree(cctx->gidlist.gids);
+
+	/*
+	 * Free the NPU priority table on SSR so stale priorities do not
+	 * persist when the DSP restarts. NULL the pointer under cctx->lock
+	 * first so any concurrent fastrpc_npu_app_prio_set that has not yet
+	 * acquired the lock will see NULL and return -ENODEV safely.
+	 * entries and the table struct are freed outside the lock to avoid
+	 * holding the spinlock across kfree.
+	 */
+	spin_lock_irqsave(&cctx->lock, flags);
+	prio_tbl = cctx->npu_app_prio;
+	cctx->npu_app_prio = NULL;
+	spin_unlock_irqrestore(&cctx->lock, flags);
+	if (prio_tbl) {
+		kfree(prio_tbl->entries);
+		kfree(prio_tbl);
+	}
+
 	of_platform_depopulate(&rpdev->dev);
 	fastrpc_mmap_remove_ssr(cctx, false);
 	cctx->dev = NULL;

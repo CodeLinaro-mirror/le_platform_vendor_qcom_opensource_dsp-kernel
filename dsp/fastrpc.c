@@ -6727,7 +6727,8 @@ static int fastrpc_dspsignal_wait(struct fastrpc_user *fl,
 			     struct fastrpc_internal_dspsignal *fsig)
 {
 	int err = 0;
-	unsigned long timeout = usecs_to_jiffies(fsig->timeout_usec);
+	uint32_t timeout_usec = fsig->timeout_usec;
+	unsigned long timeout = usecs_to_jiffies(timeout_usec);
 	u32 signal_id = fsig->signal_id;
 	struct fastrpc_dspsignal *s = NULL;
 	long ret = 0;
@@ -6761,14 +6762,15 @@ static int fastrpc_dspsignal_wait(struct fastrpc_user *fl,
 	}
 	spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
 	trace_fastrpc_dspsignal("wait", signal_id, s->state, fsig->timeout_usec);
-	if (timeout != 0xffffffff)
+	if (timeout_usec != FASTRPC_DSPSIGNAL_TIMEOUT_NONE)
 		ret = wait_for_completion_interruptible_timeout(&s->comp, timeout);
 	else
 		ret = wait_for_completion_interruptible(&s->comp);
 	trace_fastrpc_dspsignal("wakeup", signal_id, s->state, fsig->timeout_usec);
 
-	if (ret == 0) {
-		dev_dbg(fl->cctx->dev, "Wait for signal %u timed out\n", signal_id);
+	if (timeout_usec != FASTRPC_DSPSIGNAL_TIMEOUT_NONE && ret == 0) {
+		dev_dbg(fl->cctx->dev, "Wait for signal %u timed out %u us\n",
+				signal_id, timeout_usec);
 		return -ETIMEDOUT;
 	} else if (ret < 0) {
 		dev_err(fl->cctx->dev, "Wait for signal %u failed %d\n", signal_id, (int)ret);

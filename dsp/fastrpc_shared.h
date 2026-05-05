@@ -523,6 +523,15 @@
  */
 #define NPU_APP_PRIO_CONFIG_VERSION 0
 
+/* Maximum number of entries in the per-channel NPU workinfo queue; events
+ * beyond this limit are dropped to prevent unbounded memory growth if the
+ * HAL consumer falls behind. */
+#define NPU_WORKINFO_QUEUE_MAX     1024
+/* Maximum byte length accepted for group_id and debug_feature_id in a workinfo
+ * event.  Enforced before copy_to_user to prevent an out-of-bounds kernel read
+ * if the DSP provides a malformed (oversized) length value. */
+#define NPU_MAX_WORKINFO_FIELD_LEN 256
+
 /* Maximum number of per-UID priority entries the kernel table can hold */
 #define NPU_MAX_APP_PRIO_ENTRIES 1024
 
@@ -1260,6 +1269,12 @@ struct fastrpc_kcomm_channel {
 	u32 served_msg_index;
 };
 
+/* Node in the per-channel NPU workinfo FIFO queue */
+struct npu_workinfo_node {
+	struct npu_workinfo_node *next;
+	struct npu_work_info      info;
+};
+
 #if FRPC_RING_BUFFER_ENABLED
 /* Structure to hold event log data */
 struct fastrpc_event_log {
@@ -1383,6 +1398,12 @@ struct fastrpc_channel_ctx {
 	struct completion rpmsg_remove_start;
 	/* Buffer donated for preloading operations */
 	struct fastrpc_buf *preload_buf;
+	/* Per-channel NPU workinfo FIFO queue */
+	struct npu_workinfo_node *npu_workinfo_head;
+	struct npu_workinfo_node *npu_workinfo_tail;
+	struct semaphore          npu_workinfo_sem;
+	/* Number of nodes currently in the NPU workinfo queue */
+	u32                       npu_workinfo_queue_len;
 #if FRPC_RING_BUFFER_ENABLED
 	/* log context for storing kernel logs */
 	struct fastrpc_log_context log;
@@ -2019,5 +2040,7 @@ int fastrpc_init_privileged_gids(struct device *dev, char *prop_name, struct gid
 int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx, bool is_pdr);
 int fastrpc_setup_service_locator(struct fastrpc_channel_ctx *cctx, char *client_name,
 				char *service_name, char *service_path, int spd_session);
+int fastrpc_npu_post_workinfo(struct fastrpc_channel_ctx *cctx,
+			      struct npu_work_info *info);
 
 #endif /* __FASTRPC_SHARED_H__ */

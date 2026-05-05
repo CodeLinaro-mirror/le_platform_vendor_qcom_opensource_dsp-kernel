@@ -33,6 +33,12 @@ define_vm_modules("canoe-oemvm", "debug-defconfig")
 define_vm_modules("canoe-tuivm", "defconfig")
 define_vm_modules("canoe-oemvm", "defconfig")
 
+define_vm_modules("seraph-tuivm", "debug-defconfig")
+define_vm_modules("seraph-oemvm", "debug-defconfig")
+
+define_vm_modules("seraph-tuivm", "defconfig")
+define_vm_modules("seraph-oemvm", "defconfig")
+
 define_modules("tuna", "consolidate")
 
 define_modules("tuna", "perf")

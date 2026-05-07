@@ -420,11 +420,6 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 #endif
 	}
 
-	/* Configure device nodes for DSP */
-	err = fastrpc_configure_device_nodes(data, rdev);
-		if (err)
-			goto fdev_error;
-
 	/* Configure service locators for DSP */
 	err = fastrpc_configure_service_locator(data);
 		if (err)
@@ -437,6 +432,11 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	err = fastrpc_channel_default_user_create(data);
 	if (err)
 		goto fdev_error;
+
+	/* Configure device nodes for DSP */
+	err = fastrpc_configure_device_nodes(data, rdev);
+		if (err)
+			goto fdev_error;
 
 	/* Update domain status and global ctx */
 	domain->status = DSP_STATUS_UP;
@@ -459,9 +459,8 @@ fdev_error:
 		fastrpc_channel_default_user_delete(data);
 
 populate_error:
-	if (data->fdevice)
-		misc_deregister(&data->fdevice->miscdev);
 	fastrpc_scheduler_deinit(&data->scheduler);
+	fastrpc_remove_device_nodes(data);
 
 free_data:
 	kvfree(data);

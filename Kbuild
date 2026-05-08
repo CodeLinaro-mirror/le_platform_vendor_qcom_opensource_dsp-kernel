@@ -60,6 +60,7 @@ LINUXINCLUDE += -I$(DSP_ROOT)/include/uapi
 
 frpc-adsprpc-y := dsp/fastrpc.o	\
 			 dsp/fastrpc_rpmsg.o \
+			 dsp/fastrpc_timeline.o \
 
 cdsp-loader-y := dsp/cdsp-loader.o
 

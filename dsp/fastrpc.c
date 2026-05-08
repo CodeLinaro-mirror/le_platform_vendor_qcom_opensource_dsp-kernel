@@ -40,6 +40,7 @@
 #include <linux/version.h>
 #define CREATE_TRACE_POINTS
 #include "fastrpc_trace.h"
+#include "fastrpc_timeline.h"
 
 /*
  * The size of the hash table used to store fastrpc domains.
@@ -575,7 +576,7 @@ skip_buf_cache:
 	return;
 }
 
-static void fastrpc_buf_free(struct fastrpc_buf *buf, bool cache)
+void fastrpc_buf_free(struct fastrpc_buf *buf, bool cache)
 {
 	struct fastrpc_user *fl = buf->fl;
 
@@ -823,7 +824,7 @@ static u32 fastrpc_smmu_device_lookup(struct fastrpc_pool_ctx *sess,
  *
  * Return: Returns 0 on success, error code on failure
  */
-static int fastrpc_smmu_buf_alloc(struct fastrpc_user *fl, u64 size,
+int fastrpc_smmu_buf_alloc(struct fastrpc_user *fl, u64 size,
 						u32 buf_type, struct fastrpc_buf **obuf)
 {
 	int err = 0;
@@ -1403,6 +1404,8 @@ static void fastrpc_pm_awake(struct fastrpc_user *fl)
 	 */
 	if (wake_source)
 		pm_wakeup_ws_event(wake_source, fl->ws_timeout, true);
+	else
+		dev_warn_ratelimited(cctx->dev, "wake_source is not registered\n");
 }
 
 static void fastrpc_pm_relax(struct fastrpc_user *fl)
@@ -1416,6 +1419,8 @@ static void fastrpc_pm_relax(struct fastrpc_user *fl)
 	mutex_lock(&cctx->wake_mutex);
 	if (wake_source)
 		__pm_relax(wake_source);
+	else
+		dev_warn_ratelimited(cctx->dev, "wake_source is not registered\n");
 	mutex_unlock(&cctx->wake_mutex);
 }
 
@@ -2532,6 +2537,8 @@ static void fastrpc_wait_for_completion(struct fastrpc_invoke_ctx *ctx,
 	bool wait_resp = false;
 	u32 wTimeout = FASTRPC_USER_EARLY_HINT_TIMEOUT;
 	u32 wakeTime = 0;
+	struct fastrpc_user *fl = ctx->fl;
+	struct fastrpc_timeline *timeline = fl->fastrpc_timeline_obj;
 
 	do {
 		switch (ctx->rsp_flags) {
@@ -2542,15 +2549,19 @@ static void fastrpc_wait_for_completion(struct fastrpc_invoke_ctx *ctx,
 			preempt_disable();
 			jj = 0;
 			wait_resp = false;
+			fastrpc_timeline_record(48, fl->tgid_app, timeline);
 			for (; jj < wakeTime && jj < wTimeout; jj++) {
 				wait_resp = try_wait_for_completion(&ctx->work);
 				if (wait_resp)
 					break;
 				udelay(1);
 			}
+			fastrpc_timeline_record(49, fl->tgid_app, timeline);
 			preempt_enable();
 			if (!wait_resp) {
+				fastrpc_timeline_record(50, fl->tgid_app, timeline);
 				*ptr_interrupted = fastrpc_wait_for_response(ctx, kernel);
+				fastrpc_timeline_record(51, fl->tgid_app, timeline);
 				if (*ptr_interrupted || ctx->is_work_done)
 					return;
 			}
@@ -2558,29 +2569,45 @@ static void fastrpc_wait_for_completion(struct fastrpc_invoke_ctx *ctx,
 		/* busy poll on memory for actual job done */
 		case EARLY_RESPONSE:
 			trace_fastrpc_msg("early_response: poll_begin");
+			fastrpc_timeline_record(24, fl->tgid_app, timeline);
 			err = poll_for_remote_response(ctx, FASTRPC_POLL_TIME);
 			/* Mark job done if poll on memory successful */
 			/* Wait for completion if poll on memory timeout */
 			if (!err) {
 				ctx->is_work_done = true;
+				fastrpc_timeline_record(44, fl->tgid_app, timeline);
 				return;
 			}
+			fastrpc_timeline_record(25, fl->tgid_app, timeline);
 			trace_fastrpc_msg("early_response: poll_timeout");
 			if (!ctx->is_work_done) {
+				if (ctx->rsp_flags == COMPLETE_SIGNAL)
+					fastrpc_timeline_record(26, fl->tgid_app, timeline);
 				*ptr_interrupted = fastrpc_wait_for_response(ctx, kernel);
+				if (ctx->rsp_flags == COMPLETE_SIGNAL)
+					fastrpc_timeline_record(39, fl->tgid_app, timeline);
 				if (*ptr_interrupted || ctx->is_work_done)
 					return;
 			}
 			break;
 		case COMPLETE_SIGNAL:
 		case NORMAL_RESPONSE:
+			if (ctx->rsp_flags == NORMAL_RESPONSE)
+				fastrpc_timeline_record(9, fl->tgid_app, timeline);
+			if (ctx->rsp_flags == COMPLETE_SIGNAL)
+				fastrpc_timeline_record(53, fl->tgid_app, timeline);
 			*ptr_interrupted = fastrpc_wait_for_response(ctx, kernel);
-			if (*ptr_interrupted || ctx->is_work_done)
+			fastrpc_timeline_record(23, fl->tgid_app, timeline);
+			if (*ptr_interrupted || ctx->is_work_done) {
+				fastrpc_timeline_record(37, fl->tgid_app, timeline);
 				return;
+			}
 			break;
 		case POLL_MODE:
 			trace_fastrpc_msg("poll_mode: begin");
+			fastrpc_timeline_record(55, fl->tgid_app, timeline);
 			err = poll_for_remote_response(ctx, ctx->fl->poll_timeout);
+			fastrpc_timeline_record(56, fl->tgid_app, timeline);
 
 			/* If polling timed out, move to normal response state */
 			if (err) {
@@ -2667,7 +2694,9 @@ static int fastrpc_internal_invoke(struct fastrpc_user *fl,  u32 kernel,
 	}
 
 	trace_fastrpc_msg("context_alloc: begin");
+	fastrpc_timeline_record(3, fl->tgid_app, fl->fastrpc_timeline_obj);
 	ctx = fastrpc_context_alloc(fl, kernel, sc, invoke);
+	fastrpc_timeline_record(4, fl->tgid_app, fl->fastrpc_timeline_obj);
 	trace_fastrpc_msg("context_alloc: end");
 	if (IS_ERR(ctx))
 		return PTR_ERR(ctx);
@@ -2675,19 +2704,23 @@ static int fastrpc_internal_invoke(struct fastrpc_user *fl,  u32 kernel,
 	if (fl->profile)
 		perf_counter = (u64 *)ctx->perf + PERF_COUNT;
 	PERF(fl->profile, GET_COUNTER(perf_counter, PERF_GETARGS),
+	fastrpc_timeline_record(5, fl->tgid_app, fl->fastrpc_timeline_obj);
 	err = fastrpc_get_args(kernel, ctx);
 	if (err)
 		goto bail;
 	PERF_END);
+	fastrpc_timeline_record(6, fl->tgid_app, fl->fastrpc_timeline_obj);
 	trace_fastrpc_msg("get_args: end");
 	/* make sure that all CPU memory writes are seen by DSP */
 	dma_wmb();
 	/* Send invoke buffer to remote dsp */
 	PERF(fl->profile, GET_COUNTER(perf_counter, PERF_LINK),
+	fastrpc_timeline_record(7, fl->tgid_app, fl->fastrpc_timeline_obj);
 	err = fastrpc_invoke_send(fl->sctx, priority, ctx, kernel, handle);
 	if (err)
 		goto bail;
 	PERF_END);
+	fastrpc_timeline_record(8, fl->tgid_app, fl->fastrpc_timeline_obj);
 	trace_fastrpc_msg("invoke_send: end");
 wait:
 	if (fl->poll_mode &&
@@ -2713,6 +2746,7 @@ wait:
 
 	/* make sure that all memory writes by DSP are seen by CPU */
 	dma_rmb();
+	fastrpc_timeline_record(40, fl->tgid_app, fl->fastrpc_timeline_obj);
 	/* populate all the output buffers with results */
 	PERF(fl->profile, GET_COUNTER(perf_counter, PERF_PUTARGS),
 	err = fastrpc_put_args(ctx, kernel);
@@ -2724,6 +2758,7 @@ wait:
 	err = ctx->retval;
 	if (err)
 		goto bail;
+	fastrpc_timeline_record(41, fl->tgid_app, fl->fastrpc_timeline_obj);
 
 bail:
 	if (ctx && interrupted == -ERESTARTSYS) {
@@ -3170,6 +3205,15 @@ static void print_ctx_info(struct seq_file *s_file, struct fastrpc_channel_ctx *
 	seq_printf(s_file,"%s %2s %d\n", "staticpd_status", ":", ctx->staticpd_status);
 	seq_printf(s_file,"%s %11s %d\n", "secure", ":", ctx->secure);
 	seq_printf(s_file,"%s %s %d\n", "unsigned_support", ":", ctx->unsigned_support);
+	seq_printf(s_file,"%s %4s %d\n",  "startshutdown", ":", ctx->startshutdown);
+	seq_printf(s_file,"%s %9s %d\n",  "teardown", ":", atomic_read(&ctx->teardown));
+	seq_printf(s_file,"%s %7s %u\n",  "invoke_cnt", ":", ctx->invoke_cnt);
+
+	if (ctx->valid_attributes) {
+		seq_printf(s_file, "\n=============== DSP Attributes ===============\n");
+		for (int i = 0; i < FASTRPC_MAX_DSP_ATTRIBUTES; i++)
+			seq_printf(s_file, "dsp_attributes[%d] : %u\n", i, ctx->dsp_attributes[i]);
+	}
 }
 
 static void print_map_info(struct seq_file *s_file, struct fastrpc_map *map)
@@ -3182,6 +3226,100 @@ static void print_map_info(struct seq_file *s_file, struct fastrpc_map *map)
 	seq_printf(s_file,"%s %2s 0x%llx\n", "raddr", ":", map->raddr);
 	seq_printf(s_file,"%s %2s 0x%x\n", "attr", ":", map->attr);
 	seq_printf(s_file,"%s %2s 0x%x\n", "flags", ":", map->flags);
+}
+
+void print_session_info(struct seq_file *s_file, struct fastrpc_user *fl)
+{
+	seq_printf(s_file,"%s %2s %s\n", "process_name", ":", fl->name);
+	seq_printf(s_file,"%s %12s %d\n", "tgid", ":", fl->tgid);
+	seq_printf(s_file,"%s %7s %d\n", "tgid_frpc", ":", fl->tgid_frpc);
+	seq_printf(s_file,"%s %3s %d\n", "is_secure_dev", ":", fl->is_secure_dev);
+	seq_printf(s_file,"%s %3s %d\n", "num_pers_hdrs", ":", fl->num_pers_hdrs);
+	seq_printf(s_file,"%s %2s %d\n", "num_cached_buf", ":", fl->num_cached_buf);
+	seq_printf(s_file,"%s %5s %d\n", "wake_enable", ":", fl->wake_enable);
+	seq_printf(s_file,"%s %2s %d\n",  "is_unsigned_pd", ":", fl->is_unsigned_pd);
+	seq_printf(s_file,"%s %7s %d\n",  "sessionid", ":", fl->sessionid);
+	seq_printf(s_file,"%s %9s %d\n", "pd_type", ":", fl->pd_type);
+	seq_printf(s_file,"%s %9s %d\n",  "profile", ":", fl->profile);
+	seq_printf(s_file,"%s %7s %d\n", "poll_mode", ":", fl->poll_mode);
+	seq_printf(s_file,"%s %8s %d\n", "sharedcb", ":", fl->sharedcb);
+	seq_printf(s_file,"%s %11s %d\n", "state", ":", atomic_read(&fl->state));
+	seq_printf(s_file,"%s %9s %u\n", "timeout", ":", fl->timeout);
+	seq_printf(s_file,"%s %s %d\n", "multi_session_support", ":", fl->multi_session_support);
+	seq_printf(s_file,"%s %4s %d\n", "dsp_recovery", ":", fl->dsp_recovery);
+}
+
+static void print_tx_msgs(struct seq_buf *gmsgbuf, struct fastrpc_tx_msg *tx_msg)
+{
+	int i;
+
+	seq_buf_printf(gmsgbuf, "\n=============== glink tx_msgs ===============\n");
+
+	for (i = 0; i < GLINK_MSG_HISTORY_LEN; i++) {
+		seq_buf_printf(gmsgbuf,
+			"pid = %d, tid = %d, ctx = %llu, handle = %u, sc = %u, addr = %llu, size = %llu, rpmsg_send_err = %d, ns = %lld\n",
+			tx_msg[i].msg.pid,
+			tx_msg[i].msg.tid,
+			(unsigned long long)tx_msg[i].msg.ctx,
+			tx_msg[i].msg.handle,
+			tx_msg[i].msg.sc,
+			(unsigned long long)tx_msg[i].msg.addr,
+			(unsigned long long)tx_msg[i].msg.size,
+			tx_msg[i].rpmsg_send_err,
+			(long long)tx_msg[i].ns);
+	}
+}
+
+static void print_rx_msgs(struct seq_buf *gmsgbuf, struct fastrpc_rx_msg *rx_msg)
+{
+	int i;
+
+	seq_buf_printf(gmsgbuf, "\n=============== glink rx_msgs ===============\n");
+
+	for (i = 0; i < GLINK_MSG_HISTORY_LEN; i++) {
+		seq_buf_printf(gmsgbuf,
+			"ctx = %llu, retval = %d, flags = %u, early_wake_time = %u, version = %u, ns = %lld\n",
+			(unsigned long long)rx_msg[i].rsp.ctx,
+			rx_msg[i].rsp.retval,
+			rx_msg[i].rsp.flags,
+			rx_msg[i].rsp.early_wake_time,
+			rx_msg[i].rsp.version,
+			(long long)rx_msg[i].ns);
+	}
+}
+
+static void print_rpmsg_glink_logs(struct seq_buf *gmsgbuf, struct fastrpc_rpmsg_log *log)
+{
+	unsigned long flags_tx, flags_rx;
+	struct fastrpc_tx_msg *tx_copy;
+	struct fastrpc_rx_msg *rx_copy;
+
+	tx_copy = vmalloc(sizeof(struct fastrpc_tx_msg) * GLINK_MSG_HISTORY_LEN);
+	if (!tx_copy) {
+		pr_warn("%s: Failed to allocate tx_copy, skipping RPMSG logs\n", __func__);
+		return;
+	}
+
+	rx_copy = vmalloc(sizeof(struct fastrpc_rx_msg) * GLINK_MSG_HISTORY_LEN);
+	if (!rx_copy) {
+		pr_warn("%s: Failed to allocate rx_copy, skipping RPMSG logs\n", __func__);
+		vfree(tx_copy);
+		return;
+	}
+
+	spin_lock_irqsave(&log->tx_lock, flags_tx);
+	memcpy(tx_copy, log->tx_msgs, sizeof(struct fastrpc_tx_msg) * GLINK_MSG_HISTORY_LEN);
+	spin_unlock_irqrestore(&log->tx_lock, flags_tx);
+	spin_lock_irqsave(&log->rx_lock, flags_rx);
+	memcpy(rx_copy, log->rx_msgs, sizeof(struct fastrpc_rx_msg) * GLINK_MSG_HISTORY_LEN);
+	spin_unlock_irqrestore(&log->rx_lock, flags_rx);
+
+	seq_buf_printf(gmsgbuf, "\n=============== RPMSG GLINK Logs ===============\n");
+	print_tx_msgs(gmsgbuf, tx_copy);
+	print_rx_msgs(gmsgbuf, rx_copy);
+
+	vfree(tx_copy);
+	vfree(rx_copy);
 }
 
 static int fastrpc_debugfs_show(struct seq_file *s_file, void *data)
@@ -3202,16 +3340,7 @@ static int fastrpc_debugfs_show(struct seq_file *s_file, void *data)
 			return 0;
 		}
 
-		seq_printf(s_file,"%s %12s %d\n", "tgid", ":", fl->tgid);
-		seq_printf(s_file,"%s %7s %d\n", "tgid_frpc", ":", fl->tgid_frpc);
-		seq_printf(s_file,"%s %3s %d\n", "is_secure_dev", ":", fl->is_secure_dev);
-		seq_printf(s_file,"%s %3s %d\n", "num_pers_hdrs", ":", fl->num_pers_hdrs);
-		seq_printf(s_file,"%s %2s %d\n", "num_cached_buf", ":", fl->num_cached_buf);
-		seq_printf(s_file,"%s %5s %d\n", "wake_enable", ":", fl->wake_enable);
-		seq_printf(s_file,"%s %2s %d\n",  "is_unsigned_pd", ":", fl->is_unsigned_pd);
-		seq_printf(s_file,"%s %7s %d\n",  "sessionid", ":", fl->sessionid);
-		seq_printf(s_file,"%s %9s %d\n", "pd_type", ":", fl->pd_type);
-		seq_printf(s_file,"%s %9s %d\n",  "profile", ":", fl->profile);
+		print_session_info(s_file, fl);
 
 		if(fl->cctx) {
 			seq_printf(s_file,"\n=============== Channel Context ===============\n");
@@ -3713,6 +3842,74 @@ bail:
 	return err;
 }
 
+/**
+ * fastrpc_alloc_perf_timeline_bufs() -  Allocates timeline buffs
+ * @fl: fastrpc user object.
+ * @pages: Pages to be packed for DSP.
+ * @pageslen: Number of pages.
+ * @timeline_num_events: Total number of timeline events.
+ * @user_version: Userspace version.
+ *
+ * Allocates timeline buffers and updates the pages to include
+ * the physical addresses and sizes of these buffers.
+ * Initalizes timeline object.
+ *
+ * Return: 0 on success, negative error code on failure.
+ */
+static int fastrpc_alloc_perf_timeline_bufs(struct fastrpc_user *fl,
+	struct fastrpc_phy_page *pages, u32 timeline_num_events,
+	u32 user_version, struct fastrpc_timeline **timeline)
+{
+	int err = 0;
+	u32 timeline_buf_event = GET_TIMELINE_BUF_LEN(timeline_num_events);
+	size_t size = GET_TIMELINE_BUF_SIZE(timeline_buf_event);
+	struct fastrpc_timeline_buffer *timeline_buf_hlos_k = NULL;
+	struct fastrpc_buf *timeline_buf_dsp_k = NULL,
+		*timeline_buf_dsp_u = NULL;
+
+	*timeline = kvzalloc(sizeof(struct fastrpc_timeline), GFP_KERNEL);
+	if (!(*timeline))
+		return -ENOMEM;
+
+	timeline_buf_hlos_k = kvzalloc(size, GFP_KERNEL);
+	if (!timeline_buf_hlos_k) {
+		err = -ENOMEM;
+		goto bail;
+	}
+	fastrpc_timeline_buffer_init(timeline_buf_hlos_k, timeline_buf_event);
+
+	err = fastrpc_smmu_buf_alloc(fl, size, USER_BUF, &timeline_buf_dsp_k);
+	if (err)
+		goto bail;
+	fastrpc_timeline_buffer_init(timeline_buf_dsp_k->virt, timeline_buf_event);
+
+	err = fastrpc_smmu_buf_alloc(fl, size, USER_BUF, &timeline_buf_dsp_u);
+	if (err)
+		goto bail;
+	fastrpc_timeline_buffer_init(timeline_buf_dsp_u->virt, timeline_buf_event);
+
+	fastrpc_timeline_init(*timeline, user_version, timeline_buf_hlos_k,
+		timeline_buf_dsp_k, timeline_buf_dsp_u);
+
+	pages[NUM_PAGES_WITH_PERF_TIMLINE_DSP_U_SHAREDBUF - 1].addr = timeline_buf_dsp_u->phys;
+	pages[NUM_PAGES_WITH_PERF_TIMLINE_DSP_U_SHAREDBUF - 1].size = timeline_buf_dsp_u->size;
+
+	pages[NUM_PAGES_WITH_PERF_TIMLINE_DSP_K_SHAREDBUF - 1].addr = timeline_buf_dsp_k->phys;
+	pages[NUM_PAGES_WITH_PERF_TIMLINE_DSP_K_SHAREDBUF - 1].size = timeline_buf_dsp_k->size;
+
+	return 0;
+bail:
+	if (timeline_buf_dsp_u)
+		fastrpc_buf_free(timeline_buf_dsp_u, false);
+	if (timeline_buf_dsp_k)
+		fastrpc_buf_free(timeline_buf_dsp_k, false);
+	kvfree(timeline_buf_hlos_k);
+	kvfree(*timeline);
+	*timeline = NULL;
+
+	return err;
+}
+
 static int get_unique_hlos_process_id(struct fastrpc_channel_ctx *cctx)
 {
 	int tgid_frpc = -1;
@@ -3871,18 +4068,128 @@ static void *fastrpc_get_and_copy_shell_file(
 	return file;
 }
 
+/**
+ * Log detailed session-related information to ring buffer
+ *
+ * Logs session metadata, channel context, and invoke, interrupted context
+ * information for a given user session to the ring buffer for debugging.
+ *
+ * @param[in] s_file        : Pointer to seq_file used for formatting output
+ * @param[in] fl            : Pointer to fastrpc user session
+ * @param[in] session_num   : Session number for identification
+ */
+static void fastrpc_log_session_info(struct seq_file *s_file,
+	struct fastrpc_user *fl, int session_num)
+{
+	struct fastrpc_invoke_ctx *ictx;
+
+	s_file->count = 0;
+	print_session_info(s_file, fl);
+	FASTRPC_LOG_INFO(fl->cctx->dev, fl->cctx, FASTRPC_LOG_RINGBUF,
+		"session_num : %d %.*s\n", session_num, s_file->count, s_file->buf);
+
+	if (fl->sctx) {
+		s_file->count = 0;
+		print_sctx_info(s_file, fl->sctx);
+		FASTRPC_LOG_INFO(fl->cctx->dev, fl->cctx, FASTRPC_LOG_RINGBUF,
+		"session_num : %d %.*s\n", session_num, s_file->count, s_file->buf);
+	}
+
+	spin_lock(&fl->lock);
+	list_for_each_entry(ictx, &fl->pending, node) {
+		s_file->count = 0;
+		print_ictx_info(s_file, ictx);
+		FASTRPC_LOG_INFO(fl->cctx->dev, fl->cctx, FASTRPC_LOG_RINGBUF,
+		"session_num : %d %.*s\n", session_num, s_file->count, s_file->buf);
+	}
+	list_for_each_entry(ictx, &fl->interrupted, node) {
+		s_file->count = 0;
+		print_ictx_info(s_file, ictx);
+		FASTRPC_LOG_INFO(fl->cctx->dev, fl->cctx, FASTRPC_LOG_RINGBUF,
+		"session_num : %d %.*s\n", session_num, s_file->count, s_file->buf);
+	}
+	spin_unlock(&fl->lock);
+}
+
+/**
+ * Collect and log information for all active sessions
+ *
+ * Iterates over all user sessions in the channel context and logs
+ * detailed session information to the ring buffer.
+ *
+ * @param[in] cctx : Pointer to channel context
+ *
+ * @return 0 on success, error code on failure
+ */
+static void fastrpc_get_sessions_info(struct fastrpc_channel_ctx *cctx)
+{
+	struct seq_file *s_file = NULL;
+	int err = 0, ret, session_num = 1;
+	struct fastrpc_user *fl, *n;
+	unsigned long irq_flags = 0;
+	struct list_head users_list;
+
+	INIT_LIST_HEAD(&users_list);
+	s_file = kzalloc(sizeof(*s_file), GFP_KERNEL);
+	if (!s_file) {
+		err = -ENOMEM;
+		goto bail;
+	}
+	s_file->buf = (char*)kzalloc(SESSION_BUF_SIZE, GFP_KERNEL);
+	if (!s_file->buf) {
+		err = -ENOMEM;
+		goto bail;
+	}
+	s_file->size = SESSION_BUF_SIZE;
+
+	print_ctx_info(s_file, cctx);
+	FASTRPC_LOG_INFO(cctx->dev, cctx, FASTRPC_LOG_RINGBUF,
+		"Channel information for dsp-type : %d %.*s\n",
+		cctx->domain->type, s_file->count, s_file->buf);
+
+	spin_lock_irqsave(&cctx->lock, irq_flags);
+	list_for_each_entry(fl, &cctx->users, user) {
+		ret = fastrpc_file_get(fl);
+		if (ret) {
+			dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
+				__func__, fl);
+			continue;
+		}
+		list_add_tail(&fl->rb_log_node, &users_list);
+	}
+	spin_unlock_irqrestore(&cctx->lock, irq_flags);
+
+	list_for_each_entry_safe(fl, n, &users_list, rb_log_node) {
+		fastrpc_log_session_info(s_file, fl,
+			session_num);
+		list_del(&fl->rb_log_node);
+		fastrpc_file_put(fl, false);
+		session_num++;
+	}
+
+bail:
+	if (err)
+		dev_err(cctx->dev, "%s : err %d Failed to push session information into ring buffer\n",
+				__func__, err);
+	if (s_file) {
+		kfree(s_file->buf);
+		kfree(s_file);
+	}
+}
+
 static int fastrpc_init_create_process(struct fastrpc_user *fl,
 					char __user *argp)
 {
 	struct fastrpc_init_create init;
 	struct fastrpc_invoke_args args[FASTRPC_CREATE_PROCESS_NARGS] = {0};
 	struct fastrpc_enhanced_invoke ioctl;
-	struct fastrpc_phy_page pages[NUM_PAGES_WITH_PRELOAD_BUF] = {0};
+	struct fastrpc_phy_page pages[NUM_PAGES_WITH_PERF_TIMLINE_DSP_K_SHAREDBUF] = {0};
 	struct fastrpc_map *configmap = NULL;
 	struct fastrpc_buf *imem = NULL;
 	struct fastrpc_pool_ctx *sctx = NULL;
+	struct fastrpc_timeline *timeline = NULL;
 	int memlen;
-	int err = 0;
+	int err = 0, timeline_err = 0;
 	int user_fd = fl->config.user_fd, user_size = fl->config.user_size;
 	void *file = NULL;
 	u32 *dsp_attributes = fl->cctx->dsp_attributes;
@@ -3967,6 +4274,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	sctx = fastrpc_session_alloc(fl, false, fl->pd_type);
 	if (!sctx) {
 		dev_warn_ratelimited(fl->cctx->dev, "No session available\n");
+		fastrpc_get_sessions_info(fl->cctx);
 		err = -EBUSY;
 		goto err_out;
 	}
@@ -4116,6 +4424,17 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 		dev_err(fl->cctx->dev, "Error %d: %s: Failed to allocate preload buffer\n",
 				err, __func__);
 
+	if (fl->timeline_init_args && fl->timeline_init_args->version) {
+		timeline_err = fastrpc_alloc_perf_timeline_bufs(fl, pages,
+				fl->timeline_init_args->num_events,
+				fl->timeline_init_args->version, &timeline);
+		if (timeline_err)
+			pr_err("%s: Failed to allocate timeline buffer(err 0x%x)\n",
+				__func__, timeline_err);
+		else
+			inbuf.pageslen = NUM_PAGES_WITH_PERF_TIMLINE_DSP_K_SHAREDBUF;
+	}
+
 	fl->init_mem = imem;
 	args[0].ptr = (u64)(uintptr_t)&inbuf;
 	args[0].length = sizeof(inbuf);
@@ -4154,6 +4473,12 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	if (err)
 		goto err_invoke;
 
+	timeline_err = fastrpc_update_timeline_version(timeline);
+	if (!timeline_err)
+		fl->fastrpc_timeline_obj = timeline;
+	else
+		kvfree(timeline);
+
 	if (fl->cctx->domain->type == FASTRPC_NSP) {
 		fastrpc_create_persistent_headers(fl);
 	}
@@ -4175,6 +4500,7 @@ err_invoke:
 	fl->init_mem = NULL;
 	spin_unlock(&fl->lock);
 	fastrpc_buf_free(imem, false);
+	kvfree(timeline);
 err_alloc:
 	if (fl->proc_init_sharedbuf) {
 		fastrpc_buf_free(fl->proc_init_sharedbuf, false);
@@ -4297,6 +4623,11 @@ void fastrpc_free_user(struct fastrpc_user *fl)
 		fl->hdr_bufs = NULL;
 	}
 
+	fastrpc_timeline_deinit(fl->fastrpc_timeline_obj);
+	kvfree(fl->fastrpc_timeline_obj);
+	fl->fastrpc_timeline_obj = NULL;
+	kfree(fl->timeline_init_args);
+	fl->timeline_init_args = NULL;
 	fastrpc_buf_list_free(fl, &fl->cached_bufs, true);
 
 	return;
@@ -5422,6 +5753,63 @@ static int fastrpc_set_dsp_recovery_mode (struct fastrpc_user *fl,
 	spin_lock(&fl->lock);
 	fl->dsp_recovery = recovery ? true : false;
 	spin_unlock(&fl->lock);
+	return 0;
+}
+
+/**
+ * fastrpc_reserved_field_check - Validates that all bytes in a reserved array are zero.
+ * @reserved_arr: Pointer to the memory block.
+ * @len: Number of elements in the array.
+ *
+ * Returns true if all bytes are zero, false otherwise.
+ */
+static bool fastrpc_reserved_field_check(void *reserved_arr, size_t len)
+{
+	return !memchr_inv(reserved_arr, 0, len);
+}
+
+static int fastrpc_set_timeline_info(struct fastrpc_user *fl,
+	struct fastrpc_timeline_arguments *info)
+{
+	struct fastrpc_timeline_arguments *t_args = NULL;
+
+	if (info->num_events > MAX_TIMELINE_EVENT_COUNT) {
+		pr_err("%s: failed for invalid num event %u\n",
+			__func__, info->num_events);
+		return -EINVAL;
+	}
+	if (!fastrpc_reserved_field_check(info->reserved,
+			sizeof(info->reserved))) {
+		pr_err("%s: reserved fields are expected to be 0\n",
+			__func__);
+		return -EINVAL;
+	}
+	if (!READ_ONCE(fl->timeline_init_args)) {
+		t_args = kzalloc(sizeof(struct fastrpc_timeline_arguments),
+					GFP_KERNEL);
+		if (!t_args)
+			return -ENOMEM;
+	}
+	spin_lock(&fl->lock);
+	if (!fl->timeline_init_args) {
+		fl->timeline_init_args = t_args;
+		fl->timeline_init_args->num_events = info->num_events;
+		fl->timeline_init_args->version = MIN(info->version,
+			TIMELINE_VERSION);
+		t_args = NULL;
+	}
+	spin_unlock(&fl->lock);
+	kfree(t_args);
+	return 0;
+}
+
+static int fastrpc_get_timeline_version(struct fastrpc_user *fl,
+	u32 *version)
+{
+	if (!fl->fastrpc_timeline_obj ||
+		!fl->fastrpc_timeline_obj->initialized)
+		return -ENODATA;
+	*version = fl->fastrpc_timeline_obj->version;
 	return 0;
 }
 
@@ -6667,7 +7055,8 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 	struct fastrpc_internal_proc_timeout rpc = {0};
 	struct fastrpc_ioctl_kernel_log klog = {0};
 	struct fastrpc_thread_exit exit_info = {0};
-	u32 multisession, size = 0;
+	struct fastrpc_timeline_arguments timeline_init_args = {0};
+	u32 multisession, size = 0, timeline_version = 0;
 	u64 *perf_kernel;
 	bool legacy_domains = true;
 	int err = 0, recovery = 0;
@@ -6779,6 +7168,21 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 			return -EFAULT;
 		err = fastrpc_request_thread_exit(fl, &exit_info);
 		break;
+	case FASTRPC_SET_TIMELINE_INFO:
+		if (copy_from_user(&timeline_init_args,
+			(void __user *)(uintptr_t)invoke.invparam,
+			sizeof(timeline_init_args)))
+			return -EFAULT;
+		err = fastrpc_set_timeline_info(fl, &timeline_init_args);
+		break;
+	case FASTRPC_GET_TIMELINE_VERSION:
+		err = fastrpc_get_timeline_version(fl, &timeline_version);
+		if (!err) {
+			if (copy_to_user((void __user *)(uintptr_t)invoke.invparam,
+				&timeline_version, sizeof(timeline_version)))
+				return -EFAULT;
+		}
+		break;
 	default:
 		err = -ENOTTY;
 		break;
@@ -6851,6 +7255,83 @@ static int fastrpc_get_info_from_kernel(struct fastrpc_ioctl_capability *cap,
 	kfree(dsp_attributes);
 done:
 	cap->capability = cctx->dsp_attributes[attribute_id];
+	return 0;
+}
+
+static inline int fastrpc_copy_timeline_events_to_user(uintptr_t *user_addr,
+	uintptr_t user_end_addr, size_t timeline_buf_size,
+	const struct fastrpc_timeline_event *timeline_event_list,
+	size_t timeline_buf_event_cnt, __u32 *buf_write_index)
+{
+	if (timeline_buf_size > (user_end_addr - *user_addr))
+		return -EOVERFLOW;
+	if (copy_to_user((void __user *)*user_addr, timeline_event_list, timeline_buf_size))
+		return -EFAULT;
+	*user_addr += timeline_buf_size;
+	*buf_write_index += timeline_buf_event_cnt;
+	return 0;
+}
+
+static int fastrpc_get_timeline_buffer(struct fastrpc_user *fl, char __user *argp)
+{
+	int err = 0;
+	size_t timeline_buf_size, timeline_buf_event_cnt, user_buf_size;
+	uintptr_t user_addr, user_end_addr;
+	struct fastrpc_ioctl_timeline_buf timeline_ioctl;
+	struct fastrpc_timeline *timeline = NULL;
+
+	err = copy_from_user(&timeline_ioctl, (void __user *)argp,
+		sizeof(timeline_ioctl));
+	if (err)
+		return -EFAULT;
+
+	if (!fastrpc_reserved_field_check(timeline_ioctl.reserved,
+		sizeof(timeline_ioctl.reserved))) {
+		pr_err("%s: reserved fields are expected to be 0\n", __func__);
+		return -EINVAL;
+	}
+
+	if (!fl->fastrpc_timeline_obj || timeline_ioctl.total_events_cnt == 0 ||
+		(timeline_ioctl.total_events_cnt > MAX_TIMELINE_EVENT_COUNT))
+		return -EINVAL;
+
+	user_buf_size = timeline_ioctl.total_events_cnt *
+		sizeof(struct fastrpc_timeline_event);
+	user_addr = (uintptr_t)timeline_ioctl.addr;
+	/* userspace buffer overflow validation */
+	if (user_addr > (UINTPTR_MAX - user_buf_size))
+		return -EFAULT;
+	/* validate user buffer address and size access */
+	if (!access_ok((void __user *)user_addr, user_buf_size))
+		return -EFAULT;
+	user_end_addr = user_addr + user_buf_size;
+	timeline = fl->fastrpc_timeline_obj;
+	timeline_buf_event_cnt = timeline->timeline_buf_hlos_k->event_list_length;
+	timeline_buf_size = timeline_buf_event_cnt * sizeof(struct fastrpc_timeline_event);
+
+	err = fastrpc_copy_timeline_events_to_user(&user_addr, user_end_addr,
+			timeline_buf_size, timeline->timeline_buf_hlos_k->timeline_event_list,
+			timeline_buf_event_cnt, &timeline_ioctl.buf_write_index);
+	if (err)
+		return err;
+
+	err = fastrpc_copy_timeline_events_to_user(&user_addr, user_end_addr,
+		timeline_buf_size, timeline->timeline_buf_dsp_k->timeline_event_list,
+		timeline_buf_event_cnt, &timeline_ioctl.buf_write_index);
+	if (err)
+		return err;
+
+	err = fastrpc_copy_timeline_events_to_user(&user_addr, user_end_addr,
+			timeline_buf_size, timeline->timeline_buf_dsp_u->timeline_event_list,
+			timeline_buf_event_cnt, &timeline_ioctl.buf_write_index);
+	if (err)
+		return err;
+
+	err = copy_to_user((struct fastrpc_ioctl_timeline_buf __user *)argp,
+		&timeline_ioctl, sizeof(struct fastrpc_ioctl_timeline_buf));
+	if (err)
+		return -EFAULT;
+
 	return 0;
 }
 
@@ -7111,6 +7592,9 @@ static int fastrpc_req_mmap(struct fastrpc_user *fl, char __user *argp)
 		if (req.flags == ADSP_MMAP_ADD_PAGES || req.flags == ADSP_MMAP_ADD_PAGES_TSTACK)
 			dev = buf->smmucb->dev;
 
+		/* Mark growheap-related stack memory to be included in coredump */
+		buf->flags = req.flags;
+
 		req_msg.pgid = fl->tgid_frpc;
 		req_msg.flags = req.flags;
 		req_msg.vaddr = req.vaddrin;
@@ -7198,6 +7682,10 @@ static int fastrpc_req_mmap(struct fastrpc_user *fl, char __user *argp)
 			err = -EALREADY;
 			goto err_invoke;
 		}
+
+		/* Mark growheap-related stack memory to be included in coredump */
+		map->flags = req.flags;
+
 		req_msg.pgid = fl->tgid_frpc;
 		req_msg.flags = req.flags;
 		req_msg.vaddr = req.vaddrin;
@@ -7472,11 +7960,15 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int cmd,
 	switch (cmd) {
 	case FASTRPC_IOCTL_INVOKE:
 		trace_fastrpc_msg("invoke: begin");
+		fastrpc_timeline_record(2, fl->tgid_app, fl->fastrpc_timeline_obj);
 		err = fastrpc_invoke(fl, argp);
+		fastrpc_timeline_record(42, fl->tgid_app, fl->fastrpc_timeline_obj);
 		trace_fastrpc_msg("invoke: end");
 		break;
 	case FASTRPC_IOCTL_MULTIMODE_INVOKE:
+		fastrpc_timeline_record(2, fl->tgid_app, fl->fastrpc_timeline_obj);
 		err = fastrpc_multimode_invoke(fl, argp);
+		fastrpc_timeline_record(42, fl->tgid_app, fl->fastrpc_timeline_obj);
 		break;
 	case FASTRPC_IOCTL_INIT_ATTACH:
 		err = fastrpc_init_attach(fl, ROOT_PD);
@@ -7517,6 +8009,9 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int cmd,
 		break;
 	case FASTRPC_IOCTL_GET_DSP_INFO:
 		err = fastrpc_get_dsp_info(fl, argp);
+		break;
+	case FASTRPC_IOCTL_GET_TIMELINE_BUFFER:
+		err = fastrpc_get_timeline_buffer(fl, argp);
 		break;
 	default:
 		err = -ENOTTY;
@@ -8349,6 +8844,37 @@ static inline void populate_dump_metadata(struct fastrpc_dump_info *entry,
 	entry->phys = addr;
 }
 
+static int fastrpc_get_mem_content(struct dma_buf *dbuf, void *dst, size_t size)
+{
+	struct iosys_map map = {0};
+	int ret = 0;
+
+	if (!dbuf || !dst || !size || (size > dbuf->size))
+		return -EINVAL;
+
+	ret = dma_buf_begin_cpu_access(dbuf, DMA_FROM_DEVICE);
+	if (ret)
+		return ret;
+
+	ret = dma_buf_vmap(dbuf, &map);
+	if (ret)
+		goto bail;
+
+	if (!map.vaddr) {
+		ret = -EFAULT;
+		goto bail;
+	}
+
+	memcpy(dst, map.vaddr, size);
+
+bail:
+	if(map.vaddr)
+		dma_buf_vunmap(dbuf, &map);
+
+	dma_buf_end_cpu_access(dbuf, DMA_FROM_DEVICE);
+	return ret;
+}
+
 void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 	struct list_head *active_users_list)
 {
@@ -8359,18 +8885,38 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 	u64 total_size = 0, offset = 0;
 	struct fastrpc_user *user, *n;
 	struct seq_file *s_file = NULL;
+	struct seq_buf gmsgbuf;
 	struct fastrpc_dump_info *dinfo;
 	struct fastrpc_buf *buf, *b;
+	struct fastrpc_map *map;
 
 	list_for_each_entry_safe(buf, b, &cctx->gmaps, node)
 		total_size += buf->size;
 
 	list_for_each_entry_safe(user, n, active_users_list, active_user_ssr) {
 		total_size += DBG_FS_SIZE;
-		if (user->init_mem && user->is_faulted)
+
+		if (!user->is_faulted)
+			continue;
+
+		if (user->init_mem)
 			total_size += user->init_mem->size;
+
+		if (user->dbglogbuf && user->dbglogbuf->virt)
+			total_size += user->dbglogbuf->size;
+
+		list_for_each_entry(buf, &user->mmaps, node) {
+			if (buf->flags == ADSP_MMAP_ADD_PAGES_TSTACK)
+				total_size += buf->size;
+		}
+
+		list_for_each_entry(map, &user->maps, node) {
+			if (map->flags == ADSP_MMAP_ADD_PAGES_TSTACK)
+				total_size += map->size;
+		}
 	}
 
+	total_size += RPMSG_LOG_SIZE;
 	total_size += NUM_DUMPED * sizeof(struct fastrpc_dump_info);
 	dump = vmalloc(total_size);
 	if (!dump) {
@@ -8395,9 +8941,29 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 			pos += buf->size;
 			iter += 1;
 			offset += buf->size;
+		} else {
+			pr_err("%s: Insufficient space for gmaps buf, aborting coredump\n", __func__);
+			err = -EFAULT;
+			goto bail;
 		}
 	}
 	scm_done = true;
+
+	if ((dump + total_size) - pos >= RPMSG_LOG_SIZE) {
+		seq_buf_init(&gmsgbuf, pos, RPMSG_LOG_SIZE);
+		print_rpmsg_glink_logs(&gmsgbuf, &cctx->gmsg_log);
+		if (seq_buf_has_overflowed(&gmsgbuf))
+			pr_warn("%s: RPMSG log buffer overflow, logs truncated\n", __func__);
+		populate_dump_metadata(&dinfo[iter], offset, RPMSG_LOG_SIZE, DEBUGFS, 0);
+		pos    += RPMSG_LOG_SIZE;
+		iter   += 1;
+		offset += RPMSG_LOG_SIZE;
+	} else {
+		pr_err("%s: Insufficient space for RPMSG logs, aborting coredump\n", __func__);
+		err = -EFAULT;
+		goto bail;
+	}
+
 	s_file = kzalloc(sizeof(*s_file), GFP_KERNEL);
 	if (!s_file) {
 		err = -ENOMEM;
@@ -8410,6 +8976,7 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 		if ((dump + total_size) - pos >= DBG_FS_SIZE)
 			s_file->buf = pos;
 		else {
+			pr_err("%s: Insufficient space for debugfs, aborting coredump\n", __func__);
 			err = -EFAULT;
 			goto bail;
 		}
@@ -8421,7 +8988,11 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 			iter += 1;
 			offset += DBG_FS_SIZE;
 		}
-		if (user->init_mem && user->is_faulted) {
+
+		if (!user->is_faulted)
+			continue;
+
+		if (user->init_mem) {
 			if ((dump + total_size) - pos >= user->init_mem->size) {
 				memcpy(pos, user->init_mem->virt, user->init_mem->size);
 				populate_dump_metadata(&dinfo[iter], offset, user->init_mem->size,
@@ -8430,8 +9001,58 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 				iter += 1;
 				offset += user->init_mem->size;
 			} else {
+				pr_err("%s: Insufficient space for init_mem, aborting coredump\n", __func__);
 				err = -EFAULT;
 				goto bail;
+			}
+		}
+		if (user->dbglogbuf && user->dbglogbuf->virt && user->dbglogbuf->size > 0) {
+			if ((dump + total_size) - pos >= user->dbglogbuf->size) {
+				memcpy(pos, user->dbglogbuf->virt, user->dbglogbuf->size);
+				populate_dump_metadata(&dinfo[iter], offset, user->dbglogbuf->size,
+					DEBUGFS, user->dbglogbuf->phys);
+				pos += user->dbglogbuf->size;
+				iter += 1;
+				offset += user->dbglogbuf->size;
+			} else {
+				pr_err("%s: Insufficient space for dbglogbuf, aborting coredump\n", __func__);
+				err = -EFAULT;
+				goto bail;
+			}
+		}
+
+		list_for_each_entry(buf, &user->mmaps, node) {
+			if (buf->flags == ADSP_MMAP_ADD_PAGES_TSTACK) {
+				if ((dump + total_size) - pos >= buf->size) {
+					memcpy(pos, buf->virt, buf->size);
+					populate_dump_metadata(&dinfo[iter], offset, buf->size,
+						TSTACK_MEM, buf->phys);
+					pos += buf->size;
+					iter++;
+					offset += buf->size;
+				} else {
+					err = -EFAULT;
+					goto bail;
+				}
+			}
+		}
+
+		list_for_each_entry(map, &user->maps, node) {
+			if (map->flags == ADSP_MMAP_ADD_PAGES_TSTACK) {
+				if ((dump + total_size) - pos >= map->size) {
+					err = fastrpc_get_mem_content(map->buf, pos, map->size);
+					if (err)
+						goto bail;
+
+					populate_dump_metadata(&dinfo[iter], offset, map->size,
+						TSTACK_MEM, map->phys);
+					pos += map->size;
+					iter++;
+					offset += map->size;
+				} else {
+					err = -EFAULT;
+					goto bail;
+				}
 			}
 		}
 	}
@@ -8916,6 +9537,8 @@ void fastrpc_register_wakeup_source(struct device *dev,
 static void fastrpc_notify_user_ctx(struct fastrpc_invoke_ctx *ctx, int retval,
 		u32 rsp_flags, u32 early_wake_time)
 {
+	u32 tgid_app = ctx->fl->tgid_app;
+
 	if (ctx->cctx) {
 		if (!atomic_read(&ctx->cctx->teardown))
 			fastrpc_pm_awake(ctx->fl);
@@ -8930,16 +9553,19 @@ static void fastrpc_notify_user_ctx(struct fastrpc_invoke_ctx *ctx, int retval,
 		/* normal and complete response with return value */
 		ctx->is_work_done = true;
 		trace_fastrpc_msg("wakeup_task: begin");
+		fastrpc_timeline_record(38, tgid_app, ctx->fl->fastrpc_timeline_obj);
 		complete(&ctx->work);
 		trace_fastrpc_msg("wakeup_task: end");
 		break;
 	case USER_EARLY_SIGNAL:
+		fastrpc_timeline_record(52, tgid_app, ctx->fl->fastrpc_timeline_obj);
 		/* user hint of approximate time of completion */
 		ctx->early_wake_time = early_wake_time;
 		fallthrough;
 	case EARLY_RESPONSE:
 		/* rpc framework early response with return value */
 		trace_fastrpc_msg("wakeup_task: begin");
+		fastrpc_timeline_record(22, tgid_app, ctx->fl->fastrpc_timeline_obj);
 		complete(&ctx->work);
 		trace_fastrpc_msg("wakeup_task: end");
 		break;
@@ -9115,7 +9741,8 @@ static int fastrpc_handle_legacy_rsp(struct fastrpc_channel_ctx *cctx,
 			spin_unlock_irqrestore(&cctx->lock, flags);
 			return -EINVAL;
 	}
-
+	fastrpc_timeline_record(21, ctx->fl->tgid_app,
+		ctx->fl->fastrpc_timeline_obj);
 	fastrpc_notify_user_ctx(ctx, rsp.retval, rsp_flags, early_wake_time);
 
 	if (is_glink_wakeup && ctx->fl)

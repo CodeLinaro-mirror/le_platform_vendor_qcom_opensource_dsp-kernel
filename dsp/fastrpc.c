@@ -4290,7 +4290,10 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	sctx = fastrpc_session_alloc(fl, false, fl->pd_type);
 	if (!sctx) {
 		dev_warn_ratelimited(fl->cctx->dev, "No session available\n");
-		fastrpc_get_sessions_info(fl->cctx);
+		if (!atomic_cmpxchg(&fl->cctx->sessions_info_active, 0, 1)) {
+			fastrpc_get_sessions_info(fl->cctx);
+			atomic_set(&fl->cctx->sessions_info_active, 0);
+		}
 		err = -EBUSY;
 		goto err_out;
 	}

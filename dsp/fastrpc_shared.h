@@ -1389,6 +1389,8 @@ struct fastrpc_channel_ctx {
 #endif
 	/* NPU application priority table */
 	struct npu_app_prio_table *npu_app_prio;
+	/* 1 if fastrpc_get_sessions_info is running */
+	atomic_t sessions_info_active;
 };
 
 struct fastrpc_ssr_handler {

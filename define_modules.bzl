@@ -9,6 +9,7 @@ load(
     "ddk_module",
     "kernel_module",
     "kernel_modules_install",
+    "kernel_unstripped_modules_archive",
 )
 
 def define_modules(target, variant, build_loader):
@@ -58,13 +59,13 @@ def define_modules(target, variant, build_loader):
             "dsp/fastrpc_sysfs.c",
             "dsp/fastrpc_timeline.c",
             "dsp/fastrpc_timeline_shared.h",
-            "dsp/fastrpc_timeline.h"
+            "dsp/fastrpc_timeline.h",
         ],
         local_defines = ["DSP_TRACE_INCLUDE_PATH={}".format(trace_include_path)],
         out = "frpc-adsprpc.ko",
         hdrs = [
             "include/uapi/misc/fastrpc.h",
-            "include/linux/fastrpc.h"
+            "include/linux/fastrpc.h",
         ],
         includes = [
             "include/linux",
@@ -131,7 +132,7 @@ def define_vm_modules(target, variant):
             "dsp/fastrpc_sysfs.c",
             "dsp/fastrpc_timeline.c",
             "dsp/fastrpc_timeline_shared.h",
-            "dsp/fastrpc_timeline.h"
+            "dsp/fastrpc_timeline.h",
         ],
         local_defines = [
             "DSP_TRACE_INCLUDE_PATH={}".format(trace_include_path),
@@ -140,7 +141,7 @@ def define_vm_modules(target, variant):
         out = "frpc-trusted-adsprpc.ko",
         hdrs = [
             "include/uapi/misc/fastrpc.h",
-            "include/linux/fastrpc.h"
+            "include/linux/fastrpc.h",
         ],
         includes = [
             "include/linux",
@@ -148,9 +149,20 @@ def define_vm_modules(target, variant):
         ],
     )
 
+    kernel_unstripped_modules_archive(
+        name = "{}_fastrpc_unstripped_modules_tar".format(kernel_build_variant),
+        kernel_build = kernel_build,
+        kernel_modules = [":{}_frpc-trusted-adsprpc".format(kernel_build_variant)],
+    )
+
+    vm_data = [
+        ":{}_frpc-trusted-adsprpc".format(kernel_build_variant),
+        ":{}_fastrpc_unstripped_modules_tar".format(kernel_build_variant),
+    ]
+
     pkg_files(
         name = kernel_build_variant + "_dist_files",
-        srcs = [":{}_frpc-trusted-adsprpc".format(kernel_build_variant)],
+        srcs = vm_data,
         visibility = ["//visibility:private"],
         strip_prefix = strip_prefix.files_only(),
     )

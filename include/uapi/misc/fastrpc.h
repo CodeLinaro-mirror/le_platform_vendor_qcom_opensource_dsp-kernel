@@ -34,6 +34,9 @@
 /* Reserved fields in timeline buffer ioctl structs */
 #define FASTRPC_IOCTL_TIMELINE_BUF_RSVD 8
 
+/* Version constants for struct npu_work_info */
+#define NPU_WORKINFO_VERSION   0
+
 /**
  * enum fastrpc_map_flags - control flags for mapping memory on DSP user process
  * @FASTRPC_MAP_STATIC: Map memory pages with RW- permission and CACHE WRITEBACK.
@@ -125,6 +128,37 @@ enum fastrpc_npu_priority_workinfo_op {
 	FASTRPC_NPU_OP_WORKINFO   = 1,
 };
 
+/* Event type for FASTRPC_INVOKE_NPU_WORKINFO */
+enum npu_work_event {
+	WORK_REQUESTED = 0,
+	WORK_STARTED   = 1,
+	WORK_ENDED     = 2,
+};
+
+/*
+ * Reason code carried in npu_work_info.reason.
+ *
+ * The AIDL interface (ISchedulingCallback) exposes onWorkStarted(WorkInfo,
+ * StartReason) and onWorkEnded(WorkInfo, EndReason), requiring the HAL to
+ * know the specific reason for each event.  Without this field the HAL must
+ * hardcode EndReason::COMPLETED for every WORK_ENDED event, silently
+ * mislabelling cancelled or preempted work and preventing clients from
+ * triggering correct rescheduling logic.  The field occupies the four bytes
+ * of implicit compiler padding between the version field (offset 64) and the
+ * reserved array (offset 72), leaving the struct layout and total size
+ * (192 bytes) unchanged.
+ *
+ * For WORK_REQUESTED: always NPU_WORK_REASON_NONE.
+ * For WORK_STARTED:   NPU_WORK_REASON_START_INITIAL.
+ * For WORK_ENDED:     NPU_WORK_REASON_END_COMPLETED or NPU_WORK_REASON_END_CANCELLED.
+ */
+enum npu_work_reason {
+	NPU_WORK_REASON_NONE          = 0, /* WORK_REQUESTED: reason not applicable */
+	NPU_WORK_REASON_START_INITIAL = 1, /* WORK_STARTED: first execution, no prior context */
+	NPU_WORK_REASON_END_COMPLETED = 2, /* WORK_ENDED: all submitted work completed */
+	NPU_WORK_REASON_END_CANCELLED = 3, /* WORK_ENDED: preempted or cancelled by system */
+};
+
 struct fastrpc_invoke_args {
 	__u64 ptr;
 	__u64 length;
@@ -176,64 +210,82 @@ struct fastrpc_npu_priority {
 };
 
 /*
- * NPU workinfo structure added for compilation.
- * This will be implemented in a separate change.
- * The ioctl is a combined ioctl for priority sending and workinfo notification
- * retrieval to ensure strict ordering of priority updates and work events.
+ * NPU Work Information
+ * Corresponds to android.hardware.npu.WorkInfo
  */
 struct npu_work_info {
-	/* CLOCK_MONOTONIC ms at event time */
+	/* CLOCK_MONOTONIC timestamp in milliseconds at the time of the event */
 	__u64  timestamp_ms;
 
-	/* userspace pointer to group ID string */
+	/*
+	 * Userspace pointer to group ID UUID bytes.  The HAL pre-allocates an
+	 * output buffer and passes its address here; the kernel copies the UUID
+	 * bytes via copy_to_user() and patches this field to carry the userspace
+	 * VA on return.  Zero if no group ID is associated with this work item.
+	 */
 	__u64 group_id;
 
-	/* userspace pointer to feature ID string */
+	/*
+	 * Userspace pointer to the debug feature ID string.  Same delivery
+	 * mechanism as group_id.  Zero if no debug feature ID is set.
+	 */
 	__u64 debug_feature_id;
 
-	/* enum npu_work_event */
+	/* enum npu_work_event: WORK_REQUESTED, WORK_STARTED, or WORK_ENDED */
 	__u32 event;
 
-	/* monotonically increasing work id */
+	/* Monotonically increasing work identifier assigned by the kernel */
 	__s32  id;
 
-	/* UID of requesting app */
+	/* UID of the application that submitted this work item */
 	__s32  uid;
 
-	/* PID for debugging */
+	/* PID of the submitting thread, for debugging */
 	__s32  debug_pid;
 
-	/* original UID before attribution */
+	/* Original UID before any UID attribution was applied */
 	__s32  original_uid;
 
-	/* DSP domain; maps to WorkInfo.deviceNumber */
+	/* DSP domain identifier; maps to WorkInfo.deviceNumber in the AIDL layer */
 	__s32  domain;
 
-	/* job-level priority */
+	/* Job-level scheduling priority assigned by the submitter */
 	__s32  job_priority;
 
-	/* uid + job priority */
+	/*
+	 * Effective scheduling priority combining uid-level and job-level
+	 * priority to determine ordering relative to other clients.
+	 */
 	__s32  effective_priority;
 
-	/* length of group_id string; 0 if not set */
+	/* Length in bytes of the group_id UUID; 0 if group_id is not set */
 	__u32 group_id_len;
 
-	/* length of debug_feature_id string; 0 if not set */
+	/* Length in bytes of the debug_feature_id string; 0 if not set */
 	__u32 debug_feature_id_len;
 
-	/* struct version; set to 0 for now */
+	/* Struct version; set to NPU_WORKINFO_VERSION */
 	__u32 version;
 
-	/* reserved for future use */
+	/*
+	 * Reason for this event; see enum npu_work_reason.
+	 * NPU_WORK_REASON_NONE for WORK_REQUESTED,
+	 * NPU_WORK_REASON_START_* for WORK_STARTED,
+	 * NPU_WORK_REASON_END_* for WORK_ENDED.
+	 */
+	__u32 reason;
+
+	/* Reserved for future use; total struct size = 192 bytes */
 	__u64 reserved[15];
 };
 
 /* Combined payload for FASTRPC_IOCTL_NPU_PRIORITY_WORKINFO */
 struct fastrpc_ioctl_npu_priority_workinfo {
-	__u32 op;
+	__u32 op;	/* enum fastrpc_npu_priority_workinfo_op */
+	__u32 rsvd; /* padding for alignment */
 	union {
-		struct fastrpc_npu_priority prio;     /* op == FASTRPC_NPU_OP_PRIORITY: input */
-		struct npu_work_info workinfo;        /* op == FASTRPC_NPU_OP_WORKINFO: output */
+		struct fastrpc_npu_priority prio;
+		struct npu_work_info workinfo;
 	};
 	__u32 reserved[16];
 };
@@ -255,6 +307,13 @@ enum fastrpc_multimode_invoke_type {
 	FASTRPC_INVOKE_THREAD_EXIT = 14,
 	FASTRPC_SET_TIMELINE_INFO = 15,
 	FASTRPC_GET_TIMELINE_VERSION = 16,
+	FASTRPC_INVOKE_REMOTE_WORK    = 17,
+};
+
+/* Status types for FASTRPC_INVOKE_REMOTE_WORK */
+enum fastrpc_remote_work_status {
+	FASTRPC_REMOTE_WORK_STATUS_START  = 1,
+	FASTRPC_REMOTE_WORK_STATUS_END    = 2,
 };
 
 struct fastrpc_init_create {
@@ -428,6 +487,30 @@ enum fastrpc_thread_type {
 struct fastrpc_thread_exit {
 	/* Thread type that is exiting (logger, worker, etc.) */
 	__u32 thread_type;
+};
+
+/* Payload for FASTRPC_INVOKE_REMOTE_WORK */
+struct fastrpc_ioctl_remote_work {
+	/* FastRPC or DSPQueue handle */
+	__u64 handle;
+	/* Job priority (START only) */
+	__u32 priority;
+	/* Application or process ID */
+	__u32 appid;
+	/* remote_job_type */
+	__u32 type;
+	/* remote_job_status_type START or END */
+	__u32 status;
+	/* Pointer to inference group_id string */
+	__u64 group_id;
+	/* Length of group_id string */
+	__u32 group_id_len;
+	/* Userspace ptr to feature_id str */
+	__u64 feature_id;
+	/* Length of feature_id string */
+	__u32 feature_id_len;
+	/* reserved for future use */
+	__u32 reserved[8];
 };
 
 enum fastrpc_control_type {

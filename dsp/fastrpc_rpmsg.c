@@ -384,6 +384,12 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	init_completion(&data->ssr_complete);
 	init_completion(&data->rpmsg_remove_start);
 	init_waitqueue_head(&data->ssr_wait_queue);
+
+	/* Initialise the NPU workinfo semaphore for all domain types so that
+	 * fastrpc_rpmsg_remove() can call up() unconditionally without risking
+	 * undefined behaviour on non-NSP channels.
+	 */
+	sema_init(&data->npu_workinfo_sem, 0);
 #if FRPC_RING_BUFFER_ENABLED
 	init_waitqueue_head(&data->log.wq);
 #endif
@@ -472,6 +478,7 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	struct fastrpc_domain *domain = cctx->domain;
 	struct fastrpc_user *user, *n;
 	struct npu_app_prio_table *prio_tbl;
+	struct npu_workinfo_node *node, *next;
 	unsigned long flags;
 	int i = 0, err;
 	struct list_head active_users_list;
@@ -485,6 +492,10 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	domain->status = DSP_STATUS_DOWN;
 	spin_unlock_irqrestore(&cctx->lock, flags);
 
+	/* Unblock any thread sleeping in fastrpc_npu_workinfo_drain_queue()
+	 * so it sees teardown=1 and returns -EPIPE.
+	 */
+	up(&cctx->npu_workinfo_sem);
 	/* Notify userspace about domain DOWN event */
 	fastrpc_sysfs_notify_domain_event();
 
@@ -561,8 +572,8 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	 * channel to avoid any UAF later.
 	 */
 	list_for_each_entry(user, &cctx->users, user) {
- 		fastrpc_free_user(user);
- 	}
+		fastrpc_free_user(user);
+	}
 
 	mutex_lock(&cctx->wake_mutex);
 	if (cctx->wake_source) {
@@ -593,6 +604,27 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	if (prio_tbl) {
 		kfree(prio_tbl->entries);
 		kfree(prio_tbl);
+	}
+
+	/* Drain and destroy NPU workinfo notification queue */
+
+	/* Detach the entire queue under cctx->lock so no producer
+	 * can enqueue while we are draining.
+	 */
+	spin_lock_irqsave(&cctx->lock, flags);
+	node = cctx->npu_workinfo_head;
+	cctx->npu_workinfo_head = NULL;
+	cctx->npu_workinfo_tail = NULL;
+	cctx->npu_workinfo_queue_len = 0;
+	spin_unlock_irqrestore(&cctx->lock, flags);
+
+	/* Free every remaining node and its dynamically allocated fields. */
+	while (node) {
+		next = node->next;
+		kfree((void *)(uintptr_t)node->info.group_id);
+		kfree((void *)(uintptr_t)node->info.debug_feature_id);
+		kfree(node);
+		node = next;
 	}
 
 	of_platform_depopulate(&rpdev->dev);

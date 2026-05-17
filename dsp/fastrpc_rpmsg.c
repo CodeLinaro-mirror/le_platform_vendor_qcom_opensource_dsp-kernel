@@ -369,6 +369,9 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	err = of_property_read_u32(rdev->of_node, "qcom,rootheap-buffer-count",
 			&data->rootheap_buf_count);
 
+	/* sys_unsigned priority tier config — presence of property enables 12TG/3PG */
+	data->sys_unsigned_tg_enable =
+		of_property_read_bool(rdev->of_node, "qcom,sys-unsigned-tg-enable");
 	kref_init(&data->refcount);
 	dev_set_drvdata(&rpdev->dev, data);
 	rdev->dma_mask = &data->dma_mask;

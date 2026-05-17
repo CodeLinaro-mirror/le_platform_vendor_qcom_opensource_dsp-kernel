@@ -682,7 +682,22 @@ enum fastrpc_process_method_ids {
 	FASTRPC_RMID_INIT_PROCESS_DUMP  = 13,
 	FASTRPC_RMID_KCOMM_REMOTE_CALL  = 14,
 	FASTRPC_RMID_INIT_ATTACH2       = 16,
+	FASTRPC_RMID_INIT_KERNEL_DISPATCH = 17,
 	FASTRPC_RMID_INIT_MAX,
+};
+
+/* Command registry for FASTRPC_RMID_INIT_KERNEL_DISPATCH (RMID 17)
+ * Add new commands here — no IDL change required.
+ */
+enum fastrpc_kcmd {
+	FASTRPC_PRIO_GROUP_CONFIG = 1,
+};
+
+/* Payload for FASTRPC_PRIO_GROUP_CONFIG.
+ * 1 = sys_unsigned tier enabled (12TG/3PG); 0 = default (12TG/2PG)
+ */
+struct fastrpc_kcmd_prio_group_config {
+	u32 sys_unsigned_tg_enable;
 };
 
 /*
@@ -1419,6 +1434,8 @@ struct fastrpc_channel_ctx {
 	struct npu_app_prio_table *npu_app_prio;
 	/* 1 if fastrpc_get_sessions_info is running */
 	atomic_t sessions_info_active;
+	/* Flag to indicate if sys_unsigned tier is enabled */
+	bool sys_unsigned_tg_enable;
 };
 
 struct fastrpc_ssr_handler {
@@ -1810,6 +1827,8 @@ void fastrpc_notify_users(struct fastrpc_user *user);
 
 /* Create default user object for remote channel */
 int fastrpc_channel_default_user_create(struct fastrpc_channel_ctx *cctx);
+
+int fastrpc_send_sys_unsigned_prio_config(struct fastrpc_channel_ctx *cctx);
 
 /* Remove default user object for remote channel */
 int fastrpc_channel_default_user_delete(struct fastrpc_channel_ctx *cctx);

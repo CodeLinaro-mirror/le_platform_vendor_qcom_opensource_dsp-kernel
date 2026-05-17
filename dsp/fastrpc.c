@@ -5119,6 +5119,73 @@ int fastrpc_channel_default_user_create(struct fastrpc_channel_ctx *cctx)
 	return fastrpc_user_obj_create(NULL, cctx);
 }
 
+/*
+ * fastrpc_send_kernel_dispatch() - Send kernel_dispatch cmd to DSP.
+ * Returns 0 or -errno.
+ */
+static int fastrpc_send_kernel_dispatch(
+	struct fastrpc_user *fl, u32 cmd_id,
+	const void *payload_in, size_t payload_in_size,
+	void *payload_out, size_t payload_out_size)
+{
+	struct fastrpc_invoke_args args[3] = { 0 };
+	struct fastrpc_enhanced_invoke ioctl = { 0 };
+	struct fastrpc_kcmd_req {
+		int pgid;
+		u32 cmd_id;
+		u32 payload_in_len;
+		u32 payload_out_len;
+	} inargs = { 0 };
+	int err;
+
+	inargs.pgid = fl->tgid_frpc;
+	inargs.cmd_id = cmd_id;
+	inargs.payload_in_len = (u32)payload_in_size;
+	inargs.payload_out_len = (u32)payload_out_size;
+
+	args[0].ptr = (u64)(uintptr_t)&inargs;
+	args[0].length = sizeof(inargs);
+	args[0].fd = -1;
+
+	args[1].ptr = (u64)(uintptr_t)payload_in;
+	args[1].length = payload_in_size;
+	args[1].fd = -1;
+
+	args[2].ptr = (u64)(uintptr_t)payload_out;
+	args[2].length = payload_out_size;
+	args[2].fd = -1;
+
+	ioctl.inv.handle = FASTRPC_INIT_HANDLE;
+	ioctl.inv.sc = FASTRPC_SCALARS(
+		FASTRPC_RMID_INIT_KERNEL_DISPATCH, 2, 1);
+	ioctl.inv.args = (__u64)args;
+
+	err = fastrpc_internal_invoke(fl, KERNEL_MSG_WITH_ZERO_PID,
+				&ioctl);
+	if (err)
+		dev_err(fl->cctx->dev, "%s: kernel dispatch failed, cmd %u err %d\n",
+			__func__, cmd_id, err);
+	return err;
+}
+
+
+int fastrpc_send_sys_unsigned_prio_config(struct fastrpc_channel_ctx *cctx)
+{
+	struct fastrpc_user *fl = cctx->kcomm_user.obj;
+	struct fastrpc_kcmd_prio_group_config req = {
+		.sys_unsigned_tg_enable = cctx->sys_unsigned_tg_enable ? 1 : 0,
+	};
+	int err;
+
+	if(!fl)
+		return 0;
+
+	err = fastrpc_send_kernel_dispatch(fl, FASTRPC_PRIO_GROUP_CONFIG,
+					   &req, sizeof(req), NULL, 0);
+	return err;
+}
+
+
 static int fastrpc_dmabuf_alloc(struct fastrpc_user *fl, char __user *argp)
 {
 	struct fastrpc_alloc_dma_buf bp;
@@ -7891,6 +7958,10 @@ static int fastrpc_get_info_from_kernel(struct fastrpc_ioctl_capability *cap,
 		kfree(dsp_attributes);
 		return err;
 	}
+
+	err = fastrpc_send_sys_unsigned_prio_config(cctx);
+	if(err)
+		dev_warn(cctx->dev, "Failed to send sys unsigned prio config err: %d\n", err);
 
 	spin_lock_irqsave(&cctx->lock, flags);
 	memcpy(cctx->dsp_attributes, dsp_attributes, FASTRPC_MAX_DSP_ATTRIBUTES_LEN);

@@ -51,6 +51,8 @@ def define_modules(target, variant, build_loader):
         srcs = [
             "dsp/fastrpc.c",
             "dsp/fastrpc_rpmsg.c",
+            "dsp/fastrpc_scheduler.c",
+            "dsp/fastrpc_scheduler.h",
             "dsp/fastrpc_shared.h",
             "dsp/fastrpc_trace.h",
             "dsp/fastrpc_sysfs.c",
@@ -122,6 +124,7 @@ def define_vm_modules(target, variant):
         deps = deps,
         srcs = [
             "dsp/fastrpc.c",
+            "dsp/fastrpc_scheduler.h",
             "dsp/fastrpc_socket.c",
             "dsp/fastrpc_shared.h",
             "dsp/fastrpc_trace.h",

@@ -14,6 +14,7 @@
 #include "../include/uapi/misc/fastrpc.h"
 #include <linux/of_reserved_mem.h>
 #include "fastrpc_shared.h"
+#include "fastrpc_scheduler.h"
 #include <linux/soc/qcom/pdr.h>
 #include <linux/delay.h>
 #include <linux/remoteproc.h>
@@ -393,6 +394,9 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 #if FRPC_RING_BUFFER_ENABLED
 	init_waitqueue_head(&data->log.wq);
 #endif
+	err = fastrpc_scheduler_init(&data->scheduler);
+	if (err)
+		goto free_data;
 	data->domain_id = domain->id;
 	data->max_sess_per_proc = FASTRPC_MAX_SESSIONS_PER_PROCESS;
 	data->rpdev = rpdev;
@@ -457,6 +461,7 @@ fdev_error:
 populate_error:
 	if (data->fdevice)
 		misc_deregister(&data->fdevice->miscdev);
+	fastrpc_scheduler_deinit(&data->scheduler);
 
 free_data:
 	kvfree(data);
@@ -491,6 +496,21 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	atomic_set(&cctx->teardown, 1);
 	domain->status = DSP_STATUS_DOWN;
 	spin_unlock_irqrestore(&cctx->lock, flags);
+
+	/*
+	 * Unblock any ioctl threads blocked in fastrpc_work_add() waiting
+	 * for scheduler admission.  Those threads hold invoke_cnt, so
+	 * without this the invoke_cnt wait below would deadlock: the ioctl
+	 * thread waits for the completion that only the scheduler kthread
+	 * signals, but the kthread is stopped here.
+	 * abort_all() runs after teardown=1 so that the IOCTL gate rejects
+	 * new work before the kthread stops; any in-flight work_add that
+	 * passed the gate is caught by abort_all()'s incoming_list scan
+	 * (protected by sched->lock, which serializes with work_add's enqueue).
+	 * fastrpc_work_add() also checks sched->stop under sched->lock as a
+	 * defense-in-depth for the narrow race between the gate check and enqueue.
+	 */
+	fastrpc_scheduler_abort_all(&cctx->scheduler);
 
 	/* Unblock any thread sleeping in fastrpc_npu_workinfo_drain_queue()
 	 * so it sees teardown=1 and returns -EPIPE.
@@ -574,6 +594,12 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	list_for_each_entry(user, &cctx->users, user) {
 		fastrpc_free_user(user);
 	}
+
+	/*
+	 * Stop the scheduler kthread eagerly here, before the channel
+	 * context reference is dropped.
+	 */
+	fastrpc_scheduler_deinit(&cctx->scheduler);
 
 	mutex_lock(&cctx->wake_mutex);
 	if (cctx->wake_source) {

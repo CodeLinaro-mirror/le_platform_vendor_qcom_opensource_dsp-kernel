@@ -32,6 +32,7 @@
 #include <linux/mem-buf.h>
 #include <soc/qcom/secure_buffer.h>
 #include "fastrpc_shared.h"
+#include "fastrpc_scheduler.h"
 #include <linux/platform_device.h>
 #include <linux/types.h>
 #if FRPC_RING_BUFFER_ENABLED
@@ -48,12 +49,6 @@
  * added to the table..
  */
 #define DOMAINS_TABLE_SIZE 8
-
-/* Maximum length in bytes for group_id and feature_id strings in a remote
- * work event. Enforced before strndup_user() to prevent unbounded kernel
- * allocations from userspace-supplied lengths.
- */
-#define FASTRPC_REMOTE_WORK_MAX_STR_LEN 256
 
 /* Struct to hold globally used variables */
 struct fastrpc_common {
@@ -868,7 +863,6 @@ static void fastrpc_channel_ctx_free(struct kref *ref)
 {
 	struct fastrpc_channel_ctx *cctx;
 	int i, j;
-	struct npu_workinfo_node *node, *next;
 
 	cctx = container_of(ref, struct fastrpc_channel_ctx, refcount);
 	fastrpc_channel_default_user_delete(cctx);
@@ -886,16 +880,7 @@ static void fastrpc_channel_ctx_free(struct kref *ref)
 		cctx->npu_app_prio = NULL;
 	}
 
-	/* Drain any remaining NPU workinfo nodes. */
 
-	node = cctx->npu_workinfo_head;
-	while (node) {
-		next = node->next;
-		kfree((void *)(uintptr_t)node->info.group_id);
-		kfree((void *)(uintptr_t)node->info.debug_feature_id);
-		kfree(node);
-		node = next;
-	}
 
 	for (i = 0; i < FASTRPC_MAX_SESSIONS; i++)
 		for (j = 0; j < cctx->session[i].smmucount; j++)
@@ -2683,7 +2668,7 @@ static int fastrpc_internal_invoke(struct fastrpc_user *fl,  u32 kernel,
 	u64 *perf_counter = NULL;
 	struct timespec64 invoket = {0};
 	struct device *dev = NULL;
-	u32 priority = invoke->priority;
+	u32 priority = invoke->priority, user_appid = invoke->appid;
 
 	if (atomic_read(&fl->cctx->teardown))
 		return -EPIPE;
@@ -2745,6 +2730,24 @@ static int fastrpc_internal_invoke(struct fastrpc_user *fl,  u32 kernel,
 	PERF_END);
 	fastrpc_timeline_record(6, fl->tgid_app, fl->fastrpc_timeline_obj);
 	trace_fastrpc_msg("get_args: end");
+
+	/*
+	 * For untrusted processes (opened by DSP HAL on behalf of another
+	 * process), only permit invocations of dynamic handles that have an
+	 * active admitted job in the scheduler executing list.  Static handles
+	 * (<= FASTRPC_MAX_STATIC_HANDLE) and kernel-initiated calls are exempt.
+	 */
+	if (!kernel && user_appid && fl->untrusted_process &&
+		handle > FASTRPC_MAX_STATIC_HANDLE) {
+		if (!fastrpc_scheduler_handle_is_executing(
+				&fl->cctx->scheduler, fl, (u64)handle)) {
+			dev_err(dev, "%s: untrusted process %d invoking handle 0x%x without active executing work",
+				__func__, fl->tgid_frpc, handle);
+			err = -EPERM;
+			goto bail;
+		}
+	}
+
 	/* make sure that all CPU memory writes are seen by DSP */
 	dma_wmb();
 	/* Send invoke buffer to remote dsp */
@@ -4621,6 +4624,9 @@ void fastrpc_free_user(struct fastrpc_user *fl)
 {
 	struct fastrpc_map *map = NULL, *m = NULL;
 
+	/* Abort all scheduler jobs owned by this user */
+	fastrpc_scheduler_user_cleanup(fl);
+
 	fastrpc_context_list_free(fl);
 
 	if (fl->init_mem) {
@@ -4991,6 +4997,7 @@ static int fastrpc_user_obj_create(struct file *filp,
 	INIT_LIST_HEAD(&fl->mmaps);
 	INIT_LIST_HEAD(&fl->user);
 	INIT_LIST_HEAD(&fl->active_user_ssr);
+	INIT_LIST_HEAD(&fl->sched_works);
 	INIT_LIST_HEAD(&fl->cached_bufs);
 	INIT_LIST_HEAD(&fl->notif_queue);
 	INIT_LIST_HEAD(&fl->fastrpc_drivers);
@@ -7263,6 +7270,9 @@ static int fastrpc_npu_priority(struct fastrpc_user *fl,
 		err = fastrpc_npu_app_prio_set(fl->cctx,
 					       npu_sched->configs,
 					       npu_sched->num_configs);
+		if (!err)
+			fastrpc_scheduler_notify_prio_update(
+				&fl->cctx->scheduler);
 		break;
 	default:
 		dev_err(fl->cctx->dev,
@@ -7413,52 +7423,7 @@ retry_wait:
 	}
 
 	/*
-	 * Validate the reason field against the expected values for the event
-	 * type.  An unexpected reason indicates a bug in the DSP driver filling
-	 * npu_work_info; warn and drop rather than forwarding a malformed entry
-	 * to the HAL, which would silently dispatch the wrong StartReason or
-	 * EndReason to the NPU Manager.
-	 */
-	if (node->info.event > WORK_ENDED) {
-		dev_err(cctx->dev, "NPU workinfo: invalid event %u, dropping entry\n",
-			node->info.event);
-		kfree(node);
-		return -EINVAL;
-	}
-
-	switch (node->info.event) {
-	case WORK_REQUESTED:
-		if (node->info.reason != NPU_WORK_REASON_NONE) {
-			dev_warn(cctx->dev,
-				 "NPU workinfo: unexpected reason %u for WORK_REQUESTED, dropping\n",
-				 node->info.reason);
-			kfree(node);
-			return -EINVAL;
-		}
-		break;
-	case WORK_STARTED:
-		if (node->info.reason != NPU_WORK_REASON_START_INITIAL) {
-			dev_warn(cctx->dev,
-				 "NPU workinfo: unexpected reason %u for WORK_STARTED, dropping\n",
-				 node->info.reason);
-			kfree(node);
-			return -EINVAL;
-		}
-		break;
-	case WORK_ENDED:
-		if (node->info.reason != NPU_WORK_REASON_END_COMPLETED &&
-		    node->info.reason != NPU_WORK_REASON_END_CANCELLED) {
-			dev_warn(cctx->dev,
-				 "NPU workinfo: unexpected reason %u for WORK_ENDED, dropping\n",
-				 node->info.reason);
-			kfree(node);
-			return -EINVAL;
-		}
-		break;
-	}
-
-	/*
-	 * Copy the patched npu_work_info to userspace.  ubuf points directly to
+	 * ubuf points directly to
 	 * the workinfo union member inside the user's ioctl args struct.
 	 */
 	err = copy_to_user(ubuf, &node->info, sizeof(*ubuf)) ? -EFAULT : 0;
@@ -7495,6 +7460,38 @@ int fastrpc_npu_post_workinfo(struct fastrpc_channel_ctx *cctx,
 {
 	struct npu_workinfo_node *node = NULL;
 	unsigned long flags = 0;
+
+	/*
+	 * Validate event and reason at the producer so that malformed
+	 * events are rejected before entering the queue.  The consumer
+	 * must never see an unsatisfiable reason/event combination.
+	 */
+	if (info->event > WORK_ENDED) {
+		dev_err(cctx->dev, "NPU workinfo: invalid event %u, dropping\n",
+			info->event);
+		kfree((void *)(uintptr_t)info->group_id);
+		kfree((void *)(uintptr_t)info->debug_feature_id);
+		return -EINVAL;
+	}
+	if (info->event == WORK_STARTED &&
+	    info->reason != NPU_WORK_REASON_START_INITIAL) {
+		dev_warn(cctx->dev,
+			 "NPU workinfo: unexpected reason %u for WORK_STARTED, dropping\n",
+			 info->reason);
+		kfree((void *)(uintptr_t)info->group_id);
+		kfree((void *)(uintptr_t)info->debug_feature_id);
+		return -EINVAL;
+	}
+	if (info->event == WORK_ENDED &&
+	    info->reason != NPU_WORK_REASON_END_COMPLETED &&
+	    info->reason != NPU_WORK_REASON_END_CANCELLED) {
+		dev_warn(cctx->dev,
+			 "NPU workinfo: unexpected reason %u for WORK_ENDED, dropping\n",
+			 info->reason);
+		kfree((void *)(uintptr_t)info->group_id);
+		kfree((void *)(uintptr_t)info->debug_feature_id);
+		return -EINVAL;
+	}
 
 	/* Allocate a new queue node to hold a copy of the workinfo event.
 	 * GFP_ATOMIC is used because this function may be called from atomic
@@ -7626,7 +7623,6 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 	u64 *perf_kernel;
 	bool legacy_domains = true;
 	int err = 0, recovery = 0;
-	char  *feature_id = NULL, *group_id = NULL;
 
 	if (copy_from_user(&invoke, argp, sizeof(invoke)))
 		return -EFAULT;
@@ -7758,39 +7754,13 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 
 		if (!work.handle ||
 			(work.status != FASTRPC_REMOTE_WORK_STATUS_START &&
-			work.status != FASTRPC_REMOTE_WORK_STATUS_END))
-				return -EINVAL;
+			 work.status != FASTRPC_REMOTE_WORK_STATUS_END))
+			return -EINVAL;
 
-		if (work.group_id && work.group_id_len > 0) {
-			if (work.group_id_len > FASTRPC_REMOTE_WORK_MAX_STR_LEN)
-				return -EINVAL;
-			group_id = strndup_user((void __user *)(uintptr_t)work.group_id,
-										work.group_id_len + 1);
-			if (IS_ERR(group_id))
-				return PTR_ERR(group_id);
-		}
-
-		if (work.feature_id && work.feature_id_len > 0) {
-			if (work.feature_id_len > FASTRPC_REMOTE_WORK_MAX_STR_LEN){
-				kfree(group_id);
-				return -EINVAL;
-			}
-			feature_id = strndup_user((void __user *)(uintptr_t)work.feature_id,
-										work.feature_id_len + 1);
-			if (IS_ERR(feature_id)) {
-				kfree(group_id);
-				return PTR_ERR(feature_id);
-			}
-		}
-		if (work.status == FASTRPC_REMOTE_WORK_STATUS_START) {
-			/* enqueue logic here */
-		} else {
-			/* dequeue logic here */
-		}
-
-		kfree(feature_id);
-		kfree(group_id);
-		err = 0;
+		if (work.status == FASTRPC_REMOTE_WORK_STATUS_START)
+			err = fastrpc_work_add(fl, &work);
+		else
+			err = fastrpc_work_remove(fl, &work);
 		break;
 	default:
 		err = -ENOTTY;

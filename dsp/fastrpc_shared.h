@@ -22,6 +22,7 @@
 #include <linux/kobject.h>
 #include <linux/hashtable.h>
 #include <linux/iosys-map.h>
+#include "fastrpc_scheduler.h"
 #include "../include/uapi/misc/fastrpc.h"
 #include "fastrpc_timeline.h"
 
@@ -49,6 +50,7 @@
 
 /* Max number of SMMU context banks in a pool */
 #define FASTRPC_MAX_CB_POOL	7
+#define FASTRPC_REMOTE_WORK_MAX_STR_LEN	256
 #define FASTRPC_MAX_SPD		4
 #define FASTRPC_MAX_VMIDS	16
 #define FASTRPC_ALIGN		128
@@ -1408,6 +1410,8 @@ struct fastrpc_channel_ctx {
 	/* log context for storing kernel logs */
 	struct fastrpc_log_context log;
 #endif
+	/* Per-channel job scheduler */
+	struct fastrpc_scheduler scheduler;
 	/* NPU application priority table */
 	struct npu_app_prio_table *npu_app_prio;
 	/* 1 if fastrpc_get_sessions_info is running */
@@ -1704,6 +1708,8 @@ struct fastrpc_user {
 	struct fastrpc_timeline_arguments *timeline_init_args;
 	/* Node for adding this user-object to active-users list during ssr */
 	struct list_head active_user_ssr;
+	/* All scheduler works owned by this user, protected by sched->lock */
+	struct list_head sched_works;
 	struct kref refcount;
 	struct work_struct put_work;
 	/*

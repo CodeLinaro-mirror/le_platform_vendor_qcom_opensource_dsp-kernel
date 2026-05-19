@@ -10722,11 +10722,12 @@ static struct fastrpc_domain *fastrpc_lookup_domain_in_table(
 static void fastrpc_delete_domains_table(void)
 {
 	struct fastrpc_domain *domain = NULL;
+	struct hlist_node *tmp = NULL;
 	struct mutex *hmut = &g_frpc.hmut;
 	int i = 0;
 
 	mutex_lock(hmut);
-	hash_for_each(g_frpc.fastrpc_domains_table, i, domain, node) {
+	hash_for_each_safe(g_frpc.fastrpc_domains_table, i, tmp, domain, node) {
 		fastrpc_sysfs_domain_remove(domain);
 		hash_del(&domain->node);
 		kfree(domain);

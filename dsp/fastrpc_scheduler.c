@@ -34,7 +34,7 @@ static void fastrpc_workinfo_notify(struct fastrpc_scheduler *sched,
 	info.timestamp_ms	 = ktime_to_ms(ktime_get_real());
 	info.event		 = (u32)event;
 	info.reason		 = reason;
-	info.id			 = (s32)work->handle;
+	info.id			 = (s32)work->work_id;
 	info.uid		 = work->app_id;
 	info.debug_pid		 = work->app_id;
 	info.domain		 = cctx->domain_id;
@@ -642,6 +642,7 @@ int fastrpc_work_add(struct fastrpc_user *fl,
 
 	wnode->group_id = group_id;
 	wnode->feature_id = feature_id;
+	wnode->work_id = (u32)atomic_fetch_add(1, &sched->workid_seq) & INT_MAX;
 	wnode->fl = fl;
 	atomic_set(&wnode->state, WORK_STATE_INCOMING);
 	/*
@@ -871,6 +872,7 @@ int fastrpc_scheduler_init(struct fastrpc_scheduler *sched)
 	spin_lock_init(&sched->lock);
 	init_waitqueue_head(&sched->wq);
 	sched->ref_prio = U32_MAX;
+	atomic_set(&sched->workid_seq, 0);
 	sched->prio_update_pending = false;
 	sched->stop = false;
 	sched->kthread = NULL;

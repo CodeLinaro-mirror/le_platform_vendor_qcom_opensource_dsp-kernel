@@ -62,6 +62,7 @@ struct fastrpc_work_node {
 	int			app_id;		/* process tgid */
 	char			*group_id;	/* inference group ID string */
 	char			*feature_id;	/* feature ID string */
+	u32			work_id;	/* monotonic id for workinfo correlation */
 	atomic_t		state;		/* enum fastrpc_work_state */
 	u32			end_reason;	/* NPU_WORK_REASON_END_* for WORK_ENDED */
 	struct completion	*wait_done;	/* caller's on-stack completion */
@@ -98,6 +99,7 @@ struct fastrpc_scheduler {
 	wait_queue_head_t	wq;		/* wakes kthread */
 	struct task_struct	*kthread;	/* scheduler worker thread */
 	u32			ref_prio;	/* min eff_prio of executing works */
+	atomic_t		workid_seq;	/* monotonic counter for workinfo id */
 	bool			prio_update_pending;
 	bool			stop;		/* set to stop kthread */
 };

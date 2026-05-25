@@ -654,7 +654,7 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	}
 
 	of_platform_depopulate(&rpdev->dev);
-	fastrpc_mmap_remove_ssr(cctx, false);
+	fastrpc_mmap_remove_ssr(cctx);
 	cctx->dev = NULL;
 	cctx->rpdev = NULL;
 	cctx->domain = NULL;

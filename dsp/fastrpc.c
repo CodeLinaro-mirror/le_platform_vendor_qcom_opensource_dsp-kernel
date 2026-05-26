@@ -5383,7 +5383,7 @@ err_out:
 
 static int fastrpc_invoke(struct fastrpc_user *fl, char __user *argp)
 {
-	struct fastrpc_enhanced_invoke ioctl;
+	struct fastrpc_enhanced_invoke ioctl = {0};
 	struct fastrpc_invoke inv;
 	int err;
 
@@ -7610,12 +7610,12 @@ static int fastrpc_npu_priority_workinfo(struct fastrpc_user *fl,
 
 static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 {
-	struct fastrpc_enhanced_invoke inv2 ;
+	struct fastrpc_enhanced_invoke inv2 = {0};
 	struct fastrpc_ioctl_multimode_invoke invoke;
 	struct fastrpc_internal_control cp = {0};
 	struct fastrpc_internal_dspsignal *fsig = NULL;
 	struct fastrpc_internal_notif_rsp notif;
-	struct fastrpc_internal_config config;
+	struct fastrpc_internal_config config = {0};
 	struct fastrpc_internal_sessinfo sessinfo;
 	struct fastrpc_ioctl_mdctx_manage ctxm = {0};
 	struct fastrpc_ioctl_remote_proc_state_dump proc = {0};

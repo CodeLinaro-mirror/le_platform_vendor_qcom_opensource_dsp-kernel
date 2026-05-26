@@ -32,6 +32,7 @@
 #include <linux/mem-buf.h>
 #include <soc/qcom/secure_buffer.h>
 #include "fastrpc_shared.h"
+#include "fastrpc_scheduler.h"
 #include <linux/platform_device.h>
 #include <linux/types.h>
 #if FRPC_RING_BUFFER_ENABLED
@@ -463,6 +464,7 @@ static int fastrpc_map_lookup(struct fastrpc_user *fl, int fd,
 		(retained_map && (kref_read(&map->refcount) != 0))) {
 		found = NULL;
 		ret = -EBADFD;
+		goto bail;
 	}
 
 	/*
@@ -865,6 +867,20 @@ static void fastrpc_channel_ctx_free(struct kref *ref)
 	cctx = container_of(ref, struct fastrpc_channel_ctx, refcount);
 	fastrpc_channel_default_user_delete(cctx);
 	mutex_destroy(&cctx->wake_mutex);
+
+	/*
+	 * Free the NPU priority table. In the normal teardown path (no SSR)
+	 * this is the only place it gets freed. In the SSR path,
+	 * fastrpc_rpmsg_remove already freed it and NULLed the pointer,
+	 * so this block is skipped.
+	 */
+	if (cctx->npu_app_prio) {
+		kfree(cctx->npu_app_prio->entries);
+		kfree(cctx->npu_app_prio);
+		cctx->npu_app_prio = NULL;
+	}
+
+
 
 	for (i = 0; i < FASTRPC_MAX_SESSIONS; i++)
 		for (j = 0; j < cctx->session[i].smmucount; j++)
@@ -1397,6 +1413,9 @@ static void fastrpc_pm_awake(struct fastrpc_user *fl)
 {
 	struct fastrpc_channel_ctx *cctx = fl->cctx;
 	struct wakeup_source *wake_source = cctx->wake_source;
+
+	if (!fl->wake_enable)
+		return;
 
 	/*
 	 * Vote with PM to abort any suspend in progress and
@@ -2649,7 +2668,7 @@ static int fastrpc_internal_invoke(struct fastrpc_user *fl,  u32 kernel,
 	u64 *perf_counter = NULL;
 	struct timespec64 invoket = {0};
 	struct device *dev = NULL;
-	u32 priority = invoke->priority;
+	u32 priority = invoke->priority, user_appid = invoke->appid;
 
 	if (atomic_read(&fl->cctx->teardown))
 		return -EPIPE;
@@ -2711,6 +2730,24 @@ static int fastrpc_internal_invoke(struct fastrpc_user *fl,  u32 kernel,
 	PERF_END);
 	fastrpc_timeline_record(6, fl->tgid_app, fl->fastrpc_timeline_obj);
 	trace_fastrpc_msg("get_args: end");
+
+	/*
+	 * For untrusted processes (opened by DSP HAL on behalf of another
+	 * process), only permit invocations of dynamic handles that have an
+	 * active admitted job in the scheduler executing list.  Static handles
+	 * (<= FASTRPC_MAX_STATIC_HANDLE) and kernel-initiated calls are exempt.
+	 */
+	if (!kernel && user_appid && fl->untrusted_process &&
+		handle > FASTRPC_MAX_STATIC_HANDLE) {
+		if (!fastrpc_scheduler_handle_is_executing(
+				&fl->cctx->scheduler, fl, (u64)handle)) {
+			dev_err(dev, "%s: untrusted process %d invoking handle 0x%x without active executing work",
+				__func__, fl->tgid_frpc, handle);
+			err = -EPERM;
+			goto bail;
+		}
+	}
+
 	/* make sure that all CPU memory writes are seen by DSP */
 	dma_wmb();
 	/* Send invoke buffer to remote dsp */
@@ -3228,7 +3265,7 @@ static void print_map_info(struct seq_file *s_file, struct fastrpc_map *map)
 	seq_printf(s_file,"%s %2s 0x%x\n", "flags", ":", map->flags);
 }
 
-void print_session_info(struct seq_file *s_file, struct fastrpc_user *fl)
+static void print_session_info(struct seq_file *s_file, struct fastrpc_user *fl)
 {
 	seq_printf(s_file,"%s %2s %s\n", "process_name", ":", fl->name);
 	seq_printf(s_file,"%s %12s %d\n", "tgid", ":", fl->tgid);
@@ -4274,7 +4311,10 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	sctx = fastrpc_session_alloc(fl, false, fl->pd_type);
 	if (!sctx) {
 		dev_warn_ratelimited(fl->cctx->dev, "No session available\n");
-		fastrpc_get_sessions_info(fl->cctx);
+		if (!atomic_cmpxchg(&fl->cctx->sessions_info_active, 0, 1)) {
+			fastrpc_get_sessions_info(fl->cctx);
+			atomic_set(&fl->cctx->sessions_info_active, 0);
+		}
 		err = -EBUSY;
 		goto err_out;
 	}
@@ -4583,6 +4623,9 @@ static inline void fastrpc_channel_update_invoke_cnt(
 void fastrpc_free_user(struct fastrpc_user *fl)
 {
 	struct fastrpc_map *map = NULL, *m = NULL;
+
+	/* Abort all scheduler jobs owned by this user */
+	fastrpc_scheduler_user_cleanup(fl);
 
 	fastrpc_context_list_free(fl);
 
@@ -4954,6 +4997,7 @@ static int fastrpc_user_obj_create(struct file *filp,
 	INIT_LIST_HEAD(&fl->mmaps);
 	INIT_LIST_HEAD(&fl->user);
 	INIT_LIST_HEAD(&fl->active_user_ssr);
+	INIT_LIST_HEAD(&fl->sched_works);
 	INIT_LIST_HEAD(&fl->cached_bufs);
 	INIT_LIST_HEAD(&fl->notif_queue);
 	INIT_LIST_HEAD(&fl->fastrpc_drivers);
@@ -7041,6 +7085,524 @@ static int fastrpc_request_thread_exit(struct fastrpc_user *fl,
 	return err;
 }
 
+/*
+ *	fastrpc_npu_app_prio_init - Allocate the per-channel NPU priority table
+ *
+ *	@cctx	: Channel context
+ *
+ *	Return	: 0 on success, negative error code on failure
+ *
+ *	Called lazily on the first FASTRPC_IOCTL_NPU_PRIORITY_WORKINFO request.
+ *	Only the table struct is allocated here; the entries buffer is NULL until
+ *	fastrpc_npu_app_prio_set installs it on the first priority update.
+ *	All subsequent access to the table (read and write) is serialised under
+ *	cctx->lock, so no additional lock is embedded in the table itself.
+ */
+static int fastrpc_npu_app_prio_init(struct fastrpc_channel_ctx *cctx)
+{
+	struct npu_app_prio_table *prio_tbl = NULL;
+	unsigned long flags = 0;
+
+	if (cctx->npu_app_prio)
+		return 0;
+
+	if (atomic_read(&cctx->teardown))
+		return -EPIPE;
+
+	/*
+	 * Allocate outside cctx->lock — GFP_KERNEL may sleep and cannot
+	 * be used in atomic (spinlock-held) context.
+	 */
+	prio_tbl = kzalloc(sizeof(*prio_tbl), GFP_KERNEL);
+	if (!prio_tbl) {
+		dev_err(cctx->dev, "Failed to allocate NPU app prio table\n");
+		return -ENOMEM;
+	}
+
+	/*
+	 * Two callers may both observe cctx->npu_app_prio == NULL before
+	 * either acquires the lock. The first to acquire installs the table;
+	 * the second discards its allocation. Both return 0.
+	 */
+	spin_lock_irqsave(&cctx->lock, flags);
+	if (!cctx->npu_app_prio)
+		cctx->npu_app_prio = prio_tbl;
+	else
+		kfree(prio_tbl);
+	spin_unlock_irqrestore(&cctx->lock, flags);
+
+	return 0;
+}
+
+/*
+ *	fastrpc_npu_app_prio_set - Replace the NPU application priority table
+ *
+ *	@cctx		: Channel context
+ *	@user_configs	: Userspace pointer to array of fastrpc_npu_app_prio_config
+ *	@num_configs	: Number of entries in the array
+ *
+ *	Return		: 0 on success, negative error code on failure
+ *
+ *	Allocates a kernel buffer, copies and validates the user-supplied
+ *	priority configs, then atomically swaps it into the shared table under
+ *	cctx->lock. The previous buffer is freed after the lock is released.
+ *
+ *	SSR safety: the teardown check and the swap both occur under cctx->lock,
+ *	the same lock fastrpc_rpmsg_remove uses to NULL the table pointer. Either
+ *	the writer completes before SSR (SSR frees the new buffer during channel
+ *	cleanup) or SSR runs first (writer sees NULL and returns -ENODEV).
+ */
+static int fastrpc_npu_app_prio_set(struct fastrpc_channel_ctx *cctx,
+				    u64 user_configs, u32 num_configs)
+{
+	struct fastrpc_npu_app_prio_config *new_buf = NULL, *old_buf = NULL;
+	unsigned long flags = 0;
+	uint32_t i = 0;
+	int err = 0;
+
+	if (!user_configs) {
+		pr_err("%s: invalid args: cctx=%pK user_configs=0x%llx num_configs=%u\n",
+		       __func__, cctx, user_configs, num_configs);
+		return -EINVAL;
+	}
+
+	err = fastrpc_npu_app_prio_init(cctx);
+	if (err)
+		return err;
+
+	/* Fast-path rejection before doing any expensive work */
+	if (atomic_read(&cctx->teardown))
+		return -EPIPE;
+
+	/* kcalloc(GFP_KERNEL) and copy_from_user can both sleep;
+	 * neither can be called while holding a spinlock.
+	 */
+	new_buf = kcalloc(num_configs, sizeof(*new_buf), GFP_KERNEL);
+	if (!new_buf)
+		return -ENOMEM;
+
+	if (copy_from_user(new_buf, (void __user *)(uintptr_t)user_configs,
+			   array_size(num_configs, sizeof(*new_buf)))) {
+		dev_err(cctx->dev, "Failed to copy configs from user\n");
+		err = -EFAULT;
+		goto bail;
+	}
+
+	for (i = 0; i < num_configs; i++) {
+		if (new_buf[i].priority < NPU_MIN_PRIORITY ||
+		    new_buf[i].priority > NPU_MAX_PRIORITY) {
+			dev_err(cctx->dev, "Invalid priority %d at index %u\n",
+				new_buf[i].priority, i);
+			err = -EINVAL;
+			goto bail;
+		}
+		/*
+		 * Reject any config entry that sets reserved fields to a
+		 * non-zero value. Reserved fields must be zero so that a
+		 * future kernel that repurposes them for new parameters does
+		 * not silently misinterpret data sent by an older userspace
+		 * that happened to leave garbage there. Enforcing zero here
+		 * ensures the ABI can be extended safely.
+		 */
+		if (memchr_inv(new_buf[i].reserved, 0,
+			       sizeof(new_buf[i].reserved))) {
+			dev_err(cctx->dev,
+				"Non-zero reserved fields in config at index %u\n", i);
+			err = -EINVAL;
+			goto bail;
+		}
+	}
+
+	/*
+	 * Atomically swap the validated buffer into the table under cctx->lock.
+	 * teardown is checked under the same lock that fastrpc_rpmsg_remove
+	 * uses to set it and NULL the table, so either we complete the swap
+	 * before SSR or we see teardown=1 and abort.
+	 * old_buf is freed after releasing the lock — kfree(NULL) is safe
+	 * on the first call when entries has not yet been set.
+	 */
+	spin_lock_irqsave(&cctx->lock, flags);
+	if (atomic_read(&cctx->teardown)) {
+		spin_unlock_irqrestore(&cctx->lock, flags);
+		err = -EPIPE;
+		goto bail;
+	}
+	if (cctx->npu_app_prio->num_entries > NPU_MAX_APP_PRIO_ENTRIES) {
+		spin_unlock_irqrestore(&cctx->lock, flags);
+		dev_err(cctx->dev, "Invalid num_entries: %u (max %u)\n",
+			cctx->npu_app_prio->num_entries, NPU_MAX_APP_PRIO_ENTRIES);
+		err = -EINVAL;
+		goto bail;
+	}
+	old_buf                         = cctx->npu_app_prio->entries;
+	cctx->npu_app_prio->entries     = new_buf;
+	cctx->npu_app_prio->num_entries = num_configs;
+	spin_unlock_irqrestore(&cctx->lock, flags);
+
+	kfree(old_buf);
+	new_buf = NULL;
+bail:
+	kfree(new_buf);
+	return err;
+}
+
+/*
+ * fastrpc_npu_priority - Handle NPU scheduling IOCTL
+ *
+ * @fl		: User context
+ * @npu_sched	: Kernel-space scheduling parameters
+ *
+ * Return	: 0 on success, negative error code on failure
+ */
+static int fastrpc_npu_priority(struct fastrpc_user *fl,
+				  struct fastrpc_npu_priority *npu_sched)
+{
+	int err = 0;
+
+	if (npu_sched->num_configs > NPU_MAX_APP_PRIO_ENTRIES) {
+		dev_err(fl->cctx->dev, "Invalid num_configs: %u (max %u)\n",
+			npu_sched->num_configs, NPU_MAX_APP_PRIO_ENTRIES);
+		return -EINVAL;
+	}
+
+	switch (npu_sched->version) {
+	case NPU_APP_PRIO_CONFIG_VERSION:
+		err = fastrpc_npu_app_prio_set(fl->cctx,
+					       npu_sched->configs,
+					       npu_sched->num_configs);
+		if (!err)
+			fastrpc_scheduler_notify_prio_update(
+				&fl->cctx->scheduler);
+		break;
+	default:
+		dev_err(fl->cctx->dev,
+			"NPU sched: unsupported config version %u\n",
+			npu_sched->version);
+		err = -EINVAL;
+		break;
+	}
+
+	return err;
+}
+
+/*
+ * fastrpc_npu_workinfo - Block until a workinfo event is available and return it.
+ *
+ * This is the consumer side of the per-channel NPU workinfo notification queue.
+ * It is called from fastrpc_npu_priority_workinfo() when the ioctl op field is
+ * FASTRPC_NPU_OP_WORKINFO.  This function dequeues one event, delivers the
+ * group_id / debug_feature_id bytes to the HAL's pre-allocated output buffers,
+ * and copies the final npu_work_info struct to userspace via copy_to_user().
+ *
+ * The per-channel FIFO queue (npu_workinfo_head/tail) and semaphore live
+ * directly in fastrpc_channel_ctx and are initialised at probe time.
+ *
+ * Wait and wakeup:
+ *   - Blocks on cctx->npu_workinfo_sem via down_interruptible() until a node
+ *     is enqueued (up() called by producer) or teardown (up() called by SSR).
+ *   - Returns -EPIPE on SSR/teardown so userspace can close the fd and exit.
+ *   - Returns -ERESTARTSYS on signal so the kernel can restart the syscall.
+ *
+ * Dequeue:
+ *   - Dequeues exactly one node per call under cctx->lock (spinlock).
+ *   - Userspace re-issues the ioctl immediately after processing each event.
+ *
+ * group_id / debug_feature_id delivery:
+ *   - These fields hold kernel VAs.  The HAL pre-allocates output buffers and
+ *     places their addresses in kbuf->group_id / kbuf->debug_feature_id before
+ *     calling the ioctl (kbuf is the kernel copy from dispatcher's copy_from_user).
+ *     This function calls copy_to_user() to write the bytes into those HAL buffers,
+ *     then patches the pointer fields so the delivered struct carries valid
+ *     HAL-process VAs.
+ *
+ * @fl   : fastrpc user context for this open fd
+ * @kbuf : kernel-space copy of args.workinfo (provides HAL output buffer addresses)
+ * @ubuf : userspace destination — npu_work_info field inside the ioctl args struct
+ *
+ * Returns 0 on success, negative error code otherwise.
+ */
+static int fastrpc_npu_workinfo_drain_queue(struct fastrpc_user *fl,
+					    struct npu_work_info __user *ubuf)
+{
+	struct fastrpc_channel_ctx *cctx = fl->cctx;
+	struct npu_workinfo_node *node = NULL;
+	/* Kernel copy of ubuf captured before the blocking wait to prevent
+	 * TOCTOU on the HAL-provided output buffer addresses (group_id,
+	 * debug_feature_id).
+	 */
+	struct npu_work_info kbuf = { 0 };
+	unsigned long flags = 0;
+	u32 copy_len = 0;
+	int err = 0;
+
+	if (copy_from_user(&kbuf, ubuf, sizeof(kbuf)))
+		return -EFAULT;
+
+retry_wait:
+	err = down_interruptible(&cctx->npu_workinfo_sem);
+	if (err)
+		return -ERESTARTSYS;
+
+	if (atomic_read(&cctx->teardown)) {
+		up(&cctx->npu_workinfo_sem);
+		return -EPIPE;
+	}
+
+	/* Dequeue the head node under cctx->lock and decrement the queue
+	 * length counter so the producer's cap check stays accurate.
+	 * Teardown is checked here under the same lock that SSR uses to set
+	 * it, closing the TOCTOU window between wakeup and dequeue.
+	 */
+	spin_lock_irqsave(&cctx->lock, flags);
+	if (atomic_read(&cctx->teardown)) {
+		spin_unlock_irqrestore(&cctx->lock, flags);
+		return -EPIPE;
+	}
+	node = cctx->npu_workinfo_head;
+	if (!node) {
+		spin_unlock_irqrestore(&cctx->lock, flags);
+		goto retry_wait;
+	}
+	cctx->npu_workinfo_head = node->next;
+	if (!cctx->npu_workinfo_head)
+		cctx->npu_workinfo_tail = NULL;
+	cctx->npu_workinfo_queue_len--;
+	spin_unlock_irqrestore(&cctx->lock, flags);
+
+	if (kbuf.group_id != 0 && node->info.group_id != 0 &&
+	    node->info.group_id_len > 0) {
+		if (node->info.group_id_len > NPU_MAX_WORKINFO_FIELD_LEN) {
+			dev_warn(cctx->dev,
+				 "NPU workinfo: group_id_len %u exceeds max %u, clamping\n",
+				 node->info.group_id_len, NPU_MAX_WORKINFO_FIELD_LEN);
+			node->info.group_id_len = NPU_MAX_WORKINFO_FIELD_LEN;
+		}
+		copy_len = min_t(u32, node->info.group_id_len, kbuf.group_id_len);
+		if (!copy_to_user((void __user *)(uintptr_t)kbuf.group_id,
+				  (void *)(uintptr_t)node->info.group_id, copy_len)) {
+			kfree((void *)(uintptr_t)node->info.group_id);
+			node->info.group_id     = kbuf.group_id;
+			node->info.group_id_len = copy_len;
+		} else {
+			dev_warn(cctx->dev,
+				 "NPU workinfo: copy_to_user failed for group_id\n");
+			kfree((void *)(uintptr_t)node->info.group_id);
+			node->info.group_id     = 0;
+			node->info.group_id_len = 0;
+		}
+	} else {
+		kfree((void *)(uintptr_t)node->info.group_id);
+		node->info.group_id     = 0;
+		node->info.group_id_len = 0;
+	}
+
+	if (kbuf.debug_feature_id != 0 && node->info.debug_feature_id != 0 &&
+	    node->info.debug_feature_id_len > 0) {
+		if (node->info.debug_feature_id_len > NPU_MAX_WORKINFO_FIELD_LEN) {
+			dev_warn(cctx->dev,
+				 "NPU workinfo: debug_feature_id_len %u exceeds max %u, clamping\n",
+				 node->info.debug_feature_id_len, NPU_MAX_WORKINFO_FIELD_LEN);
+			node->info.debug_feature_id_len = NPU_MAX_WORKINFO_FIELD_LEN;
+		}
+		copy_len = min_t(u32, node->info.debug_feature_id_len,
+				      kbuf.debug_feature_id_len);
+		if (!copy_to_user((void __user *)(uintptr_t)kbuf.debug_feature_id,
+				  (void *)(uintptr_t)node->info.debug_feature_id, copy_len)) {
+			kfree((void *)(uintptr_t)node->info.debug_feature_id);
+			node->info.debug_feature_id     = kbuf.debug_feature_id;
+			node->info.debug_feature_id_len = copy_len;
+		} else {
+			kfree((void *)(uintptr_t)node->info.debug_feature_id);
+			node->info.debug_feature_id     = 0;
+			node->info.debug_feature_id_len = 0;
+		}
+	} else {
+		kfree((void *)(uintptr_t)node->info.debug_feature_id);
+		node->info.debug_feature_id     = 0;
+		node->info.debug_feature_id_len = 0;
+	}
+
+	/*
+	 * ubuf points directly to
+	 * the workinfo union member inside the user's ioctl args struct.
+	 */
+	err = copy_to_user(ubuf, &node->info, sizeof(*ubuf)) ? -EFAULT : 0;
+
+	kfree(node);
+	return err;
+}
+
+static int fastrpc_npu_workinfo(struct fastrpc_user *fl,
+				struct npu_work_info __user *ubuf)
+{
+	struct fastrpc_channel_ctx *cctx = fl->cctx;
+	u32 version = 0;
+	int err = 0;
+
+	if (get_user(version, &ubuf->version))
+		return -EFAULT;
+
+	switch (version) {
+	case NPU_WORKINFO_VERSION:
+		err = fastrpc_npu_workinfo_drain_queue(fl, ubuf);
+		break;
+	default:
+		dev_err(cctx->dev, "NPU workinfo: unsupported version %u\n",
+			version);
+		err = -EINVAL;
+		break;
+	}
+	return err;
+}
+
+int fastrpc_npu_post_workinfo(struct fastrpc_channel_ctx *cctx,
+			      struct npu_work_info *info)
+{
+	struct npu_workinfo_node *node = NULL;
+	unsigned long flags = 0;
+
+	/*
+	 * Validate event and reason at the producer so that malformed
+	 * events are rejected before entering the queue.  The consumer
+	 * must never see an unsatisfiable reason/event combination.
+	 */
+	if (info->event > WORK_ENDED) {
+		dev_err(cctx->dev, "NPU workinfo: invalid event %u, dropping\n",
+			info->event);
+		kfree((void *)(uintptr_t)info->group_id);
+		kfree((void *)(uintptr_t)info->debug_feature_id);
+		return -EINVAL;
+	}
+	if (info->event == WORK_STARTED &&
+	    info->reason != NPU_WORK_REASON_START_INITIAL) {
+		dev_warn(cctx->dev,
+			 "NPU workinfo: unexpected reason %u for WORK_STARTED, dropping\n",
+			 info->reason);
+		kfree((void *)(uintptr_t)info->group_id);
+		kfree((void *)(uintptr_t)info->debug_feature_id);
+		return -EINVAL;
+	}
+	if (info->event == WORK_ENDED &&
+	    info->reason != NPU_WORK_REASON_END_COMPLETED &&
+	    info->reason != NPU_WORK_REASON_END_CANCELLED) {
+		dev_warn(cctx->dev,
+			 "NPU workinfo: unexpected reason %u for WORK_ENDED, dropping\n",
+			 info->reason);
+		kfree((void *)(uintptr_t)info->group_id);
+		kfree((void *)(uintptr_t)info->debug_feature_id);
+		return -EINVAL;
+	}
+
+	/* Allocate a new queue node to hold a copy of the workinfo event.
+	 * GFP_ATOMIC is used because this function may be called from atomic
+	 * context (e.g. softirq/interrupt); GFP_KERNEL would sleep and crash.
+	 */
+	node = kzalloc(sizeof(*node), GFP_ATOMIC);
+	if (!node) {
+		dev_err(cctx->dev, "NPU workinfo: failed to alloc node\n");
+		kfree((void *)(uintptr_t)info->group_id);
+		kfree((void *)(uintptr_t)info->debug_feature_id);
+		return -ENOMEM;
+	}
+
+	node->info = *info;
+	node->next = NULL;
+
+	/* Hold cctx->lock across both the cap check and the enqueue so that
+	 * concurrent producers cannot both pass the check and exceed the limit.
+	 */
+	spin_lock_irqsave(&cctx->lock, flags);
+	if (cctx->npu_workinfo_queue_len >= NPU_WORKINFO_QUEUE_MAX) {
+		spin_unlock_irqrestore(&cctx->lock, flags);
+		dev_err(cctx->dev, "NPU workinfo: queue full (%d), dropping event\n",
+			NPU_WORKINFO_QUEUE_MAX);
+		kfree((void *)(uintptr_t)node->info.group_id);
+		kfree((void *)(uintptr_t)node->info.debug_feature_id);
+		kfree(node);
+		return -ENOSPC;
+	}
+	/* Enqueue at the tail and update the length counter. */
+	if (cctx->npu_workinfo_tail)
+		cctx->npu_workinfo_tail->next = node;
+	else
+		cctx->npu_workinfo_head = node;
+	cctx->npu_workinfo_tail = node;
+	cctx->npu_workinfo_queue_len++;
+	spin_unlock_irqrestore(&cctx->lock, flags);
+
+	/* Wake the HAL consumer thread blocked in fastrpc_npu_workinfo_drain_queue(). */
+	up(&cctx->npu_workinfo_sem);
+	return 0;
+}
+
+/*
+ * fastrpc_npu_priority_workinfo - Handle FASTRPC_IOCTL_NPU_PRIORITY_WORKINFO
+ *
+ * Combines NPU scheduling and workinfo into a single dedicated ioctl.
+ * Dispatches to fastrpc_npu_priority or fastrpc_npu_workinfo based
+ * on the op field.  copy_from_user is centralised here; copy_to_user
+ * for WORKINFO is handled inside fastrpc_npu_workinfo().
+ *
+ * @fl   : User context
+ * @argp : Userspace pointer to struct fastrpc_ioctl_npu_priority_workinfo
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+static int fastrpc_npu_priority_workinfo(struct fastrpc_user *fl,
+					 struct file *file, char __user *argp)
+{
+	struct fastrpc_channel_ctx *cctx = fl->cctx;
+	struct fastrpc_ioctl_npu_priority_workinfo args = {};
+	struct npu_work_info __user *ubuf = NULL;
+	int err = 0;
+
+	if (copy_from_user(&args, argp, sizeof(args)))
+		return -EFAULT;
+
+	/* Reject non-zero reserved fields: a future userspace that repurposes
+	 * a reserved word for a new parameter must not silently succeed on an
+	 * older kernel that ignores it.
+	 */
+	if (memchr_inv(args.reserved, 0, sizeof(args.reserved)))
+		return -EINVAL;
+
+	/*
+	 * Reject all NPU ioctl calls once the channel is tearing down (SSR or
+	 * device removal).  At this point the DSP subsystem is no longer
+	 * operational: PRIORITY updates would target a dead subsystem, and
+	 * WORKINFO would block on a wait queue that will never be woken by a
+	 * new work event.  Return -EPIPE so userspace can distinguish teardown
+	 * from a permission error or malformed request.
+	 */
+	if (atomic_read(&cctx->teardown))
+		return -EPIPE;
+
+	switch (args.op) {
+	case FASTRPC_NPU_OP_PRIORITY:
+		if (memchr_inv(args.prio.reserved, 0, sizeof(args.prio.reserved)))
+			return -EINVAL;
+		if (args.prio.num_configs == 0)
+			return -EINVAL;
+		err = fastrpc_npu_priority(fl, &args.prio);
+		break;
+	case FASTRPC_NPU_OP_WORKINFO:
+		if (memchr_inv(args.workinfo.reserved, 0, sizeof(args.workinfo.reserved)))
+			return -EINVAL;
+		/*
+		 * ubuf points directly at the workinfo union member inside the
+		 * user's ioctl args struct.  fastrpc_npu_workinfo() dequeues one
+		 * event and copies it to ubuf via copy_to_user().
+		 */
+		ubuf = &((struct fastrpc_ioctl_npu_priority_workinfo __user *)argp)->workinfo;
+		err = fastrpc_npu_workinfo(fl, ubuf);
+		break;
+	default:
+		err = -EINVAL;
+		break;
+	}
+	return err;
+}
+
 static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 {
 	struct fastrpc_enhanced_invoke inv2 ;
@@ -7056,6 +7618,7 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 	struct fastrpc_ioctl_kernel_log klog = {0};
 	struct fastrpc_thread_exit exit_info = {0};
 	struct fastrpc_timeline_arguments timeline_init_args = {0};
+	struct fastrpc_ioctl_remote_work work = {0};
 	u32 multisession, size = 0, timeline_version = 0;
 	u64 *perf_kernel;
 	bool legacy_domains = true;
@@ -7183,6 +7746,22 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 				return -EFAULT;
 		}
 		break;
+	case FASTRPC_INVOKE_REMOTE_WORK:
+		if (copy_from_user(&work,
+				(void __user *)(uintptr_t)invoke.invparam,
+				sizeof(work)))
+			return -EFAULT;
+
+		if (!work.handle ||
+			(work.status != FASTRPC_REMOTE_WORK_STATUS_START &&
+			 work.status != FASTRPC_REMOTE_WORK_STATUS_END))
+			return -EINVAL;
+
+		if (work.status == FASTRPC_REMOTE_WORK_STATUS_START)
+			err = fastrpc_work_add(fl, &work);
+		else
+			err = fastrpc_work_remove(fl, &work);
+		break;
 	default:
 		err = -ENOTTY;
 		break;
@@ -7222,7 +7801,11 @@ static int fastrpc_get_info_from_kernel(struct fastrpc_ioctl_capability *cap,
 	uint32_t *dsp_attributes;
 	unsigned long flags;
 	uint32_t domain = cap->domain;
+	struct fastrpc_user *user_obj = cctx->kcomm_user.obj;
 	int err;
+
+	if (!user_obj)
+		user_obj = fl;
 
 	spin_lock_irqsave(&cctx->lock, flags);
 	/* check if we already have queried dsp for attributes */
@@ -7236,7 +7819,7 @@ static int fastrpc_get_info_from_kernel(struct fastrpc_ioctl_capability *cap,
 	if (!dsp_attributes)
 		return -ENOMEM;
 
-	err = fastrpc_get_info_from_dsp(fl, dsp_attributes, FASTRPC_MAX_DSP_ATTRIBUTES);
+	err = fastrpc_get_info_from_dsp(user_obj, dsp_attributes, FASTRPC_MAX_DSP_ATTRIBUTES);
 	if (err == DSP_UNSUPPORTED_API) {
 		dev_info(cctx->dev,
 			 "Warning: DSP capabilities not supported on domain: %d\n", domain);
@@ -8013,6 +8596,43 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int cmd,
 	case FASTRPC_IOCTL_GET_TIMELINE_BUFFER:
 		err = fastrpc_get_timeline_buffer(fl, argp);
 		break;
+	case FASTRPC_IOCTL_NPU_PRIORITY_WORKINFO: {
+		struct fastrpc_ioctl_npu_priority_workinfo __user *uargs =
+			(struct fastrpc_ioctl_npu_priority_workinfo __user *)argp;
+		__u32 rsvd;
+		__u32 reserved[16];
+
+		/*
+	 	 * TODO: Add check to ensure that NPU HAL service is the only process that is
+	 	 * allowed to make this ioctl call.
+	 	 * ioctl call from any other application needs to be rejected.
+	 	 * For now, add this rudimentary check to block most 3rd-party apps from making
+	 	 * this ioctl. This is NOT expected to block 3rd party-apps and is only a
+	 	 * temporary placeholder.
+	 	 */
+		if (fl->tgid >= THIRD_PARTY_APP_PID) {
+			err = -EPERM;
+			break;
+		}
+		if (get_user(rsvd, &uargs->rsvd) ||
+		    copy_from_user(reserved, uargs->reserved, sizeof(reserved))) {
+			err = -EFAULT;
+			break;
+		}
+		if (memchr_inv(&rsvd, 0, sizeof(rsvd)) ||
+		    memchr_inv(reserved, 0, sizeof(reserved))) {
+			err = -EINVAL;
+			break;
+		}
+		/*
+ 		 * NPU workinfo case added as a placeholder.
+ 		 * This will be implemented in a separate change.
+ 		 * The ioctl is a combined ioctl for priority sending and workinfo notification
+ 		 * retrieval to ensure strict ordering of priority updates and work events.
+ 		 */
+		err = fastrpc_npu_priority_workinfo(fl, file, argp);
+		break;
+	}
 	default:
 		err = -ENOTTY;
 		break;

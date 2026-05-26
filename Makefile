@@ -1,10 +1,15 @@
-KBUILD_OPTIONS += DSP_ROOT=$(KERNEL_SRC)/$(M) V=1
+DSP_KERNEL_ROOT=$(ROOTDIR)vendor/qcom/opensource/dsp-kernel
+KBUILD_OPTIONS := DSP_KERNEL_ROOT=$(DSP_KERNEL_ROOT) CONFIG_QCOM_FASTRPC_TRUSTED=m
+
+ifeq ($(TARGET_SUPPORT),genericarmv8)
+	KBUILD_OPTIONS += CONFIG_ARCH_PINEAPPLE=y
+endif
 
 all:
 	$(MAKE) -C $(KERNEL_SRC) M=$(M) modules $(KBUILD_OPTIONS)
 
 modules_install:
-	$(MAKE) M=$(M) -C $(KERNEL_SRC) modules_install
+	$(MAKE) INSTALL_MOD_STRIP=1 -C $(KERNEL_SRC) M=$(M) modules_install
 
 %:
 	$(MAKE) -C $(KERNEL_SRC) M=$(M) $@ $(KBUILD_OPTIONS)

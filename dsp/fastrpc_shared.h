@@ -22,6 +22,7 @@
 #include <linux/kobject.h>
 #include <linux/hashtable.h>
 #include <linux/iosys-map.h>
+#include "fastrpc_scheduler.h"
 #include "../include/uapi/misc/fastrpc.h"
 #include "fastrpc_timeline.h"
 
@@ -49,6 +50,7 @@
 
 /* Max number of SMMU context banks in a pool */
 #define FASTRPC_MAX_CB_POOL	7
+#define FASTRPC_REMOTE_WORK_MAX_STR_LEN	256
 #define FASTRPC_MAX_SPD		4
 #define FASTRPC_MAX_VMIDS	16
 #define FASTRPC_ALIGN		128
@@ -516,6 +518,40 @@
  * Kernel attributes are offset by +1 to align with DSP attributes.
  */
 #define DSP_ATTR_OFFSET (1)
+
+/*
+ * The kernel checks version before copying from userspace;
+ * if the version is different from this then ioctl will be rejected.
+ */
+#define NPU_APP_PRIO_CONFIG_VERSION 0
+
+/* Maximum number of entries in the per-channel NPU workinfo queue; events
+ * beyond this limit are dropped to prevent unbounded memory growth if the
+ * HAL consumer falls behind. */
+#define NPU_WORKINFO_QUEUE_MAX     1024
+/* Maximum byte length accepted for group_id and debug_feature_id in a workinfo
+ * event.  Enforced before copy_to_user to prevent an out-of-bounds kernel read
+ * if the DSP provides a malformed (oversized) length value. */
+#define NPU_MAX_WORKINFO_FIELD_LEN 256
+
+/* Maximum number of per-UID priority entries the kernel table can hold */
+#define NPU_MAX_APP_PRIO_ENTRIES 1024
+
+/* Lowest possible scheduling priority */
+#define NPU_MIN_PRIORITY 0
+
+/* Highest possible scheduling priority */
+#define NPU_MAX_PRIORITY 1000
+
+/*
+ * On Android, PIDs are assigned sequentially. Typically, init-spawned
+ * platform services are assigned the lower values and 3rd-party apps
+ * that launch later are assigned higher values. This check does not
+ * guarantee 3rd-party apps from configuring app priorities in the NPU
+ * scheduler but will prevent most 3rd-party apps from doing so, until
+ * a clean check is implemented.
+ */
+#define THIRD_PARTY_APP_PID 10000
 
 enum fastrpc_reserved_ctx {
 	/*
@@ -1235,6 +1271,12 @@ struct fastrpc_kcomm_channel {
 	u32 served_msg_index;
 };
 
+/* Node in the per-channel NPU workinfo FIFO queue */
+struct npu_workinfo_node {
+	struct npu_workinfo_node *next;
+	struct npu_work_info      info;
+};
+
 #if FRPC_RING_BUFFER_ENABLED
 /* Structure to hold event log data */
 struct fastrpc_event_log {
@@ -1252,6 +1294,35 @@ struct fastrpc_log_context {
 	wait_queue_head_t wq;
 };
 #endif
+
+struct fastrpc_npu_app_prio_config {
+	/* Android UID of the application this config applies to */
+	u32 uid;
+	/* Scheduling priority value; higher means more preferred */
+	u32 priority;
+	/* True if this UID is granted direct DSP access, bypassing arbitration */
+	u32 has_direct_access;
+	/* True if this UID may attribute work to other UIDs for priority purposes */
+	u32 can_attribute_other_uid;
+	/* Reserved for future use; must be zero */
+	u32 reserved[8];
+};
+
+/*
+ * NPU application priority table per channel.
+ * All fields are read and written under cctx->lock.
+ */
+struct npu_app_prio_table {
+	/* Number of valid entries in @entries */
+	u32 num_entries;
+	/*
+	 * Kernel buffer holding the per-UID priority configs.
+	 * NULL until the first FASTRPC_IOCTL_NPU_PRIORITY_WORKINFO call.
+	 * Replaced atomically under cctx->lock on every update;
+	 * the old pointer is freed after the lock is released.
+	 */
+	struct fastrpc_npu_app_prio_config *entries;
+};
 
 struct fastrpc_channel_ctx {
 	int domain_id;
@@ -1329,10 +1400,22 @@ struct fastrpc_channel_ctx {
 	struct completion rpmsg_remove_start;
 	/* Buffer donated for preloading operations */
 	struct fastrpc_buf *preload_buf;
+	/* Per-channel NPU workinfo FIFO queue */
+	struct npu_workinfo_node *npu_workinfo_head;
+	struct npu_workinfo_node *npu_workinfo_tail;
+	struct semaphore          npu_workinfo_sem;
+	/* Number of nodes currently in the NPU workinfo queue */
+	u32                       npu_workinfo_queue_len;
 #if FRPC_RING_BUFFER_ENABLED
 	/* log context for storing kernel logs */
 	struct fastrpc_log_context log;
 #endif
+	/* Per-channel job scheduler */
+	struct fastrpc_scheduler scheduler;
+	/* NPU application priority table */
+	struct npu_app_prio_table *npu_app_prio;
+	/* 1 if fastrpc_get_sessions_info is running */
+	atomic_t sessions_info_active;
 };
 
 struct fastrpc_ssr_handler {
@@ -1625,6 +1708,8 @@ struct fastrpc_user {
 	struct fastrpc_timeline_arguments *timeline_init_args;
 	/* Node for adding this user-object to active-users list during ssr */
 	struct list_head active_user_ssr;
+	/* All scheduler works owned by this user, protected by sched->lock */
+	struct list_head sched_works;
 	struct kref refcount;
 	struct work_struct put_work;
 	/*
@@ -1963,5 +2048,7 @@ int fastrpc_init_privileged_gids(struct device *dev, char *prop_name, struct gid
 int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx, bool is_pdr);
 int fastrpc_setup_service_locator(struct fastrpc_channel_ctx *cctx, char *client_name,
 				char *service_name, char *service_path, int spd_session);
+int fastrpc_npu_post_workinfo(struct fastrpc_channel_ctx *cctx,
+			      struct npu_work_info *info);
 
 #endif /* __FASTRPC_SHARED_H__ */

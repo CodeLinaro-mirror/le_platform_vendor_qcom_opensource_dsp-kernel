@@ -14,6 +14,7 @@
 #include "../include/uapi/misc/fastrpc.h"
 #include <linux/of_reserved_mem.h>
 #include "fastrpc_shared.h"
+#include "fastrpc_scheduler.h"
 #include <linux/soc/qcom/pdr.h>
 #include <linux/delay.h>
 #include <linux/remoteproc.h>
@@ -38,36 +39,27 @@ static void fastrpc_handle_ssr_request(struct work_struct *work)
 		container_of(work, struct fastrpc_ssr_handler, ssr_work);
 	void *rphandle = ssr_handler->rphandle;
 
-	struct rproc *rproc = (struct rproc *)rphandle;
-	if (!rphandle || !rproc) {
+	if (!rphandle) {
 		pr_err("Error: %s: invalid rproc handle for domain %d\n",
 			__func__, ssr_handler->domain_id);
 		goto bail;
 	}
 
-	if (rproc->recovery_disabled) {
-		/* If recovery disabled, use rproc_shutdown/rproc_boot to trigger dsp ssr. No elf file dumped. */
-		pr_info("%s : SSR started with recovery disabled \n", __func__);
-		/* Shut down DSP */
-		rc = rproc_shutdown(rphandle);
-		if (rc) {
-			pr_err("Error: %s: rproc_shutdown failed with rc %d and rphandle %pK\n",
-				__func__, rc, rphandle);
-			goto bail;
-		}
-		/* Reboot DSP */
-		rc = rproc_boot(rphandle);
-		if (rc) {
-		 	pr_err("Error: %s: rproc_boot failed with rc %d and rphandle %pK\n",
-		 		__func__, rc, rphandle);
-		 	goto bail;
-		}
-	} else {
-		/* If recovery enabled, use rproc_report_crash to trigger dsp ssr and dump elf file */
-		pr_info("%s : SSR started with recovery enabled \n", __func__);
-		rproc_report_crash(rphandle, RPROC_WATCHDOG);
+	/* Shut down DSP */
+	rc = rproc_shutdown(rphandle);
+	if (rc) {
+		pr_err("Error: %s: rproc_shutdown failed with rc %d and rphandle %pK\n",
+			__func__, rc, rphandle);
+		goto bail;
 	}
 
+	/* Reboot DSP */
+	rc = rproc_boot(rphandle);
+	if (rc) {
+		pr_err("Error: %s: rproc_boot failed with rc %d and rphandle %pK\n",
+			__func__, rc, rphandle);
+		goto bail;
+	}
 	pr_info("%s : SSR completed successfully", __func__);
 
 bail:
@@ -393,9 +385,18 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	init_completion(&data->ssr_complete);
 	init_completion(&data->rpmsg_remove_start);
 	init_waitqueue_head(&data->ssr_wait_queue);
+
+	/* Initialise the NPU workinfo semaphore for all domain types so that
+	 * fastrpc_rpmsg_remove() can call up() unconditionally without risking
+	 * undefined behaviour on non-NSP channels.
+	 */
+	sema_init(&data->npu_workinfo_sem, 0);
 #if FRPC_RING_BUFFER_ENABLED
 	init_waitqueue_head(&data->log.wq);
 #endif
+	err = fastrpc_scheduler_init(&data->scheduler);
+	if (err)
+		goto free_data;
 	data->domain_id = domain->id;
 	data->max_sess_per_proc = FASTRPC_MAX_SESSIONS_PER_PROCESS;
 	data->rpdev = rpdev;
@@ -460,6 +461,7 @@ fdev_error:
 populate_error:
 	if (data->fdevice)
 		misc_deregister(&data->fdevice->miscdev);
+	fastrpc_scheduler_deinit(&data->scheduler);
 
 free_data:
 	kvfree(data);
@@ -480,6 +482,8 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	struct fastrpc_channel_ctx *cctx = dev_get_drvdata(&rpdev->dev);
 	struct fastrpc_domain *domain = cctx->domain;
 	struct fastrpc_user *user, *n;
+	struct npu_app_prio_table *prio_tbl;
+	struct npu_workinfo_node *node, *next;
 	unsigned long flags;
 	int i = 0, err;
 	struct list_head active_users_list;
@@ -493,6 +497,25 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	domain->status = DSP_STATUS_DOWN;
 	spin_unlock_irqrestore(&cctx->lock, flags);
 
+	/*
+	 * Unblock any ioctl threads blocked in fastrpc_work_add() waiting
+	 * for scheduler admission.  Those threads hold invoke_cnt, so
+	 * without this the invoke_cnt wait below would deadlock: the ioctl
+	 * thread waits for the completion that only the scheduler kthread
+	 * signals, but the kthread is stopped here.
+	 * abort_all() runs after teardown=1 so that the IOCTL gate rejects
+	 * new work before the kthread stops; any in-flight work_add that
+	 * passed the gate is caught by abort_all()'s incoming_list scan
+	 * (protected by sched->lock, which serializes with work_add's enqueue).
+	 * fastrpc_work_add() also checks sched->stop under sched->lock as a
+	 * defense-in-depth for the narrow race between the gate check and enqueue.
+	 */
+	fastrpc_scheduler_abort_all(&cctx->scheduler);
+
+	/* Unblock any thread sleeping in fastrpc_npu_workinfo_drain_queue()
+	 * so it sees teardown=1 and returns -EPIPE.
+	 */
+	up(&cctx->npu_workinfo_sem);
 	/* Notify userspace about domain DOWN event */
 	fastrpc_sysfs_notify_domain_event();
 
@@ -569,8 +592,14 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	 * channel to avoid any UAF later.
 	 */
 	list_for_each_entry(user, &cctx->users, user) {
- 		fastrpc_free_user(user);
- 	}
+		fastrpc_free_user(user);
+	}
+
+	/*
+	 * Stop the scheduler kthread eagerly here, before the channel
+	 * context reference is dropped.
+	 */
+	fastrpc_scheduler_deinit(&cctx->scheduler);
 
 	mutex_lock(&cctx->wake_mutex);
 	if (cctx->wake_source) {
@@ -585,6 +614,45 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 
 	dev_info(cctx->dev, "Closing rpmsg channel for %s", cctx->domain->name);
 	kfree(cctx->gidlist.gids);
+
+	/*
+	 * Free the NPU priority table on SSR so stale priorities do not
+	 * persist when the DSP restarts. NULL the pointer under cctx->lock
+	 * first so any concurrent fastrpc_npu_app_prio_set that has not yet
+	 * acquired the lock will see NULL and return -ENODEV safely.
+	 * entries and the table struct are freed outside the lock to avoid
+	 * holding the spinlock across kfree.
+	 */
+	spin_lock_irqsave(&cctx->lock, flags);
+	prio_tbl = cctx->npu_app_prio;
+	cctx->npu_app_prio = NULL;
+	spin_unlock_irqrestore(&cctx->lock, flags);
+	if (prio_tbl) {
+		kfree(prio_tbl->entries);
+		kfree(prio_tbl);
+	}
+
+	/* Drain and destroy NPU workinfo notification queue */
+
+	/* Detach the entire queue under cctx->lock so no producer
+	 * can enqueue while we are draining.
+	 */
+	spin_lock_irqsave(&cctx->lock, flags);
+	node = cctx->npu_workinfo_head;
+	cctx->npu_workinfo_head = NULL;
+	cctx->npu_workinfo_tail = NULL;
+	cctx->npu_workinfo_queue_len = 0;
+	spin_unlock_irqrestore(&cctx->lock, flags);
+
+	/* Free every remaining node and its dynamically allocated fields. */
+	while (node) {
+		next = node->next;
+		kfree((void *)(uintptr_t)node->info.group_id);
+		kfree((void *)(uintptr_t)node->info.debug_feature_id);
+		kfree(node);
+		node = next;
+	}
+
 	of_platform_depopulate(&rpdev->dev);
 	fastrpc_mmap_remove_ssr(cctx, false);
 	cctx->dev = NULL;

@@ -178,7 +178,7 @@ struct fastrpc_enhanced_invoke {
 	__u64 perf_kernel;
 	__u64 perf_dsp;
 	__u32 priority;
-	__u32 appid;
+	__s32 appid;
 	__u32 reserved[18];
 };
 
@@ -496,7 +496,7 @@ struct fastrpc_ioctl_remote_work {
 	/* Job priority (START only) */
 	__u32 priority;
 	/* Application or process ID */
-	__u32 appid;
+	__s32 appid;
 	/* remote_job_type */
 	__u32 type;
 	/* remote_job_status_type START or END */

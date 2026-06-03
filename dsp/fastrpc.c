@@ -4402,6 +4402,13 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 		mem_thread = dsp_attributes[FIRMWARE_MEM_THREAD];
 		threads = dsp_attributes[MAX_THREAD_COUNT_PROTECTION_DOMAIN];
 
+		/* Raise donation floor to client-requested count if higher than
+		 * DSP default; set via FASTRPC_INVOKE_SESSIONINFO V2 before PROC_CREATE.
+		 * fl->max_threads is 0 if V2 was never called.
+		 */
+		if (fl->max_threads > threads)
+			threads = fl->max_threads;
+
 		if (compute > 0 && tg > 0 && compute > (U64_MAX / tg)) {
 			dev_err(fl->cctx->dev,
 				"Error: %s: Overflow in compute_size: compute=%u tg=%u\n",
@@ -5013,6 +5020,7 @@ static int fastrpc_user_obj_create(struct file *filp,
 	fl->dsp_recovery = false;
 	fl->logger_exit = false;
 	fl->is_faulted = false;
+	fl->max_threads = 0;
 
 	if (filp) {
 		fl->tgid = fl->tgid_app = current->tgid;
@@ -6015,6 +6023,40 @@ static int fastrpc_set_session_info(
 	fl->multi_session_support = true;
 
 	return 0;
+}
+
+/*
+ * fastrpc_set_session_info_v2() - V2 session info handler.
+ * Validates reserved fields and max_threads bound, then delegates
+ * to fastrpc_set_session_info() for common session setup.
+ * Sets fl->max_threads for donation sizing in fastrpc_init_create_process().
+ * fastrpc_internal_sessinfo_v2 is a superset of fastrpc_internal_sessinfo
+ * with identical field layout for the first four members, so a direct
+ * cast is safe.
+ */
+static int fastrpc_set_session_info_v2(struct fastrpc_user *fl,
+		struct fastrpc_internal_sessinfo_v2 *s)
+{
+	int ii, err = 0;
+
+	for (ii = 0; ii < ARRAY_SIZE(s->reserved); ii++) {
+		if (s->reserved[ii]) {
+			dev_err(fl->cctx->dev,
+				"Error: %s: reserved[%d]=%u must be 0\n",
+				__func__, ii, s->reserved[ii]);
+			return -EINVAL;
+		}
+	}
+	if (s->max_threads > FASTRPC_MAX_THREADS_PER_PD) {
+		dev_err(fl->cctx->dev,
+			"Error: %s: max_threads %u exceeds limit %u\n",
+			__func__, s->max_threads, FASTRPC_MAX_THREADS_PER_PD);
+		return -EINVAL;
+	}
+	err = fastrpc_set_session_info(fl, (struct fastrpc_internal_sessinfo *)s);
+	if (!err && s->max_threads)
+		fl->max_threads = s->max_threads;
+	return err;
 }
 
 /* Get fastrpc tgid of given session on given domain */
@@ -7617,6 +7659,7 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 	struct fastrpc_internal_notif_rsp notif;
 	struct fastrpc_internal_config config = {0};
 	struct fastrpc_internal_sessinfo sessinfo;
+	struct fastrpc_internal_sessinfo_v2 sessinfo_v2 = {0};
 	struct fastrpc_ioctl_mdctx_manage ctxm = {0};
 	struct fastrpc_ioctl_remote_proc_state_dump proc = {0};
 	struct fastrpc_internal_proc_timeout rpc = {0};
@@ -7693,10 +7736,23 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 		fl->config.root_size = config.root_size;
 		break;
 	case FASTRPC_INVOKE_SESSIONINFO:
-		if(copy_from_user(&sessinfo,(void __user *)(uintptr_t)invoke.invparam,
-			sizeof(struct fastrpc_internal_sessinfo)))
-			return -EFAULT;
-		err = fastrpc_set_session_info(fl, &sessinfo);
+		/* V2: invoke.size == sizeof(fastrpc_internal_sessinfo_v2) carries max_threads */
+		if (invoke.size == sizeof(struct fastrpc_internal_sessinfo_v2)) {
+			if (copy_from_user(&sessinfo_v2,
+					(void __user *)(uintptr_t)invoke.invparam,
+					sizeof(sessinfo_v2)))
+				return -EFAULT;
+			err = fastrpc_set_session_info_v2(fl, &sessinfo_v2);
+		} else {
+		/* V1: legacy path, max_threads not carried */
+			if (invoke.size < sizeof(struct fastrpc_internal_sessinfo))
+				return -EINVAL;
+			if (copy_from_user(&sessinfo,
+					(void __user *)(uintptr_t)invoke.invparam,
+					sizeof(struct fastrpc_internal_sessinfo)))
+				return -EFAULT;
+			err = fastrpc_set_session_info(fl, &sessinfo);
+		}
 		break;
 	case FASTRPC_INVOKE_MDCTX_MANAGE:
 		if (copy_from_user(&ctxm, (void __user *)(uintptr_t)invoke.invparam,

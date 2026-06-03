@@ -722,6 +722,9 @@ enum fastrpc_internal_attributes {
 	KERNEL_TSTACK_FLAG_SUPPORT  = 259 + DSP_ATTR_OFFSET,
 };
 
+/* Hardware ceiling for threads per PD; distinct from the DSP default baseline. */
+#define FASTRPC_MAX_THREADS_PER_PD  256
+
 enum fastrpc_remote_domains_id {
 	SECURE_PD = 0,
 	GUEST_OS = 1,
@@ -1549,6 +1552,16 @@ struct fastrpc_internal_sessinfo {
 	uint32_t sharedcb;   /* Unused, Session can share context bank with other sessions */
 };
 
+/* V2: same as V1 + max_threads for per-PD donation sizing + reserved slots */
+struct fastrpc_internal_sessinfo_v2 {
+	uint32_t domain_id;
+	uint32_t session_id;
+	uint32_t pd;
+	uint32_t sharedcb;
+	uint32_t max_threads; /* Per-PD thread count for RTOS donation sizing */
+	uint32_t reserved[12]; /* Reserved for future parameters; must be zero */
+};
+
 struct fastrpc_notif_queue {
 	/* Number of pending status notifications in queue */
 	atomic_t notif_queue_count;
@@ -1691,6 +1704,8 @@ struct fastrpc_user {
 	struct fastrpc_notif_queue proc_state_notif;
 	struct list_head notif_queue;
 	struct fastrpc_internal_config config;
+	/* Max thread count requested from user space. 0 means unset. */
+	u32 max_threads;
 	bool multi_session_support;
 	bool untrusted_process;
 	bool set_session_info;

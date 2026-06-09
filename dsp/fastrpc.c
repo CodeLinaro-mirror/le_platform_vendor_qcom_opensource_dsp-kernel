@@ -53,6 +53,7 @@ struct fastrpc_common {
 
 /* Global fastrpc driver object */
 struct fastrpc_common g_frpc;
+static void fastrpc_user_obj_free(struct fastrpc_user *fl);
 
 static inline int64_t getnstimediff(struct timespec64 *start)
 {
@@ -2633,10 +2634,15 @@ static int fastrpc_debugfs_show(struct seq_file *s_file, void *data)
 	struct fastrpc_pool_ctx *sctx = NULL;
 	struct fastrpc_invoke_ctx *ictx, *m;
 	struct fastrpc_buf *buf, *n;
-	int i;
+	int i, ret;
 	unsigned long irq_flags = 0;
 
 	if (fl != NULL) {
+		ret = fastrpc_file_get(fl);
+		if (ret) {
+			/* User object being released as ref-count is already 0 */
+			return 0;
+		}
 		seq_printf(s_file,"%s %12s %d\n", "tgid", ":", fl->tgid);
 		seq_printf(s_file,"%s %7s %d\n", "tgid_frpc", ":", fl->tgid_frpc);
 		seq_printf(s_file,"%s %3s %d\n", "is_secure_dev", ":", fl->is_secure_dev);
@@ -2648,8 +2654,10 @@ static int fastrpc_debugfs_show(struct seq_file *s_file, void *data)
 		seq_printf(s_file,"%s %9s %d\n", "pd_type", ":", fl->pd_type);
 		seq_printf(s_file,"%s %9s %d\n",  "profile", ":", fl->profile);
 
-                if(!fl->cctx)
+                if(!fl->cctx) {
+                   fastrpc_file_put(fl, false);
                    return 0;
+                }
 
                 seq_printf(s_file,"\n=============== Channel Context ===============\n");
 		ctx = fl->cctx;
@@ -2723,6 +2731,7 @@ static int fastrpc_debugfs_show(struct seq_file *s_file, void *data)
 				print_ictx_info(s_file, ictx);
 		}
 		spin_unlock(&fl->lock);
+		fastrpc_file_put(fl, false);
 	}
 	return 0;
 }
@@ -3394,9 +3403,85 @@ void fastrpc_free_user(struct fastrpc_user *fl)
 	return;
 }
 
-static int fastrpc_device_release(struct inode *inode, struct file *file)
+/*
+ * File kref destructor function that will be invoked when the file
+ *  kref is zero
+ *
+ * This functions cleans up the user-object of the app.
+ */
+static void fastrpc_user_release(struct kref *ref)
 {
-	struct fastrpc_user *fl = (struct fastrpc_user *)file->private_data;
+	struct fastrpc_user *fl = container_of(ref, struct fastrpc_user, refcount);
+
+	fastrpc_user_obj_free(fl);
+}
+
+
+int fastrpc_file_get(struct fastrpc_user *fl)
+{
+	return kref_get_unless_zero(&fl->refcount) ? 0 : -ENOENT;
+}
+
+void fastrpc_file_put(struct fastrpc_user *fl, bool worker)
+{
+	if (worker) {
+		struct kref *kref = &fl->refcount;
+		u32 old, new_val, val = atomic_read(&kref->refcount.refs);
+
+		/*
+		 * Schedule the job to a worker thread if the user-object
+		 * reference count is 1; otherwise, simply decrease the
+		 * refcount.
+		 */
+		if (val > 1 && likely(val != UINT_MAX)) {
+			for (;;) {
+				new_val = val - 1;
+
+				if (val == 1)
+					goto schedule_work;
+
+				old = atomic_cmpxchg_release(&kref->refcount.refs, val, new_val);
+				if (old == val)
+					break;
+				val = old;
+			}
+		} else if (val == 1) {
+			goto schedule_work;
+		}
+	} else {
+		kref_put(&fl->refcount, fastrpc_user_release);
+	}
+	return;
+schedule_work:
+	/*
+	 * In case the reference count is 1 for the user-object,
+	 * its release function cannot be called in an interrupt context.
+	 * So schedule the job to a worker thread.
+	 */
+	schedule_work(&fl->put_work);
+}
+
+static void fastrpc_file_put_worker(struct work_struct *work)
+{
+	struct fastrpc_user *fl =
+		container_of(work, struct fastrpc_user, put_work);
+
+	fastrpc_file_put(fl, false);
+}
+
+/*
+ * Free fastrpc user object of client
+ *
+ * @arg1 : fastrpc_user object to be freed
+ *
+ * This function deletes a fastrpc user object when a user-app closes
+ * the fastrpc device node. It is invoked via the kref destructor when
+ * the last reference to the user object is dropped, ensuring all
+ * concurrent accessors (signal handler, notification handler, debugfs)
+ * have finished before teardown begins.
+ */
+static void fastrpc_user_obj_free(struct fastrpc_user *fl)
+{
 	struct fastrpc_channel_ctx *cctx = fl->cctx;
 	struct fastrpc_driver *frpc_drv, *d;
 	struct fastrpc_buf *buf, *b;
@@ -3543,8 +3628,20 @@ static int fastrpc_device_release(struct inode *inode, struct file *file)
 	fastrpc_channel_update_invoke_cnt(cctx, false);
 	spin_unlock_irqrestore(&cctx->lock, flags);
 	fastrpc_channel_ctx_put(cctx);
-	file->private_data = NULL;
 	spin_unlock_irqrestore(glock, irq_flags);
+}
+
+/*
+ * Callback function invoked when user-app closes the fastrpc device node.
+ * Drops the initial reference on the fastrpc_user object; when the count
+ * reaches zero fastrpc_user_release() performs the full cleanup.
+ */
+static int fastrpc_device_release(struct inode *inode, struct file *file)
+{
+	struct fastrpc_user *fl = (struct fastrpc_user *)file->private_data;
+
+	fastrpc_file_put(fl, false);
+	file->private_data = NULL;
 	return 0;
 }
 
@@ -3586,6 +3683,8 @@ static int fastrpc_device_open(struct inode *inode, struct file *filp)
 	init_waitqueue_head(&fl->proc_state_notif.notif_wait_queue);
 	spin_lock_init(&fl->proc_state_notif.nqlock);
 	init_completion(&fl->dma_invoke);
+	kref_init(&fl->refcount);
+	INIT_WORK(&fl->put_work, fastrpc_file_put_worker);
 
 	fl->cctx = cctx;
 	fl->tgid = current->tgid;
@@ -3807,10 +3906,17 @@ static void fastrpc_notif_find_process(int domain, struct fastrpc_channel_ctx *c
 	bool is_process_found = false;
 	unsigned long irq_flags = 0;
 	struct fastrpc_user *user;
+	int err;
 
 	spin_lock_irqsave(&cctx->lock, irq_flags);
 	list_for_each_entry(user, &cctx->users, user) {
 		if (user->tgid_frpc == notif->pid) {
+			err = fastrpc_file_get(user);
+			if (err) {
+				dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
+					__func__, user);
+				break;
+			}
 			is_process_found = true;
 			break;
 		}
@@ -3820,6 +3926,7 @@ static void fastrpc_notif_find_process(int domain, struct fastrpc_channel_ctx *c
 	if (!is_process_found)
 		return;
 	fastrpc_queue_pd_status(user, domain, notif->status, user->sessionid);
+	fastrpc_file_put(user, true);
 }
 
 static int fastrpc_wait_on_notif_queue(
@@ -6169,13 +6276,20 @@ static void fastrpc_handle_signal_rpmsg(uint64_t msg, struct fastrpc_channel_ctx
 	struct fastrpc_user *fl ;
 	unsigned long irq_flags = 0;
 	bool process_found = false;
+	int err;
 
 	if (signal_id >=FASTRPC_DSPSIGNAL_NUM_SIGNALS)
 		return;
 
 	spin_lock_irqsave(&cctx->lock, irq_flags);
 	list_for_each_entry(fl, &cctx->users, user) {
-		if (fl->tgid_frpc == pid && atomic_read(&fl->state) < DSP_EXIT_START) {
+		if (fl->tgid_frpc == pid) {
+			err = fastrpc_file_get(fl);
+			if (err) {
+				dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
+					__func__, fl);
+				break;
+			}
 			process_found = true;
 			break;
 		}
@@ -6208,6 +6322,7 @@ static void fastrpc_handle_signal_rpmsg(uint64_t msg, struct fastrpc_channel_ctx
 				signal_id, pid);
 	}
 	spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
+	fastrpc_file_put(fl, true);
 }
 
 int fastrpc_handle_rpc_response(struct fastrpc_channel_ctx *cctx, void *data, int len)

@@ -304,7 +304,7 @@
 
 /* Default root heap buffer size and count */
 #define FASTRPC_DEFAULT_ROOTHEAP_BUF_SIZE (0x140000)
-#define FASTRPC_DEFAULT_ROOTHEAP_BUF_COUNT (3)
+#define FASTRPC_DEFAULT_ROOTHEAP_BUF_COUNT (4)
 
 /* Default buffer size for preload memory */
 #define FASTRPC_DEFAULT_PRELOAD_BUF_SIZE (0x500000)

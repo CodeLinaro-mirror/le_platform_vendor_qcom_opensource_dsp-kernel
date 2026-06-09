@@ -52,3 +52,7 @@ define_modules("bengal", "consolidate", "no")
 define_modules("bengal", "gki", "no")
 
 define_modules("bengal", "perf", "no")
+
+define_modules("bengal-le", "debug-defconfig", "no")
+
+define_modules("bengal-le", "defconfig", "no")

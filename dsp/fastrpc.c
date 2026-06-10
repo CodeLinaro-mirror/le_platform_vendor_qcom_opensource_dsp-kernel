@@ -2737,7 +2737,7 @@ static int fastrpc_internal_invoke(struct fastrpc_user *fl,  u32 kernel,
 	 * active admitted job in the scheduler executing list.  Static handles
 	 * (<= FASTRPC_MAX_STATIC_HANDLE) and kernel-initiated calls are exempt.
 	 */
-	if (!kernel && user_appid && fl->untrusted_process &&
+	if (!kernel && user_appid > 0 && fl->untrusted_process &&
 		handle > FASTRPC_MAX_STATIC_HANDLE) {
 		if (!fastrpc_scheduler_handle_is_executing(
 				&fl->cctx->scheduler, fl, (u64)handle)) {

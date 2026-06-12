@@ -4357,8 +4357,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	/* Process spawn should not fail if unable to pack root buffer */
 	fastrpc_pack_root_sharedpage(fl, pages, &inbuf.pageslen);
 
-	memlen = ALIGN(max(INIT_FILELEN_MAX, (int)init.filelen * 4),
-		       1024 * 1024);
+	memlen = INIT_MEMLEN_MAX;
 
 	err = fastrpc_smmu_buf_alloc(fl, memlen, INITMEM_BUF, &imem);
 	if (err)

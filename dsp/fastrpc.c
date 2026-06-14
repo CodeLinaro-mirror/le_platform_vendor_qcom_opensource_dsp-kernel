@@ -618,6 +618,7 @@ static int fastrpc_map_lookup(struct fastrpc_user *fl, int fd,
 		(retained_map && (kref_read(&map->refcount) != 0))) {
 		found = NULL;
 		ret = -EBADFD;
+		goto bail;
 	}
 
 	/*
@@ -4888,7 +4889,7 @@ static int fastrpc_init_attach(struct fastrpc_user *fl, int pd)
 
 static int fastrpc_invoke(struct fastrpc_user *fl, char __user *argp)
 {
-	struct fastrpc_enhanced_invoke ioctl;
+	struct fastrpc_enhanced_invoke ioctl = {0};
 	struct fastrpc_invoke inv;
 	int err;
 
@@ -5707,6 +5708,8 @@ bail:
 		kfree(mdctx->tgids_frpc);
 		kfree(mdctx->session_ids);
 		kfree(mdctx->domains);
+		kfree(mdctx->phy_ids);
+		kfree(mdctx->instance_ids);
 		kfree(mdctx);
 	}
 	mutex_unlock(gmut);
@@ -5751,6 +5754,8 @@ static int fastrpc_multidomain_ctx_cleanup(struct fastrpc_user *fl,
 	kfree(mdctx->tgids_frpc);
 	kfree(mdctx->session_ids);
 	kfree(mdctx->domains);
+	kfree(mdctx->phy_ids);
+	kfree(mdctx->instance_ids);
 	kfree(mdctx);
 bail:
 	mutex_unlock(gmut);
@@ -5929,7 +5934,8 @@ int fastrpc_dspsignal_wait(struct fastrpc_user *fl,
 			     struct fastrpc_internal_dspsignal *fsig)
 {
 	int err = 0;
-	unsigned long timeout = usecs_to_jiffies(fsig->timeout_usec);
+	uint32_t timeout_usec = fsig->timeout_usec;
+	unsigned long timeout = usecs_to_jiffies(timeout_usec);
 	u32 signal_id = fsig->signal_id;
 	struct fastrpc_dspsignal *s = NULL;
 	long ret = 0;
@@ -5968,14 +5974,15 @@ int fastrpc_dspsignal_wait(struct fastrpc_user *fl,
 	}
 	spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
 	trace_fastrpc_dspsignal("wait", signal_id, s->state, fsig->timeout_usec);
-	if (timeout != 0xffffffff)
+	if (timeout_usec != FASTRPC_DSPSIGNAL_TIMEOUT_NONE)
 		ret = wait_for_completion_interruptible_timeout(&s->comp, timeout);
 	else
 		ret = wait_for_completion_interruptible(&s->comp);
 	trace_fastrpc_dspsignal("wakeup", signal_id, s->state, fsig->timeout_usec);
 
-	if (ret == 0) {
-		dev_dbg(fl->cctx->dev, "Wait for signal %u timed out\n", signal_id);
+	if (timeout_usec != FASTRPC_DSPSIGNAL_TIMEOUT_NONE && ret == 0) {
+		dev_dbg(fl->cctx->dev, "Wait for signal %u timed out %u us\n",
+				signal_id, timeout_usec);
 		return -ETIMEDOUT;
 	} else if (ret < 0) {
 		dev_err(fl->cctx->dev, "Wait for signal %u failed %d\n", signal_id, (int)ret);
@@ -6219,12 +6226,12 @@ bail:
 
 static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 {
-	struct fastrpc_enhanced_invoke inv2 ;
+	struct fastrpc_enhanced_invoke inv2 = {0};
 	struct fastrpc_ioctl_multimode_invoke invoke;
 	struct fastrpc_internal_control cp = {0};
 	struct fastrpc_internal_dspsignal *fsig = NULL;
 	struct fastrpc_internal_notif_rsp notif;
-	struct fastrpc_internal_config config;
+	struct fastrpc_internal_config config = {0};
 	struct fastrpc_internal_sessinfo sessinfo;
 	struct fastrpc_ioctl_mdctx_manage ctxm = {0};
 	struct fastrpc_ioctl_remote_proc_state_dump proc = {0};

@@ -8,6 +8,7 @@ load(
     "ddk_module",
     "kernel_module",
     "kernel_modules_install",
+    "kernel_unstripped_modules_archive",
 )
 
 def define_modules(target, variant):
@@ -40,13 +41,13 @@ def define_modules(target, variant):
             "dsp/fastrpc_rpmsg.c",
             "dsp/fastrpc_shared.h",
             "dsp/fastrpc_trace.h",
-            "dsp/fastrpc_sysfs.c"
+            "dsp/fastrpc_sysfs.c",
         ],
         local_defines = ["DSP_TRACE_INCLUDE_PATH={}".format(trace_include_path)],
         out = "frpc-adsprpc.ko",
         hdrs = [
             "include/uapi/misc/fastrpc.h",
-            "include/linux/fastrpc.h"
+            "include/linux/fastrpc.h",
         ],
         includes = [
             "include/linux",
@@ -96,16 +97,16 @@ def define_vm_modules(target, variant):
             "dsp/fastrpc_socket.c",
             "dsp/fastrpc_shared.h",
             "dsp/fastrpc_trace.h",
-            "dsp/fastrpc_sysfs.c"
+            "dsp/fastrpc_sysfs.c",
         ],
         local_defines = [
             "DSP_TRACE_INCLUDE_PATH={}".format(trace_include_path),
-            "CONFIG_QCOM_FASTRPC_TRUSTED=1"
+            "CONFIG_QCOM_FASTRPC_TRUSTED=1",
         ],
         out = "frpc-trusted-adsprpc.ko",
         hdrs = [
             "include/uapi/misc/fastrpc.h",
-            "include/linux/fastrpc.h"
+            "include/linux/fastrpc.h",
         ],
         includes = [
             "include/linux",
@@ -113,10 +114,17 @@ def define_vm_modules(target, variant):
         ],
     )
 
+    kernel_unstripped_modules_archive(
+        name = "{}_fastrpc_unstripped_modules_tar".format(kernel_build_variant),
+        kernel_build = kernel_build,
+        kernel_modules = [":{}_frpc-trusted-adsprpc".format(kernel_build_variant)],
+    )
+
     copy_to_dist_dir(
         name = "{}_dsp-kernel_dist".format(kernel_build_variant),
         data = [
             ":{}_frpc-trusted-adsprpc".format(kernel_build_variant),
+            ":{}_fastrpc_unstripped_modules_tar".format(kernel_build_variant),
         ],
         dist_dir = "out/target/product/{}/dlkm/lib/modules/".format(target),
         flat = True,

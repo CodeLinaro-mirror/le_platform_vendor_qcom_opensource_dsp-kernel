@@ -26,6 +26,15 @@
 #include "../include/uapi/misc/fastrpc.h"
 #include "fastrpc_timeline.h"
 
+/* To check if config flag was present indicating discrete NSPs in system */
+#ifdef CONFIG_FASTRPC_QNA
+#include <linux/qna.h>
+#endif
+
+/* Alignment constants shared between dsp-kernel and qna-kernel */
+#define FASTRPC_MEM_ALIGN_4K    (4096)
+#define FASTRPC_MEM_ALIGN_1M    (1024 * 1024)
+
 #if (KERNEL_VERSION(6, 3, 0) <= LINUX_VERSION_CODE)
 #include <linux/cpu.h>
 #include <linux/firmware/qcom/qcom_scm.h>
@@ -1174,9 +1183,30 @@ struct fastrpc_map {
 	struct kref refcount;
 	int secure;
 	atomic_t state;
+	/*
+	 * Negative err set by map call if mem_map_to_dsp fails and
+	 * the dma_buf ref was never "transferred" into map->buf. Tells the
+	 * kref_release callback to skip dma_buf_put.
+	 */
+	int map_err;
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,16,0))
 	/* Retained IOVA address and size */
 	struct dma_iova_state iova_state;
+#endif
+	/*
+	 * Scatter-gather physical page list for discrete allocations.
+	 * NULL for regular SMMU-mapped buffers. Allocated
+	 * in fastrpc_discrete_map_create, freed in kref_release.
+	 */
+	struct fastrpc_phy_page *sg_pages;
+	unsigned int num_sg_pages;
+#ifdef CONFIG_FASTRPC_QNA
+	/*
+	 * Discrete allocation descriptor: address and size of each
+	 * scatter-gather block backing this map. Set in
+	 * fastrpc_discrete_map_create; NULL for regular SMMU-mapped buffers.
+	 */
+	struct qna_discrete_alloc *discrete_alloc;
 #endif
 };
 
@@ -1652,6 +1682,8 @@ enum fastrpc_process_state {
 struct fastrpc_user {
 	struct list_head user;
 	struct list_head maps;
+	/* List of discrete fd maps for this user session */
+	struct list_head discrete_maps;
 	struct list_head pending;
 	struct list_head interrupted;
 	struct list_head mmaps;

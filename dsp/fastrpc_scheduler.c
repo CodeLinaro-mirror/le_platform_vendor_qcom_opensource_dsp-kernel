@@ -34,7 +34,7 @@ static void fastrpc_workinfo_notify(struct fastrpc_scheduler *sched,
 	info.timestamp_ms	 = ktime_to_ms(ktime_get_real());
 	info.event		 = (u32)event;
 	info.reason		 = reason;
-	info.id			 = (s32)work->handle;
+	info.id			 = (s32)work->work_id;
 	info.uid		 = work->app_id;
 	info.debug_pid		 = work->app_id;
 	info.domain		 = cctx->domain_id;
@@ -79,6 +79,100 @@ static u32 fastrpc_npu_lookup_prio(struct fastrpc_channel_ctx *cctx,
 	}
 	spin_unlock_irqrestore(&cctx->lock, flags);
 	return prio;
+}
+
+/*
+ * Validate that the calling process (caller_uid) is allowed to submit
+ * work targeting a given appid, based on the NPU priority table
+ * configured by the AIDL scheduling service.
+ *
+ * Access rules enforced (see struct fastrpc_npu_app_prio_config):
+ *
+ *   0. appid < 0 (infrastructure sentinel):  always allowed.  Handles
+ *      opened without the _appid URI token carry appid -1; these bypass
+ *      the access gate entirely.
+ *
+ *   1. Table not populated:  always allowed.  Systems that have not
+ *      received an NPU_PRIORITY_WORKINFO ioctl from the AIDL service
+ *      operate without access control.
+ *
+ *   2. caller_uid not in table:  denied.  Only UIDs explicitly
+ *      registered by the scheduling service may submit work.  This
+ *      blocks new apps that lack an Android manifest permission entry.
+ *
+ *   3. caller_uid in table, appid == caller_uid:  allowed only if
+ *      has_direct_access is set.  Apps with a manifest change or AI
+ *      Core itself carry this flag; apps that rely on AI Core to proxy
+ *      their work do not, so they cannot submit work directly.
+ *
+ *   4. caller_uid in table, appid != caller_uid:  allowed only if
+ *      can_attribute_other_uid is set.  Only trusted proxies such as
+ *      AI Core carry this flag, enabling them to submit work attributed
+ *      to a client UID so that the correct per-client priority is used.
+ *
+ * Acquires cctx->lock for the table scan.  This function is called
+ * before sched->lock is taken in fastrpc_work_add(), so only cctx->lock
+ * is held — consistent with the lock ordering documented in
+ * fastrpc_npu_lookup_prio().
+ *
+ * Returns 0 if access is granted, -EACCES if denied.
+ */
+static int fastrpc_npu_check_access(struct fastrpc_channel_ctx *cctx,
+				    uid_t caller_uid, s32 appid)
+{
+	struct npu_app_prio_table *table = cctx->npu_app_prio;
+	unsigned long flags;
+	u32 i, has_direct_access = 0, can_attribute_other_uid = 0;
+	bool found = false;
+
+	/* Infrastructure/legacy sentinel (s32 = -1): always allowed */
+	if (appid < 0)
+		return 0;
+
+	/* Rule 2: no table yet means no access control */
+	if (!table || table->num_entries == 0) {
+		dev_dbg(cctx->dev, "%s: NPU priority table not populated, skipping access check\n",
+			__func__);
+		return 0;
+	}
+
+	spin_lock_irqsave(&cctx->lock, flags);
+	for (i = 0; i < table->num_entries; i++) {
+		if (table->entries[i].uid == caller_uid) {
+			has_direct_access = table->entries[i].has_direct_access;
+			can_attribute_other_uid =
+				table->entries[i].can_attribute_other_uid;
+			found = true;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&cctx->lock, flags);
+
+	/* Rule 3: caller not registered in the priority table */
+	if (!found) {
+		dev_err(cctx->dev, "%s: uid %u not in NPU priority table, rejecting appid %d\n",
+			__func__, caller_uid, appid);
+		return -EACCES;
+	}
+
+	if ((uid_t)appid == caller_uid) {
+		/* Rule 4: direct submission — requires has_direct_access */
+		if (!has_direct_access) {
+			dev_err(cctx->dev, "%s: uid %u lacks direct access (has_direct_access=0)\n",
+				__func__, caller_uid);
+			return -EACCES;
+		}
+	} else {
+		/* Rule 5: cross-uid attribution — requires can_attribute_other_uid */
+		if (!can_attribute_other_uid) {
+			dev_err(cctx->dev, "%s: uid %u cannot attribute work to appid %d"
+				" (can_attribute_other_uid=0)\n",
+				__func__, caller_uid, appid);
+			return -EACCES;
+		}
+	}
+
+	return 0;
 }
 
 /*
@@ -588,6 +682,16 @@ int fastrpc_work_add(struct fastrpc_user *fl,
 	char *feature_id = NULL;
 	u32 cap = 0;
 	int result = 0;
+	int err = 0;
+
+	/*
+	 * Gate: verify the caller is permitted to submit work for this
+	 * appid before allocating any resources.  See the access rules
+	 * documented above fastrpc_npu_check_access().
+	 */
+	err = fastrpc_npu_check_access(fl->cctx, fl->uid, work->appid);
+	if (err)
+		return err;
 
 	if (work->group_id && work->group_id_len > 0) {
 		if (work->group_id_len > NPU_MAX_WORKINFO_FIELD_LEN)
@@ -642,6 +746,7 @@ int fastrpc_work_add(struct fastrpc_user *fl,
 
 	wnode->group_id = group_id;
 	wnode->feature_id = feature_id;
+	wnode->work_id = (u32)atomic_fetch_add(1, &sched->workid_seq) & INT_MAX;
 	wnode->fl = fl;
 	atomic_set(&wnode->state, WORK_STATE_INCOMING);
 	/*
@@ -871,6 +976,7 @@ int fastrpc_scheduler_init(struct fastrpc_scheduler *sched)
 	spin_lock_init(&sched->lock);
 	init_waitqueue_head(&sched->wq);
 	sched->ref_prio = U32_MAX;
+	atomic_set(&sched->workid_seq, 0);
 	sched->prio_update_pending = false;
 	sched->stop = false;
 	sched->kthread = NULL;

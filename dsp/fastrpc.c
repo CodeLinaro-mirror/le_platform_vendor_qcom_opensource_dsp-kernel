@@ -2737,7 +2737,7 @@ static int fastrpc_internal_invoke(struct fastrpc_user *fl,  u32 kernel,
 	 * active admitted job in the scheduler executing list.  Static handles
 	 * (<= FASTRPC_MAX_STATIC_HANDLE) and kernel-initiated calls are exempt.
 	 */
-	if (!kernel && user_appid && fl->untrusted_process &&
+	if (!kernel && user_appid > 0 && fl->untrusted_process &&
 		handle > FASTRPC_MAX_STATIC_HANDLE) {
 		if (!fastrpc_scheduler_handle_is_executing(
 				&fl->cctx->scheduler, fl, (u64)handle)) {
@@ -3035,13 +3035,14 @@ static int fastrpc_remote_heap_unassign(struct fastrpc_channel_ctx *cctx, struct
 		if (err) {
 			dev_err(cctx->dev, "%s: Failed to assign memory with phys 0x%llx size 0x%llx err %d\n",
 				__func__, buf->phys, buf->size, err);
+			BUG_ON(1);
 			return err;
 		}
 	}
 	return 0;
 }
 
-int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx, bool is_pdr)
+int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx)
 {
 	struct fastrpc_buf *buf, *b, *match;
 	unsigned long flags;
@@ -3059,14 +3060,12 @@ int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx, bool is_pdr)
 		if (!match)
 			return 0;
 
-		if (is_pdr) {
-			err = fastrpc_remote_heap_unassign(cctx, match);
-			if (err) {
-				spin_lock_irqsave(&cctx->lock, flags);
-				list_add_tail(&match->node, &cctx->gmaps);
-				spin_unlock_irqrestore(&cctx->lock, flags);
-				return err;
-			}
+		err = fastrpc_remote_heap_unassign(cctx, match);
+		if (err) {
+			spin_lock_irqsave(&cctx->lock, flags);
+			list_add_tail(&match->node, &cctx->gmaps);
+			spin_unlock_irqrestore(&cctx->lock, flags);
+			return err;
 		}
 
 		__fastrpc_buf_free(match);
@@ -3582,7 +3581,7 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 		 * Remove any previous remote heap mappings in case process is trying
 		 * to reconnect after a PD restart on remote subsystem.
 		 */
-		err = fastrpc_mmap_remove_ssr(fl->cctx, true);
+		err = fastrpc_mmap_remove_ssr(fl->cctx);
 		if (err) {
 			pr_warn("%s: %s: failed to unmap remote heap (err %d)\n",
 				current->comm, __func__, err);
@@ -4358,8 +4357,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	/* Process spawn should not fail if unable to pack root buffer */
 	fastrpc_pack_root_sharedpage(fl, pages, &inbuf.pageslen);
 
-	memlen = ALIGN(max(INIT_FILELEN_MAX, (int)init.filelen * 4),
-		       1024 * 1024);
+	memlen = INIT_MEMLEN_MAX;
 
 	err = fastrpc_smmu_buf_alloc(fl, memlen, INITMEM_BUF, &imem);
 	if (err)
@@ -4402,6 +4400,13 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 		tg = dsp_attributes[HANDLE_PRIORITY_SUPPORT];
 		mem_thread = dsp_attributes[FIRMWARE_MEM_THREAD];
 		threads = dsp_attributes[MAX_THREAD_COUNT_PROTECTION_DOMAIN];
+
+		/* Raise donation floor to client-requested count if higher than
+		 * DSP default; set via FASTRPC_INVOKE_SESSIONINFO V2 before PROC_CREATE.
+		 * fl->max_threads is 0 if V2 was never called.
+		 */
+		if (fl->max_threads > threads)
+			threads = fl->max_threads;
 
 		if (compute > 0 && tg > 0 && compute > (U64_MAX / tg)) {
 			dev_err(fl->cctx->dev,
@@ -5014,6 +5019,7 @@ static int fastrpc_user_obj_create(struct file *filp,
 	fl->dsp_recovery = false;
 	fl->logger_exit = false;
 	fl->is_faulted = false;
+	fl->max_threads = 0;
 
 	if (filp) {
 		fl->tgid = fl->tgid_app = current->tgid;
@@ -5111,6 +5117,73 @@ int fastrpc_channel_default_user_create(struct fastrpc_channel_ctx *cctx)
 {
 	return fastrpc_user_obj_create(NULL, cctx);
 }
+
+/*
+ * fastrpc_send_kernel_dispatch() - Send kernel_dispatch cmd to DSP.
+ * Returns 0 or -errno.
+ */
+static int fastrpc_send_kernel_dispatch(
+	struct fastrpc_user *fl, u32 cmd_id,
+	const void *payload_in, size_t payload_in_size,
+	void *payload_out, size_t payload_out_size)
+{
+	struct fastrpc_invoke_args args[3] = { 0 };
+	struct fastrpc_enhanced_invoke ioctl = { 0 };
+	struct fastrpc_kcmd_req {
+		int pgid;
+		u32 cmd_id;
+		u32 payload_in_len;
+		u32 payload_out_len;
+	} inargs = { 0 };
+	int err;
+
+	inargs.pgid = fl->tgid_frpc;
+	inargs.cmd_id = cmd_id;
+	inargs.payload_in_len = (u32)payload_in_size;
+	inargs.payload_out_len = (u32)payload_out_size;
+
+	args[0].ptr = (u64)(uintptr_t)&inargs;
+	args[0].length = sizeof(inargs);
+	args[0].fd = -1;
+
+	args[1].ptr = (u64)(uintptr_t)payload_in;
+	args[1].length = payload_in_size;
+	args[1].fd = -1;
+
+	args[2].ptr = (u64)(uintptr_t)payload_out;
+	args[2].length = payload_out_size;
+	args[2].fd = -1;
+
+	ioctl.inv.handle = FASTRPC_INIT_HANDLE;
+	ioctl.inv.sc = FASTRPC_SCALARS(
+		FASTRPC_RMID_INIT_KERNEL_DISPATCH, 2, 1);
+	ioctl.inv.args = (__u64)args;
+
+	err = fastrpc_internal_invoke(fl, KERNEL_MSG_WITH_ZERO_PID,
+				&ioctl);
+	if (err)
+		dev_err(fl->cctx->dev, "%s: kernel dispatch failed, cmd %u err %d\n",
+			__func__, cmd_id, err);
+	return err;
+}
+
+
+int fastrpc_send_sys_unsigned_prio_config(struct fastrpc_channel_ctx *cctx)
+{
+	struct fastrpc_user *fl = cctx->kcomm_user.obj;
+	struct fastrpc_kcmd_prio_group_config req = {
+		.sys_unsigned_tg_enable = cctx->sys_unsigned_tg_enable ? 1 : 0,
+	};
+	int err;
+
+	if(!fl)
+		return 0;
+
+	err = fastrpc_send_kernel_dispatch(fl, FASTRPC_PRIO_GROUP_CONFIG,
+					   &req, sizeof(req), NULL, 0);
+	return err;
+}
+
 
 static int fastrpc_dmabuf_alloc(struct fastrpc_user *fl, char __user *argp)
 {
@@ -5384,7 +5457,7 @@ err_out:
 
 static int fastrpc_invoke(struct fastrpc_user *fl, char __user *argp)
 {
-	struct fastrpc_enhanced_invoke ioctl;
+	struct fastrpc_enhanced_invoke ioctl = {0};
 	struct fastrpc_invoke inv;
 	int err;
 
@@ -6018,6 +6091,40 @@ static int fastrpc_set_session_info(
 	return 0;
 }
 
+/*
+ * fastrpc_set_session_info_v2() - V2 session info handler.
+ * Validates reserved fields and max_threads bound, then delegates
+ * to fastrpc_set_session_info() for common session setup.
+ * Sets fl->max_threads for donation sizing in fastrpc_init_create_process().
+ * fastrpc_internal_sessinfo_v2 is a superset of fastrpc_internal_sessinfo
+ * with identical field layout for the first four members, so a direct
+ * cast is safe.
+ */
+static int fastrpc_set_session_info_v2(struct fastrpc_user *fl,
+		struct fastrpc_internal_sessinfo_v2 *s)
+{
+	int ii, err = 0;
+
+	for (ii = 0; ii < ARRAY_SIZE(s->reserved); ii++) {
+		if (s->reserved[ii]) {
+			dev_err(fl->cctx->dev,
+				"Error: %s: reserved[%d]=%u must be 0\n",
+				__func__, ii, s->reserved[ii]);
+			return -EINVAL;
+		}
+	}
+	if (s->max_threads > FASTRPC_MAX_THREADS_PER_PD) {
+		dev_err(fl->cctx->dev,
+			"Error: %s: max_threads %u exceeds limit %u\n",
+			__func__, s->max_threads, FASTRPC_MAX_THREADS_PER_PD);
+		return -EINVAL;
+	}
+	err = fastrpc_set_session_info(fl, (struct fastrpc_internal_sessinfo *)s);
+	if (!err && s->max_threads)
+		fl->max_threads = s->max_threads;
+	return err;
+}
+
 /* Get fastrpc tgid of given session on given domain */
 static int fastrpc_get_frpc_tgid(uint32_t domain, uint32_t session,
 	int32_t *tgid_frpc)
@@ -6505,6 +6612,8 @@ bail:
 		kfree(mdctx->tgids_frpc);
 		kfree(mdctx->session_ids);
 		kfree(mdctx->domains);
+		kfree(mdctx->phy_ids);
+		kfree(mdctx->instance_ids);
 		kfree(mdctx);
 	}
 	mutex_unlock(gmut);
@@ -6549,6 +6658,8 @@ static int fastrpc_multidomain_ctx_cleanup(struct fastrpc_user *fl,
 	kfree(mdctx->tgids_frpc);
 	kfree(mdctx->session_ids);
 	kfree(mdctx->domains);
+	kfree(mdctx->phy_ids);
+	kfree(mdctx->instance_ids);
 	kfree(mdctx);
 bail:
 	mutex_unlock(gmut);
@@ -6727,7 +6838,8 @@ static int fastrpc_dspsignal_wait(struct fastrpc_user *fl,
 			     struct fastrpc_internal_dspsignal *fsig)
 {
 	int err = 0;
-	unsigned long timeout = usecs_to_jiffies(fsig->timeout_usec);
+	uint32_t timeout_usec = fsig->timeout_usec;
+	unsigned long timeout = usecs_to_jiffies(timeout_usec);
 	u32 signal_id = fsig->signal_id;
 	struct fastrpc_dspsignal *s = NULL;
 	long ret = 0;
@@ -6761,14 +6873,15 @@ static int fastrpc_dspsignal_wait(struct fastrpc_user *fl,
 	}
 	spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
 	trace_fastrpc_dspsignal("wait", signal_id, s->state, fsig->timeout_usec);
-	if (timeout != 0xffffffff)
+	if (timeout_usec != FASTRPC_DSPSIGNAL_TIMEOUT_NONE)
 		ret = wait_for_completion_interruptible_timeout(&s->comp, timeout);
 	else
 		ret = wait_for_completion_interruptible(&s->comp);
 	trace_fastrpc_dspsignal("wakeup", signal_id, s->state, fsig->timeout_usec);
 
-	if (ret == 0) {
-		dev_dbg(fl->cctx->dev, "Wait for signal %u timed out\n", signal_id);
+	if (timeout_usec != FASTRPC_DSPSIGNAL_TIMEOUT_NONE && ret == 0) {
+		dev_dbg(fl->cctx->dev, "Wait for signal %u timed out %u us\n",
+				signal_id, timeout_usec);
 		return -ETIMEDOUT;
 	} else if (ret < 0) {
 		dev_err(fl->cctx->dev, "Wait for signal %u failed %d\n", signal_id, (int)ret);
@@ -7605,13 +7718,14 @@ static int fastrpc_npu_priority_workinfo(struct fastrpc_user *fl,
 
 static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 {
-	struct fastrpc_enhanced_invoke inv2 ;
+	struct fastrpc_enhanced_invoke inv2 = {0};
 	struct fastrpc_ioctl_multimode_invoke invoke;
 	struct fastrpc_internal_control cp = {0};
 	struct fastrpc_internal_dspsignal *fsig = NULL;
 	struct fastrpc_internal_notif_rsp notif;
-	struct fastrpc_internal_config config;
+	struct fastrpc_internal_config config = {0};
 	struct fastrpc_internal_sessinfo sessinfo;
+	struct fastrpc_internal_sessinfo_v2 sessinfo_v2 = {0};
 	struct fastrpc_ioctl_mdctx_manage ctxm = {0};
 	struct fastrpc_ioctl_remote_proc_state_dump proc = {0};
 	struct fastrpc_internal_proc_timeout rpc = {0};
@@ -7688,10 +7802,23 @@ static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 		fl->config.root_size = config.root_size;
 		break;
 	case FASTRPC_INVOKE_SESSIONINFO:
-		if(copy_from_user(&sessinfo,(void __user *)(uintptr_t)invoke.invparam,
-			sizeof(struct fastrpc_internal_sessinfo)))
-			return -EFAULT;
-		err = fastrpc_set_session_info(fl, &sessinfo);
+		/* V2: invoke.size == sizeof(fastrpc_internal_sessinfo_v2) carries max_threads */
+		if (invoke.size == sizeof(struct fastrpc_internal_sessinfo_v2)) {
+			if (copy_from_user(&sessinfo_v2,
+					(void __user *)(uintptr_t)invoke.invparam,
+					sizeof(sessinfo_v2)))
+				return -EFAULT;
+			err = fastrpc_set_session_info_v2(fl, &sessinfo_v2);
+		} else {
+		/* V1: legacy path, max_threads not carried */
+			if (invoke.size < sizeof(struct fastrpc_internal_sessinfo))
+				return -EINVAL;
+			if (copy_from_user(&sessinfo,
+					(void __user *)(uintptr_t)invoke.invparam,
+					sizeof(struct fastrpc_internal_sessinfo)))
+				return -EFAULT;
+			err = fastrpc_set_session_info(fl, &sessinfo);
+		}
 		break;
 	case FASTRPC_INVOKE_MDCTX_MANAGE:
 		if (copy_from_user(&ctxm, (void __user *)(uintptr_t)invoke.invparam,
@@ -7830,6 +7957,10 @@ static int fastrpc_get_info_from_kernel(struct fastrpc_ioctl_capability *cap,
 		kfree(dsp_attributes);
 		return err;
 	}
+
+	err = fastrpc_send_sys_unsigned_prio_config(cctx);
+	if(err)
+		dev_warn(cctx->dev, "Failed to send sys unsigned prio config err: %d\n", err);
 
 	spin_lock_irqsave(&cctx->lock, flags);
 	memcpy(cctx->dsp_attributes, dsp_attributes, FASTRPC_MAX_DSP_ATTRIBUTES_LEN);
@@ -9509,9 +9640,18 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 	struct fastrpc_dump_info *dinfo;
 	struct fastrpc_buf *buf, *b;
 	struct fastrpc_map *map;
+	unsigned long flags;
+	struct list_head lgmaps_list;
 
-	list_for_each_entry_safe(buf, b, &cctx->gmaps, node)
+	INIT_LIST_HEAD(&lgmaps_list);
+
+	spin_lock_irqsave(&cctx->lock, flags);
+	list_for_each_entry_safe(buf, b, &cctx->gmaps, node) {
 		total_size += buf->size;
+		list_del(&buf->node);
+		list_add_tail(&buf->node, &lgmaps_list);
+	}
+	spin_unlock_irqrestore(&cctx->lock, flags);
 
 	list_for_each_entry_safe(user, n, active_users_list, active_user_ssr) {
 		total_size += DBG_FS_SIZE;
@@ -9548,12 +9688,11 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 	pos += NUM_DUMPED * sizeof(struct fastrpc_dump_info);
 	offset += NUM_DUMPED * sizeof(struct fastrpc_dump_info);
 
-	list_for_each_entry_safe(buf, b, &cctx->gmaps, node) {
+	list_for_each_entry_safe(buf, b, &lgmaps_list, node) {
 		err = fastrpc_remote_heap_unassign(cctx, buf);
-		if (err) {
-			list_del(&buf->node);
+		list_del(&buf->node);
+		if (err)
 			continue;
-		}
 		if ((dump + total_size) - pos >= buf->size) {
 			memcpy(pos, buf->virt, buf->size);
 			populate_dump_metadata(&dinfo[iter], offset, buf->size,
@@ -9566,6 +9705,7 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 			err = -EFAULT;
 			goto bail;
 		}
+		__fastrpc_buf_free(buf);
 	}
 	scm_done = true;
 
@@ -9680,11 +9820,12 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx,
 	dev_coredumpv(dev, dump, total_size, GFP_KERNEL);
 bail:
 	if (!scm_done) {
-		list_for_each_entry_safe(buf, b, &cctx->gmaps, node) {
+		list_for_each_entry_safe(buf, b, &lgmaps_list, node) {
 			err = fastrpc_remote_heap_unassign(cctx, buf);
-			if (err) {
-				list_del(&buf->node);
-			}
+			list_del(&buf->node);
+			if (err)
+				continue;
+			__fastrpc_buf_free(buf);
 		}
 	}
 	if (err)

@@ -369,6 +369,9 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	err = of_property_read_u32(rdev->of_node, "qcom,rootheap-buffer-count",
 			&data->rootheap_buf_count);
 
+	/* sys_unsigned priority tier config — presence of property enables 12TG/3PG */
+	data->sys_unsigned_tg_enable =
+		of_property_read_bool(rdev->of_node, "qcom,sys-unsigned-tg-enable");
 	kref_init(&data->refcount);
 	dev_set_drvdata(&rpdev->dev, data);
 	rdev->dma_mask = &data->dma_mask;
@@ -420,11 +423,6 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 #endif
 	}
 
-	/* Configure device nodes for DSP */
-	err = fastrpc_configure_device_nodes(data, rdev);
-		if (err)
-			goto fdev_error;
-
 	/* Configure service locators for DSP */
 	err = fastrpc_configure_service_locator(data);
 		if (err)
@@ -437,6 +435,11 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	err = fastrpc_channel_default_user_create(data);
 	if (err)
 		goto fdev_error;
+
+	/* Configure device nodes for DSP */
+	err = fastrpc_configure_device_nodes(data, rdev);
+		if (err)
+			goto fdev_error;
 
 	/* Update domain status and global ctx */
 	domain->status = DSP_STATUS_UP;
@@ -459,9 +462,8 @@ fdev_error:
 		fastrpc_channel_default_user_delete(data);
 
 populate_error:
-	if (data->fdevice)
-		misc_deregister(&data->fdevice->miscdev);
 	fastrpc_scheduler_deinit(&data->scheduler);
+	fastrpc_remove_device_nodes(data);
 
 free_data:
 	kvfree(data);
@@ -654,7 +656,7 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	}
 
 	of_platform_depopulate(&rpdev->dev);
-	fastrpc_mmap_remove_ssr(cctx, false);
+	fastrpc_mmap_remove_ssr(cctx);
 	cctx->dev = NULL;
 	cctx->rpdev = NULL;
 	cctx->domain = NULL;

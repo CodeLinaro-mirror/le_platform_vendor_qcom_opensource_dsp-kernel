@@ -60,6 +60,7 @@
 #define FASTRPC_DSP_PERF_LIST 12
 #define FASTRPC_MAX_STATIC_HANDLE (20)
 #define INIT_FILELEN_MAX (5 * 1024 * 1024)
+#define INIT_MEMLEN_MAX (6 * 1024 * 1024)
 #define INIT_FILE_NAMELEN_MAX (128)
 #define FASTRPC_DEVICE_NAME	"fastrpc"
 #define SESSION_ID_INDEX (30)
@@ -682,7 +683,22 @@ enum fastrpc_process_method_ids {
 	FASTRPC_RMID_INIT_PROCESS_DUMP  = 13,
 	FASTRPC_RMID_KCOMM_REMOTE_CALL  = 14,
 	FASTRPC_RMID_INIT_ATTACH2       = 16,
+	FASTRPC_RMID_INIT_KERNEL_DISPATCH = 17,
 	FASTRPC_RMID_INIT_MAX,
+};
+
+/* Command registry for FASTRPC_RMID_INIT_KERNEL_DISPATCH (RMID 17)
+ * Add new commands here — no IDL change required.
+ */
+enum fastrpc_kcmd {
+	FASTRPC_PRIO_GROUP_CONFIG = 1,
+};
+
+/* Payload for FASTRPC_PRIO_GROUP_CONFIG.
+ * 1 = sys_unsigned tier enabled (12TG/3PG); 0 = default (12TG/2PG)
+ */
+struct fastrpc_kcmd_prio_group_config {
+	u32 sys_unsigned_tg_enable;
 };
 
 /*
@@ -721,6 +737,9 @@ enum fastrpc_internal_attributes {
 	FASTRPC_PRELOAD_SUPPORT     = 142 + DSP_ATTR_OFFSET,
 	KERNEL_TSTACK_FLAG_SUPPORT  = 259 + DSP_ATTR_OFFSET,
 };
+
+/* Hardware ceiling for threads per PD; distinct from the DSP default baseline. */
+#define FASTRPC_MAX_THREADS_PER_PD  256
 
 enum fastrpc_remote_domains_id {
 	SECURE_PD = 0,
@@ -1416,6 +1435,8 @@ struct fastrpc_channel_ctx {
 	struct npu_app_prio_table *npu_app_prio;
 	/* 1 if fastrpc_get_sessions_info is running */
 	atomic_t sessions_info_active;
+	/* Flag to indicate if sys_unsigned tier is enabled */
+	bool sys_unsigned_tg_enable;
 };
 
 struct fastrpc_ssr_handler {
@@ -1547,6 +1568,16 @@ struct fastrpc_internal_sessinfo {
 	uint32_t session_id; /* Unused, Set the Session ID on remote subsystem */
 	uint32_t pd;    /* Set the process type on remote subsystem */
 	uint32_t sharedcb;   /* Unused, Session can share context bank with other sessions */
+};
+
+/* V2: same as V1 + max_threads for per-PD donation sizing + reserved slots */
+struct fastrpc_internal_sessinfo_v2 {
+	uint32_t domain_id;
+	uint32_t session_id;
+	uint32_t pd;
+	uint32_t sharedcb;
+	uint32_t max_threads; /* Per-PD thread count for RTOS donation sizing */
+	uint32_t reserved[12]; /* Reserved for future parameters; must be zero */
 };
 
 struct fastrpc_notif_queue {
@@ -1691,6 +1722,8 @@ struct fastrpc_user {
 	struct fastrpc_notif_queue proc_state_notif;
 	struct list_head notif_queue;
 	struct fastrpc_internal_config config;
+	/* Max thread count requested from user space. 0 means unset. */
+	u32 max_threads;
 	bool multi_session_support;
 	bool untrusted_process;
 	bool set_session_info;
@@ -1795,6 +1828,8 @@ void fastrpc_notify_users(struct fastrpc_user *user);
 
 /* Create default user object for remote channel */
 int fastrpc_channel_default_user_create(struct fastrpc_channel_ctx *cctx);
+
+int fastrpc_send_sys_unsigned_prio_config(struct fastrpc_channel_ctx *cctx);
 
 /* Remove default user object for remote channel */
 int fastrpc_channel_default_user_delete(struct fastrpc_channel_ctx *cctx);
@@ -2045,7 +2080,7 @@ void frpc_coredump(struct fastrpc_channel_ctx *cctx, struct list_head *active_us
 void fastrpc_lowest_capacity_corecount(struct device *dev, struct fastrpc_channel_ctx *cctx);
 
 int fastrpc_init_privileged_gids(struct device *dev, char *prop_name, struct gid_list *gidlist);
-int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx, bool is_pdr);
+int fastrpc_mmap_remove_ssr(struct fastrpc_channel_ctx *cctx);
 int fastrpc_setup_service_locator(struct fastrpc_channel_ctx *cctx, char *client_name,
 				char *service_name, char *service_path, int spd_session);
 int fastrpc_npu_post_workinfo(struct fastrpc_channel_ctx *cctx,

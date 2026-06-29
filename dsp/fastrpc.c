@@ -7941,6 +7941,11 @@ static int fastrpc_get_info_from_kernel(struct fastrpc_ioctl_capability *cap,
 	if (!user_obj)
 		user_obj = fl;
 
+	/* No sctx in TVM case treated as unsupported */
+	if (!user_obj->sctx) {
+		return -EOPNOTSUPP;
+	}
+
 	spin_lock_irqsave(&cctx->lock, flags);
 	/* check if we already have queried dsp for attributes */
 	if (cctx->valid_attributes) {

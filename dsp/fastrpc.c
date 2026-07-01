@@ -4030,10 +4030,8 @@ static int fastrpc_pack_root_sharedpage(struct fastrpc_user *fl,
 	return 0;
 
 err_sharedbuf_fail:
-	if (fl->proc_init_sharedbuf) {
-		fastrpc_buf_free(fl->proc_init_sharedbuf, false);
-		fl->proc_init_sharedbuf = NULL;
-	}
+	fastrpc_buf_free(fl->proc_init_sharedbuf, false);
+	fl->proc_init_sharedbuf = NULL;
 	return err;
 }
 

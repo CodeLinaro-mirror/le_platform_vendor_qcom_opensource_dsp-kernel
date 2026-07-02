@@ -1,8 +1,6 @@
 # ported from Android.mk
 $(info within KBUILD file KBUILD_EXTRA_SYMBOLS = $(KBUILD_EXTRA_SYMBOLS))
 
-LINUXINCLUDE := $(SOCINCLUDE) $(LINUXINCLUDE)
-
 ifeq ($(CONFIG_ARCH_PINEAPPLE), y)
 $(info within KBUILD file CONFIG_ARCH_PINEAPPLE = $(CONFIG_ARCH_PINEAPPLE))
 KBUILD_CPPFLAGS += -DCONFIG_DSP_PINEAPPLE=1
@@ -25,17 +23,9 @@ $(info within KBUILD file CONFIG_ARCH_CANOE = $(CONFIG_ARCH_CANOE))
 ccflags-y += -DCONFIG_QCOM_FASTRPC_TRUSTED=1
 endif
 
-ifdef CONFIG_QCOM_FASTRPC_TRUSTED
 frpc-trusted-adsprpc-y := dsp/fastrpc.o	\
 					 dsp/fastrpc_socket.o \
 					 dsp/fastrpc_sysfs.o \
 					 dsp/fastrpc_timeline.o \
 
 obj-m := frpc-trusted-adsprpc.o
-else
-obj-m := frpc-adsprpc.o
-frpc-adsprpc-y := dsp/fastrpc.o \
-                  dsp/fastrpc_rpmsg.o \
-                  dsp/fastrpc_sysfs.o \
-                  dsp/fastrpc_timeline.o
-endif

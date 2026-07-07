@@ -475,6 +475,9 @@
  */
 #define MAX_FW_CARD_ID 2
 
+/* Check if domain is a discrete DSP (card_id > SOC_CARD_ID) */
+#define FASTRPC_DOMAIN_IS_DISCRETE(domain) (domain && domain->card > SOC_CARD_ID)
+
 /*
  * Generates a physical ID for a DSP (Digital Signal Processor) device.
  *
@@ -1582,6 +1585,8 @@ struct fastrpc_mdctx_info {
 	struct fastrpc_user *fl;
 	/* Kernel generated context id */
 	uint64_t ctx;
+	/* Context spans discrete DSPs */
+	bool is_discrete;
 };
 
 struct fastrpc_internal_config {
@@ -1755,6 +1760,8 @@ struct fastrpc_user {
 	u32 max_threads;
 	bool multi_session_support;
 	bool untrusted_process;
+	/* This process currently owns the discrete card */
+	bool claimed_discrete;
 	bool set_session_info;
 	/* Various states throughout process life cycle */
 	atomic_t state;

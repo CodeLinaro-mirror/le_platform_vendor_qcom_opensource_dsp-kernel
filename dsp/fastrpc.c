@@ -91,6 +91,12 @@ struct fastrpc_common {
 	 */
 	bool debug_mode_enable;
 
+	/* TGID of process currently offloading to discrete card */
+	int discrete_owner_tgid;
+
+	/* Active remote sessions of owner process on discrete card */
+	u32 discrete_proc_count;
+
 #ifdef CONFIG_DEBUG_FS
 	struct dentry *debugfs_root;
 	struct dentry *debugfs_global_file;
@@ -106,6 +112,66 @@ bool fastrpc_debug_mode_enabled(void)
 }
 
 static void fastrpc_user_release(struct kref *ref);
+
+/*
+ * fastrpc_claim_discrete_card() - Claim ownership of the discrete card.
+ * At any given time, only a single process may offload work to any domain
+ * on the discrete card.
+ * @fl: fastrpc user creating a process on the discrete card.
+ *
+ * Returns 0 if the card is unclaimed or already owned by current process.
+ * Returns -EBUSY if a different application owns the card.
+ */
+static int fastrpc_claim_discrete_card(struct fastrpc_user *fl)
+{
+	int err = 0;
+	unsigned long flags = 0;
+	int owner_tgid = 0;
+
+	spin_lock_irqsave(&g_frpc.glock, flags);
+	if (g_frpc.discrete_proc_count > 0 &&
+		g_frpc.discrete_owner_tgid != fl->tgid_app) {
+		err = -EBUSY;
+		owner_tgid = g_frpc.discrete_owner_tgid;
+		goto bail;
+	}
+	g_frpc.discrete_owner_tgid = fl->tgid_app;
+	g_frpc.discrete_proc_count++;
+	fl->claimed_discrete = true;
+        fl->claimed_discrete_card_id = card_id;
+bail:
+	spin_unlock_irqrestore(&g_frpc.glock, flags);
+	if (err)
+		dev_err(fl->cctx->dev,
+			"Error %d: tgid %d rejected, discrete card currently owned by tgid %d",
+			err, fl->tgid_app, owner_tgid);
+	return err;
+}
+
+/*
+ * fastrpc_release_discrete_card() - Release this process's claim on the discrete card.
+ * @fl: fastrpc user whose process is being torn down.
+ *
+ * No-op if fl never claimed the card. Frees the card for other applications
+ * when the owner's last process is released.
+ */
+static void fastrpc_release_discrete_card(struct fastrpc_user *fl)
+{
+	unsigned long flags = 0;
+        u32 card_id = fl->claimed_discrete_card_id;
+
+	spin_lock_irqsave(&g_frpc.glock, flags);
+	if (fl->claimed_discrete) {
+		/*
+		 * When the last remote session of this process on discrete is
+		 * cleaned up, release ownership of discrete card.
+		 */
+		if (--g_frpc.discrete_proc_count == 0)
+			g_frpc.discrete_owner_tgid = 0;
+		fl->claimed_discrete = false;
+	}
+	spin_unlock_irqrestore(&g_frpc.glock, flags);
+}
 
 int fastrpc_file_get(struct fastrpc_user *fl)
 {
@@ -3559,6 +3625,11 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 		return -EACCES;
 	}
 
+	if (FASTRPC_DOMAIN_IS_DISCRETE(fl->cctx->domain)) {
+		dev_err(fl->cctx->dev, "static process creation not supported on discrete DSP\n");
+		return -EACCES;
+	}
+
 	if (copy_from_user(&init, argp, sizeof(init)))
 		return -EFAULT;
 
@@ -4309,6 +4380,23 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 			snprintf(fl->name, sizeof(fl->name), "%s-%d", current->comm, fl->tgid_app);
 		}
 	}
+	/*
+	 * Untrusted (HAL-proxied) processes are rejected on discrete domain.
+	 * Only one application may own the card at a time.
+	 */
+	if (FASTRPC_DOMAIN_IS_DISCRETE(fl->cctx->domain)) {
+		if (fl->untrusted_process) {
+			err = -EACCES;
+			dev_err(fl->cctx->dev,
+				"Error %d: untrusted process cannot offload to discrete DSP (card %u, domain %u, %s)",
+				err, fl->cctx->domain->card, fl->cctx->domain->id, fl->cctx->domain->name);
+			goto err_out;
+		}
+
+		err = fastrpc_claim_discrete_card(fl);
+		if (err)
+			goto err_out;
+	}
 
 	/* Get the uid of the current process */
 	fl->uid = __kuid_val(current_euid());
@@ -4593,6 +4681,7 @@ err_alloc:
 		fl->proc_res_buf = NULL;
 	}
 err_out:
+	fastrpc_release_discrete_card(fl);
 	kfree(file);
 	/* Reset the process state to its default in case of an error. */
 	atomic_set(&fl->state, DEFAULT_PROC_STATE);
@@ -4815,6 +4904,7 @@ static int fastrpc_user_obj_free(struct fastrpc_user *user,
 		atomic_set(&fl->spd->is_attached, 0);
 
 	err = fastrpc_release_current_dsp_process(fl);
+	fastrpc_release_discrete_card(fl);
 
 	/*
 	 * Handle GLINK timeout during PD kill.
@@ -5350,6 +5440,10 @@ static int fastrpc_init_attach(struct fastrpc_user *fl, int pd)
 		return err;
 
 	if (pd == SENSORS_STATICPD) {
+		if (FASTRPC_DOMAIN_IS_DISCRETE(fl->cctx->domain)) {
+			dev_err(fl->cctx->dev, "sensors PD not supported on discrete DSP\n");
+			return -EACCES;
+		}
 		if (fl->cctx->domain->type == FASTRPC_LPASS)
 			fl->servloc_name = SENSORS_PDR_ADSP_SERVICE_LOCATION_CLIENT_NAME;
 		else if (fl->cctx->domain->type == FASTRPC_SDSP)
@@ -6264,6 +6358,86 @@ static int fastrpc_multidomain_ctx_get_tgids(struct device *dev,
 	return err;
 }
 
+/* Returns true if two multidomain context DSP sets contain the same phy_ids */
+static bool fastrpc_domain_sets_equal(struct fastrpc_mdctx_info *a,
+	struct fastrpc_mdctx_info *b)
+{
+	uint32_t i = 0, j = 0;
+	bool found = false;
+
+	if (a->num_domains != b->num_domains)
+		return false;
+	for (i = 0; i < a->num_domains; i++) {
+		found = false;
+		for (j = 0; j < b->num_domains; j++) {
+			if (a->phy_ids[i] == b->phy_ids[j]) {
+				found = true;
+				break;
+			}
+		}
+		if (!found)
+			return false;
+	}
+	return true;
+}
+
+/* Returns true if two multidomain context DSP sets share at least one phy_id */
+static bool fastrpc_domain_sets_intersect(struct fastrpc_mdctx_info *a,
+	struct fastrpc_mdctx_info *b)
+{
+	uint32_t i = 0, j = 0;
+
+	for (i = 0; i < a->num_domains; i++) {
+		for (j = 0; j < b->num_domains; j++) {
+			if (a->phy_ids[i] == b->phy_ids[j])
+				return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * Ensure all domains in a multi-domain context share the same class:
+ * either all integrated or all discrete. The first domain sets the class;
+ * every later domain must match it.
+ */
+static int fastrpc_check_domain_class(struct fastrpc_domain *domain,
+	bool *class_set, bool *is_discrete)
+{
+	bool this_discrete = FASTRPC_DOMAIN_IS_DISCRETE(domain);
+
+	if (!*class_set) {
+		*is_discrete = this_discrete;
+		*class_set = true;
+	} else if (this_discrete != *is_discrete) {
+		return -EINVAL;
+	}
+	return 0;
+}
+
+/*
+ * fastrpc_discrete_combination_available() - Check if a discrete multi-domain
+ * context can be created without conflicting with an existing combination.
+ * @cand: candidate context, not yet inserted into the idr.
+ *
+ * Caller must hold g_frpc.gmut. Returns true if no conflict exists.
+ */
+static bool fastrpc_discrete_combination_available(struct fastrpc_mdctx_info *cand)
+{
+	struct fastrpc_mdctx_info *other = NULL;
+	int id = 0;
+
+	idr_for_each_entry(&g_frpc.mdctx_idr, other, id) {
+		if (!other->is_discrete)
+			continue;
+		if (fastrpc_domain_sets_equal(other, cand))
+			continue;                 /* identical combination: allowed */
+		if (fastrpc_domain_sets_intersect(other, cand))
+			return false;             /* partial overlap: conflict */
+	}
+	return true;
+}
+
 /* Helper function to initialize multidomain context object */
 static int fastrpc_multidomain_ctx_obj_init(struct fastrpc_user *fl,
 	struct fastrpc_ioctl_mdctx_manage *ctxm,
@@ -6281,6 +6455,7 @@ static int fastrpc_multidomain_ctx_obj_init(struct fastrpc_user *fl,
 	struct fastrpc_mdctx_info *mdctx = NULL;
 	struct fastrpc_domain *domain = NULL;
 	uint32_t logical_domain_id = 0;
+	bool class_set = false, is_discrete = false;
 
 	/* Validate that reserved fields are all zero */
 	for (ii = 0; ii < FASTRPC_MDCTX_IOCTL_RSVD; ii++) {
@@ -6385,9 +6560,20 @@ static int fastrpc_multidomain_ctx_obj_init(struct fastrpc_user *fl,
 				err, __func__, logical_domain_id);
 			goto bail;
 		}
+
+		err = fastrpc_check_domain_class(domain, &class_set, &is_discrete);
+		if (err) {
+			dev_err(dev,
+				"Error %d: cannot mix integrated and discrete DSPs in one multi-domain context",
+				err);
+			goto bail;
+		}
+
 		instance_ids[ii] = domain->instance_id;
 		phy_ids[ii] = domain->phy_id;
 	}
+
+	mdctx->is_discrete = is_discrete;
 
 	/* Allocate tgids array to send to dsp */
 	size = sizeof(*tgids_frpc) * num_domains;
@@ -6606,6 +6792,15 @@ static int fastrpc_multidomain_ctx_setup(struct fastrpc_user *fl,
 
 	/* Generate kernel context id */
 	mutex_lock(gmut);
+
+	if (mdctx->is_discrete &&
+		!fastrpc_discrete_combination_available(mdctx)) {
+		err = -EBUSY;
+		dev_err(dev, "Error %d: DSP already bound to a different multi-core combination",
+			err);
+		goto bail;
+	}
+
 	err = idr_alloc_cyclic(mdctx_idr, mdctx, 1,
 				FASTRPC_CTX_MAX, GFP_ATOMIC);
 

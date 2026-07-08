@@ -59,18 +59,28 @@ static void fastrpc_workinfo_notify(struct fastrpc_scheduler *sched,
 static u32 fastrpc_npu_lookup_prio(struct fastrpc_channel_ctx *cctx,
 				    int app_id)
 {
-	struct npu_app_prio_table *table = cctx->npu_app_prio;
+	struct npu_app_prio_table *table;
 	unsigned long flags;
 	u32 i, prio = FASTRPC_APP_PRIORITY_DEFAULT;
 
 	/*
 	 * Acquire cctx->lock to guard against a concurrent
-	 * fastrpc_npu_app_prio_set() write.  All call sites hold
-	 * sched->lock on entry; the writer never takes sched->lock,
-	 * so the lock ordering sched->lock -> cctx->lock
+	 * fastrpc_npu_app_prio_set() write or fastrpc_npu_app_prio_clear()
+	 * free.  All call sites hold sched->lock on entry; the writer never
+	 * takes sched->lock, so the lock ordering sched->lock -> cctx->lock
 	 * is deadlock-free.
+	 *
+	 * Read cctx->npu_app_prio inside the lock: fastrpc_npu_app_prio_clear()
+	 * (setSchedulingConfigs({})) can free and NULL it at runtime, so a
+	 * pointer cached before the lock could dangle.
 	 */
 	spin_lock_irqsave(&cctx->lock, flags);
+	table = cctx->npu_app_prio;
+	if (!table) {
+		/* Table cleared: skip the lookup, use the default priority */
+		spin_unlock_irqrestore(&cctx->lock, flags);
+		return FASTRPC_APP_PRIORITY_DEFAULT;
+	}
 	for (i = 0; i < table->num_entries; i++) {
 		if (table->entries[i].uid == app_id) {
 			prio = (u32)table->entries[i].priority;
@@ -120,7 +130,7 @@ static u32 fastrpc_npu_lookup_prio(struct fastrpc_channel_ctx *cctx,
 static int fastrpc_npu_check_access(struct fastrpc_channel_ctx *cctx,
 				    uid_t caller_uid, s32 appid)
 {
-	struct npu_app_prio_table *table = cctx->npu_app_prio;
+	struct npu_app_prio_table *table;
 	unsigned long flags;
 	u32 i, has_direct_access = 0, can_attribute_other_uid = 0;
 	bool found = false;
@@ -129,14 +139,22 @@ static int fastrpc_npu_check_access(struct fastrpc_channel_ctx *cctx,
 	if (appid < 0)
 		return 0;
 
-	/* Rule 2: no table yet means no access control */
+	/*
+	 * Read cctx->npu_app_prio inside cctx->lock: fastrpc_npu_app_prio_clear()
+	 * (setSchedulingConfigs({})) can free and NULL it at runtime.  The
+	 * pointer must not be cached before the lock, and the NULL/empty check
+	 * must run under the lock so the table cannot be freed between the check
+	 * and the scan below.
+	 */
+	spin_lock_irqsave(&cctx->lock, flags);
+	table = cctx->npu_app_prio;
+	/* Rule 2: no table (cleared or not yet populated) => no access control */
 	if (!table || table->num_entries == 0) {
+		spin_unlock_irqrestore(&cctx->lock, flags);
 		dev_dbg(cctx->dev, "%s: NPU priority table not populated, skipping access check\n",
 			__func__);
 		return 0;
 	}
-
-	spin_lock_irqsave(&cctx->lock, flags);
 	for (i = 0; i < table->num_entries; i++) {
 		if (table->entries[i].uid == caller_uid) {
 			has_direct_access = table->entries[i].has_direct_access;
@@ -292,9 +310,11 @@ static struct fastrpc_work_node *fastrpc_find_work(
 }
 
 /*
- * Scan hashtable for apps whose priority changed in the live table.
- * For each changed app: erase its pending works from the rbtree, update
- * eff_prio, and reinsert.  Skips empty and unchanged buckets.
+ * Scan hashtable for apps whose priority changed and re-key their pending
+ * works.  For each changed app: erase its pending works from the rbtree,
+ * update eff_prio, and reinsert.  On a populated table, empty and unchanged
+ * buckets are skipped; on a cleared table (setSchedulingConfigs({})) every
+ * app reverts to the default, so all buckets are visited.
  * Must be called under sched->lock.
  */
 static void fastrpc_apply_prio_updates(struct fastrpc_scheduler *sched)
@@ -302,19 +322,43 @@ static void fastrpc_apply_prio_updates(struct fastrpc_scheduler *sched)
 	struct fastrpc_channel_ctx *cctx =
 		container_of(sched, struct fastrpc_channel_ctx,
 			     scheduler);
+	struct npu_app_prio_table *table;
 	struct fastrpc_app_entry *entry;
 	struct fastrpc_work_node *work, *tmp;
+	unsigned long flags;
+	bool cleared;
 	int bkt;
 
 	sched->prio_update_pending = false;
 
-	if (!cctx->npu_app_prio)
-		return;
+	/*
+	 * Read the table under cctx->lock: fastrpc_npu_app_prio_clear()
+	 * (setSchedulingConfigs({})) can free cctx->npu_app_prio at runtime,
+	 * so the NULL check and the ->num_entries deref must both happen under
+	 * the lock or they race a concurrent free (use-after-free).  Lock
+	 * ordering sched->lock -> cctx->lock is safe (see
+	 * fastrpc_npu_lookup_prio).
+	 */
+	spin_lock_irqsave(&cctx->lock, flags);
+	table = cctx->npu_app_prio;
+	cleared = (!table || table->num_entries == 0);
+	spin_unlock_irqrestore(&cctx->lock, flags);
 
+	/*
+	 * Cleared table (setSchedulingConfigs({}) = "remove policy"): every app
+	 * reverts to the default — fastrpc_npu_lookup_prio() returns the default
+	 * on a NULL table.  We must visit *all* entries, even those with no
+	 * queued work, because fastrpc_drain_incoming() reads entry->cur_prio
+	 * directly when cctx->npu_app_prio is NULL; a stale cur_prio would let a
+	 * later work inherit the old priority.
+	 *
+	 * Populated table: idle apps read the live table in drain_incoming, so
+	 * they need no re-key here and stay skipped as before.
+	 */
 	hash_for_each(sched->app_works, bkt, entry, hash_node) {
 		u32 new_prio;
 
-		if (list_empty(&entry->works))
+		if (!cleared && list_empty(&entry->works))
 			continue;
 
 		new_prio = fastrpc_npu_lookup_prio(cctx,
@@ -338,6 +382,16 @@ static void fastrpc_apply_prio_updates(struct fastrpc_scheduler *sched)
 		}
 		entry->cur_prio = new_prio;
 	}
+
+	/*
+	 * A clear re-keys PENDING work but never changes the eff_prio of
+	 * already-executing works — they run to completion at their admitted
+	 * priority, exactly as in the populated-table update path.  Recompute
+	 * ref_prio from the executing set so admission uses the true running
+	 * minimum instead of being pinned to the default.
+	 */
+	if (cleared)
+		fastrpc_recalc_ref_prio(sched);
 }
 
 static void fastrpc_work_node_free(struct fastrpc_work_node *work)
@@ -652,6 +706,47 @@ void fastrpc_scheduler_notify_prio_update(
 	wake_up(&sched->wq);
 }
 EXPORT_SYMBOL(fastrpc_scheduler_notify_prio_update);
+
+/*
+ * Bracket a priority-table mutation so the mutation and the
+ * prio_update_pending flag are armed atomically with respect to the kthread.
+ *
+ * The kthread reads prio_update_pending (Stage 2) and cctx->npu_app_prio
+ * (Stage 3, via fastrpc_drain_incoming) within a single sched->lock section.
+ * fastrpc_npu_app_prio_clear() (setSchedulingConfigs({})) NULLs
+ * cctx->npu_app_prio under cctx->lock only.  If the flag were armed in a
+ * separate critical section from the clear (as a plain
+ * fastrpc_scheduler_notify_prio_update() call would be), a kthread pass could
+ * interleave and observe the NULL table WITHOUT the pending flag: it would
+ * skip fastrpc_apply_prio_updates(), leave entry->cur_prio stale, and then
+ * admit queued work at the pre-clear priority via the entry->cur_prio
+ * fallback in fastrpc_drain_incoming().
+ *
+ * Callers hold sched->lock across the table mutation:
+ *
+ *	fastrpc_scheduler_prio_update_begin(sched);
+ *	fastrpc_npu_app_prio_clear(cctx);	// takes cctx->lock inside
+ *	fastrpc_scheduler_prio_update_finish(sched);
+ *
+ * The clear takes cctx->lock nested inside sched->lock, matching the
+ * sched->lock -> cctx->lock order used by fastrpc_apply_prio_updates().
+ */
+void fastrpc_scheduler_prio_update_begin(struct fastrpc_scheduler *sched)
+	__acquires(&sched->lock)
+{
+	spin_lock(&sched->lock);
+}
+EXPORT_SYMBOL(fastrpc_scheduler_prio_update_begin);
+
+void fastrpc_scheduler_prio_update_finish(struct fastrpc_scheduler *sched)
+	__releases(&sched->lock)
+{
+	sched->prio_update_pending = true;
+	spin_unlock(&sched->lock);
+
+	wake_up(&sched->wq);
+}
+EXPORT_SYMBOL(fastrpc_scheduler_prio_update_finish);
 
 /*
  * IOCTL handler for FASTRPC_INVOKE_REMOTE_WORK (status=START).

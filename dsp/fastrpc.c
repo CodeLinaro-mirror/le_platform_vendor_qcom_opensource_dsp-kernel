@@ -7203,6 +7203,63 @@ static int fastrpc_request_thread_exit(struct fastrpc_user *fl,
 }
 
 /*
+ * fastrpc_npu_app_prio_clear - Detach and free the channel priority table.
+ *
+ * Called when userspace sends setSchedulingConfigs({}) (num_configs == 0),
+ * i.e. "remove all scheduling policy".  The table lives in
+ * fastrpc_channel_ctx (per-channel), not per-user.
+ *
+ * The entries buffer and the npu_app_prio struct are both freed under
+ * cctx->lock, then cctx->npu_app_prio is set to NULL before unlocking.
+ * kfree() is safe in atomic context, so freeing under the spinlock keeps
+ * the detach atomic against concurrent readers (fastrpc_npu_check_access /
+ * fastrpc_npu_lookup_prio read cctx->npu_app_prio inside cctx->lock), which
+ * never see a dangling pointer.  This leaves cctx->npu_app_prio == NULL so
+ * readers observe "no table" (allow-all); a later non-empty
+ * setSchedulingConfigs() re-allocates via fastrpc_npu_app_prio_init().
+ */
+static void fastrpc_npu_app_prio_clear(struct fastrpc_channel_ctx *cctx)
+{
+	u32 cleared_count = 0;
+	unsigned long flags;
+
+	spin_lock_irqsave(&cctx->lock, flags);
+	/*
+	 * Re-check under the lock: cctx->npu_app_prio is only read-modified
+	 * while holding cctx->lock, so an unlocked check is a TOCTOU.  Two
+	 * concurrent setSchedulingConfigs({}) on the same channel could both
+	 * pass an unlocked NULL check; the second would then dereference a
+	 * table the first already freed.  Checking here means a losing racer
+	 * simply observes NULL and returns.
+	 */
+	if (!cctx->npu_app_prio) {
+		spin_unlock_irqrestore(&cctx->lock, flags);
+		dev_info(cctx->dev, "%s: no priority table, nothing to clear\n",
+			__func__);
+		return;
+	}
+	if (atomic_read(&cctx->teardown)) {
+		/* SSR already handles full cleanup; nothing to do here */
+		spin_unlock_irqrestore(&cctx->lock, flags);
+		dev_info(cctx->dev, "%s: skipped — SSR teardown in progress\n",
+			__func__);
+		return;
+	}
+	/*
+	 * Free the whole table under the lock so concurrent readers never
+	 * observe a dangling pointer.  kfree() is safe in atomic context.
+	 */
+	cleared_count = cctx->npu_app_prio->num_entries;
+	kfree(cctx->npu_app_prio->entries);
+	kfree(cctx->npu_app_prio);
+	cctx->npu_app_prio = NULL;
+	spin_unlock_irqrestore(&cctx->lock, flags);
+
+	dev_info(cctx->dev, "%s: cleared %u priority entries\n",
+		__func__, cleared_count);
+}
+
+/*
  *	fastrpc_npu_app_prio_init - Allocate the per-channel NPU priority table
  *
  *	@cctx	: Channel context
@@ -7275,6 +7332,7 @@ static int fastrpc_npu_app_prio_set(struct fastrpc_channel_ctx *cctx,
 	struct fastrpc_npu_app_prio_config *new_buf = NULL, *old_buf = NULL;
 	unsigned long flags = 0;
 	uint32_t i = 0;
+	int retries = 0;
 	int err = 0;
 
 	if (!user_configs) {
@@ -7339,6 +7397,34 @@ static int fastrpc_npu_app_prio_set(struct fastrpc_channel_ctx *cctx,
 	 * on the first call when entries has not yet been set.
 	 */
 	spin_lock_irqsave(&cctx->lock, flags);
+	/*
+	 * A concurrent setSchedulingConfigs({}) may have freed the table via
+	 * fastrpc_npu_app_prio_clear() after our init() at the top of this
+	 * function.  Re-create it rather than failing: kzalloc cannot run under
+	 * cctx->lock, so drop the lock, call the init helper, then re-acquire
+	 * and re-check.  init() returns -EPIPE during SSR teardown, which breaks
+	 * the loop with an error.
+	 *
+	 * Bound the retries: a pathological stream of concurrent clear()s could
+	 * otherwise re-NULL the table in the narrow window between init() and the
+	 * re-check on every iteration.  Give up with -EAGAIN after a few attempts
+	 * so the loop can never livelock; userspace is free to retry the request.
+	 */
+	while (!cctx->npu_app_prio) {
+		if (++retries > 3) {
+			spin_unlock_irqrestore(&cctx->lock, flags);
+			dev_err(cctx->dev,
+				"%s: priority table repeatedly cleared during init; giving up (-EAGAIN)\n",
+				__func__);
+			err = -EAGAIN;
+			goto bail;
+		}
+		spin_unlock_irqrestore(&cctx->lock, flags);
+		err = fastrpc_npu_app_prio_init(cctx);
+		if (err)
+			goto bail;
+		spin_lock_irqsave(&cctx->lock, flags);
+	}
 	if (atomic_read(&cctx->teardown)) {
 		spin_unlock_irqrestore(&cctx->lock, flags);
 		err = -EPIPE;
@@ -7698,8 +7784,30 @@ static int fastrpc_npu_priority_workinfo(struct fastrpc_user *fl,
 	case FASTRPC_NPU_OP_PRIORITY:
 		if (memchr_inv(args.prio.reserved, 0, sizeof(args.prio.reserved)))
 			return -EINVAL;
-		if (args.prio.num_configs == 0)
-			return -EINVAL;
+		if (args.prio.num_configs == 0) {
+			/*
+			 * Empty config list = clear all UID restrictions.
+			 * Rule 2 of fastrpc_npu_check_access: empty table ->
+			 * allow all.  Treat setSchedulingConfigs({}) as
+			 * "remove policy" rather than an error.
+			 *
+			 * Clear the table and arm the scheduler's prio-update
+			 * flag under a single sched->lock hold so a kthread pass
+			 * cannot observe a NULL cctx->npu_app_prio without also
+			 * seeing prio_update_pending.  Otherwise it would skip
+			 * fastrpc_apply_prio_updates(), leave entry->cur_prio
+			 * stale, and admit queued work at the pre-clear
+			 * priority.  fastrpc_npu_app_prio_clear() takes cctx->lock
+			 * nested inside sched->lock, matching the scheduler's
+			 * sched->lock -> cctx->lock order.
+			 */
+			fastrpc_scheduler_prio_update_begin(
+				&fl->cctx->scheduler);
+			fastrpc_npu_app_prio_clear(fl->cctx);
+			fastrpc_scheduler_prio_update_finish(
+				&fl->cctx->scheduler);
+			break;
+		}
 		err = fastrpc_npu_priority(fl, &args.prio);
 		break;
 	case FASTRPC_NPU_OP_WORKINFO:

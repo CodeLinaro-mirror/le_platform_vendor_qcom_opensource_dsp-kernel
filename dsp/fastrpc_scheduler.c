@@ -537,13 +537,18 @@ static int fastrpc_scheduler_thread(void *data)
 
 	while (!kthread_should_stop()) {
 		/* Sleep until there is work to process */
-		wait_event(sched->wq,
+		if (wait_event_interruptible(sched->wq,
 			!list_empty(&sched->incoming_list) ||
 			!list_empty(&sched->abort_list) ||
 			!list_empty(&sched->done_list) ||
 			READ_ONCE(sched->prio_update_pending) ||
-			kthread_should_stop());
-
+			kthread_should_stop())) {
+			if (signal_pending(current)) {
+				/* Interrupted by signal; flush to avoid busy-spin */
+				flush_signals(current);
+				continue;
+			}
+		}
 		if (kthread_should_stop())
 			break;
 

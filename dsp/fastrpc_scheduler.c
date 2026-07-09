@@ -542,9 +542,9 @@ static int fastrpc_scheduler_thread(void *data)
 			!list_empty(&sched->abort_list) ||
 			!list_empty(&sched->done_list) ||
 			READ_ONCE(sched->prio_update_pending) ||
-			READ_ONCE(sched->stop));
+			kthread_should_stop());
 
-		if (READ_ONCE(sched->stop))
+		if (kthread_should_stop())
 			break;
 
 		spin_lock(&sched->lock);
@@ -1022,9 +1022,13 @@ void fastrpc_scheduler_abort_all(struct fastrpc_scheduler *sched)
 	struct fastrpc_work_node *work, *wtmp;
 	struct rb_node *node, *next;
 
-	/* Stop the kthread to prevent new admissions or state changes */
+	/*
+	 * Stop the kthread to prevent new admissions or state changes.
+	 * Set sched->stop = true first to reject any in-flight work_add() calls.
+	 * Then call kthread_stop() to signal
+	 * the kthread to exit via kthread_should_stop().
+	 */
 	WRITE_ONCE(sched->stop, true);
-	wake_up(&sched->wq);
 	if (sched->kthread && !IS_ERR(sched->kthread)) {
 		kthread_stop(sched->kthread);
 		sched->kthread = NULL;
@@ -1090,9 +1094,14 @@ void fastrpc_scheduler_deinit(struct fastrpc_scheduler *sched)
 	struct rb_node *node, *next;
 	int bkt;
 
-	/* Signal the kthread to stop and wait for it to exit */
+	/*
+	 * Signal the kthread to stop and wait for it to exit.
+	 * Set sched->stop = true first to reject any in-flight work_add() calls.
+	 * Then call kthread_stop() to signalthe kthread to exit via kthread_should_stop().
+	 * Only call kthread_stop() if the kthread is still valid (not already stopped
+	 * by abort_all()).
+	 */
 	WRITE_ONCE(sched->stop, true);
-	wake_up(&sched->wq);
 	if (sched->kthread && !IS_ERR(sched->kthread)) {
 		kthread_stop(sched->kthread);
 		sched->kthread = NULL;

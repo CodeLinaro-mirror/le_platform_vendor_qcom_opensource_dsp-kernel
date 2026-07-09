@@ -107,5 +107,9 @@ define_modules("malabar", "consolidate", "no")
 
 define_modules("malabar", "perf", "no")
 
+define_modules("coast", "perf", "no")
+
+define_modules("coast", "consolidate", "no")
+
 define_target_modules()
 

@@ -2668,7 +2668,7 @@ static int fastrpc_internal_invoke(struct fastrpc_user *fl,  u32 kernel,
 	u64 *perf_counter = NULL;
 	struct timespec64 invoket = {0};
 	struct device *dev = NULL;
-	u32 priority = invoke->priority, user_appid = invoke->appid;
+	u32 priority = invoke->priority;
 
 	if (atomic_read(&fl->cctx->teardown))
 		return -EPIPE;
@@ -2737,7 +2737,7 @@ static int fastrpc_internal_invoke(struct fastrpc_user *fl,  u32 kernel,
 	 * active admitted job in the scheduler executing list.  Static handles
 	 * (<= FASTRPC_MAX_STATIC_HANDLE) and kernel-initiated calls are exempt.
 	 */
-	if (!kernel && user_appid > 0 && fl->untrusted_process &&
+	if (!kernel && invoke->appid >= 0 && fl->untrusted_process &&
 		handle > FASTRPC_MAX_STATIC_HANDLE) {
 		if (!fastrpc_scheduler_handle_is_executing(
 				&fl->cctx->scheduler, fl, (u64)handle)) {
@@ -5457,7 +5457,8 @@ err_out:
 
 static int fastrpc_invoke(struct fastrpc_user *fl, char __user *argp)
 {
-	struct fastrpc_enhanced_invoke ioctl = {0};
+	/* Legacy invoke has no appid field; -1 sentinel bypasses appid>=0 enforcement */
+	struct fastrpc_enhanced_invoke ioctl = { .appid = -1 };
 	struct fastrpc_invoke inv;
 	int err;
 
@@ -6866,6 +6867,11 @@ static int fastrpc_dspsignal_wait(struct fastrpc_user *fl,
 	if (s->state != DSPSIGNAL_STATE_PENDING) {
 		if ((s->state == DSPSIGNAL_STATE_CANCELED) || (s->state == DSPSIGNAL_STATE_UNUSED))
 			err = -EINTR;
+		if (s->state == DSPSIGNAL_STATE_SIGNALED) {
+			/* Signal already received from DSP. Reset signal state and return */
+			s->state = DSPSIGNAL_STATE_PENDING;
+			reinit_completion(&s->comp);
+		}
 		spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
 		dev_dbg(fl->cctx->dev, "Signal %u in state %u, complete wait immediately",
 				signal_id, s->state);
@@ -7718,7 +7724,8 @@ static int fastrpc_npu_priority_workinfo(struct fastrpc_user *fl,
 
 static int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 {
-	struct fastrpc_enhanced_invoke inv2 = {0};
+	/* Legacy invoke has no appid field; -1 sentinel bypasses appid>=0 enforcement */
+	struct fastrpc_enhanced_invoke inv2 = { .appid = -1 };
 	struct fastrpc_ioctl_multimode_invoke invoke;
 	struct fastrpc_internal_control cp = {0};
 	struct fastrpc_internal_dspsignal *fsig = NULL;

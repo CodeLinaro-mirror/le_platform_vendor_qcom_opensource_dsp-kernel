@@ -5889,7 +5889,8 @@ static int fastrpc_set_timeline_info(struct fastrpc_user *fl,
 {
 	struct fastrpc_timeline_arguments *t_args = NULL;
 
-	if (info->num_events > MAX_TIMELINE_EVENT_COUNT) {
+	if (info->num_events > MAX_TIMELINE_EVENT_COUNT ||
+		info->num_events < TIMELINE_BUF_COUNT) {
 		pr_err("%s: failed for invalid num event %u\n",
 			__func__, info->num_events);
 		return -EINVAL;

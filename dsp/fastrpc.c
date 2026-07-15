@@ -4185,8 +4185,6 @@ static void fastrpc_get_sessions_info(struct fastrpc_channel_ctx *cctx)
 	list_for_each_entry(fl, &cctx->users, user) {
 		ret = fastrpc_file_get(fl);
 		if (ret) {
-			dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
-				__func__, fl);
 			continue;
 		}
 		list_add_tail(&fl->rb_log_node, &users_list);
@@ -5508,9 +5506,14 @@ static void fastrpc_notif_find_process(int domain, struct fastrpc_channel_ctx *c
 		if (user->tgid_frpc == notif->pid) {
 			err = fastrpc_file_get(user);
 			if (err) {
+				spin_unlock_irqrestore(&cctx->lock, irq_flags);
+				/*
+				 * Emit warning outside the spinlock to avoid holding cctx->lock
+				 * across slow console output (serial UART busy-wait in __delay).
+				 */
 				dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
 					__func__, user);
-				break;
+				return;
 			}
 			is_process_found = true;
 			break;
@@ -9308,15 +9311,21 @@ int fastrpc_driver_register(struct fastrpc_driver *frpc_driver)
 			if (user->tgid_frpc == frpc_driver->handle) {
 				err = fastrpc_file_get(user);
 				if (err) {
+					spin_unlock_irqrestore(&cctx->lock, irq_flags);
+					/*
+					 * Emit warning outside the spinlock to avoid holding cctx->lock
+					 * across slow console output (serial UART busy-wait in __delay).
+					 */
 					dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
 						__func__, user);
-					break;
+					goto out;
 				}
 				goto process_found;
 			}
 		}
 		spin_unlock_irqrestore(&cctx->lock, irq_flags);
 	}
+out:
 	pr_err("%s: no client found for handle 0x%x",
 		__func__, frpc_driver->handle);
 	return -ESRCH;
@@ -9401,8 +9410,6 @@ static void fastrpc_notify_pdr_drivers(struct fastrpc_channel_ctx *cctx,
 	list_for_each_entry(fl, &cctx->users, user) {
 		err = fastrpc_file_get(fl);
 		if (err) {
-			dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
-				__func__, fl);
 			continue;
 		}
 		if (fl->spd_id == pid)
@@ -10365,9 +10372,14 @@ static void fastrpc_handle_signal_rpmsg(uint64_t msg, struct fastrpc_channel_ctx
 		if (fl->tgid_frpc == pid) {
 			err = fastrpc_file_get(fl);
 			if (err) {
+				spin_unlock_irqrestore(&cctx->lock, irq_flags);
+				/*
+				 * Emit warning outside the spinlock to avoid holding cctx->lock
+				 * across slow console output (serial UART busy-wait in __delay).
+				 */
 				dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
 					__func__, fl);
-				break;
+				goto out;
 			}
 			process_found = true;
 			break;
@@ -10375,6 +10387,7 @@ static void fastrpc_handle_signal_rpmsg(uint64_t msg, struct fastrpc_channel_ctx
 	}
 	spin_unlock_irqrestore(&cctx->lock, irq_flags);
 
+out:
 	if (!process_found) {
 		pr_warn("Warning: %s: no active processes found for pid %u, signal id %u",
 			__func__, pid, signal_id);

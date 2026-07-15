@@ -4197,7 +4197,7 @@ static void fastrpc_get_sessions_info(struct fastrpc_channel_ctx *cctx)
 		fastrpc_log_session_info(s_file, fl,
 			session_num);
 		list_del(&fl->rb_log_node);
-		fastrpc_file_put(fl, false);
+		fastrpc_file_put(fl, true);
 		session_num++;
 	}
 

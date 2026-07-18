@@ -82,6 +82,14 @@ struct fastrpc_common {
 	/* Flag to check if the kernel is in trusted VM */
 	bool is_trusted_vm;
 
+	/*
+	 * Debug-only flag: when true, BUG_ON() on a FastRPC SSR timeout
+	 * instead of the normal recovery (bypass or real SSR). Off by
+	 * default; only settable via the debugfs node below, which is
+	 * only meaningful on debug builds.
+	 */
+	bool debug_mode_enable;
+
 #ifdef CONFIG_DEBUG_FS
 	struct dentry *debugfs_root;
 	struct dentry *debugfs_global_file;
@@ -90,6 +98,11 @@ struct fastrpc_common {
 
 /* Global fastrpc driver object */
 struct fastrpc_common g_frpc;
+
+bool fastrpc_debug_mode_enabled(void)
+{
+	return g_frpc.debug_mode_enable;
+}
 
 static void fastrpc_user_release(struct kref *ref);
 
@@ -2464,9 +2477,13 @@ static int fastrpc_wait_for_response(struct fastrpc_invoke_ctx *ctx,
 		 * Certain trusted applications can disable this recovery
 		 * mechanism by configuring an environment variable.
 		 */
-		if (cctx->domain->type == FASTRPC_NSP &&
+		if (((cctx->domain->type == FASTRPC_NSP &&
 			(fl->pd_type == USERPD ||
-			fl->pd_type == USER_UNSIGNEDPD_POOL) &&
+			fl->pd_type == USER_UNSIGNEDPD_POOL)) ||
+			(cctx->domain->type == FASTRPC_LPASS &&
+			(fl->pd_type == SENSORS_STATICPD ||
+			fl->pd_type == AUDIO_STATICPD ||
+			fl->pd_type == OIS_STATICPD))) &&
 			fl->dsp_recovery && !g_frpc.is_trusted_vm &&
 			!atomic_read(&cctx->teardown)) {
 			/*
@@ -11108,6 +11125,7 @@ static int fastrpc_init(void)
 #else
 	g_frpc.is_trusted_vm = false;
 #endif
+	g_frpc.debug_mode_enable = false;
 
 #ifdef CONFIG_DEBUG_FS
 	debugfs_root = debugfs_create_dir("fastrpc", NULL);
@@ -11118,6 +11136,9 @@ static int fastrpc_init(void)
 		debugfs_root = NULL;
 	}
 	g_frpc.debugfs_root = debugfs_root;
+	if (debugfs_root)
+		debugfs_create_bool("debug_mode", 0644, debugfs_root,
+			&g_frpc.debug_mode_enable);
 #endif
 	return 0;
 

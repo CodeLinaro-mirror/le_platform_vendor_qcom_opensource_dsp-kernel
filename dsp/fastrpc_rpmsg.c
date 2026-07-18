@@ -129,13 +129,46 @@ void ssr_timer_callback(struct timer_list *timer)
 
 	ssr_handler->domain_id = cctx->domain_id;
 
-	if (ctx->fl && cctx->domain)
+	if (ctx->fl && cctx->domain) {
 		pr_info("%s: Hang in process caused %s SSR by process %s, pid %d,"
 				"pid_frpc %d, tid %d, handle 0x%x, sc 0x%x\n",
 			__func__, cctx->domain->name, ctx->fl->name, ctx->fl->tgid_app,
 			ctx->fl->tgid_frpc, ctx->pid, ctx->handle, ctx->sc);
 
+		if (cctx->domain->type == FASTRPC_LPASS &&
+			(ctx->fl->pd_type == SENSORS_STATICPD ||
+			ctx->fl->pd_type == AUDIO_STATICPD ||
+			ctx->fl->pd_type == OIS_STATICPD) &&
+			ctx->fl->dsp_recovery) {
+
+			pr_info("%s: Bypass SSR for LPAIDSP path, type:%d", __func__, ctx->fl->pd_type);
+			/*
+			 * Forcing SSR on LPAIDSP may cause race conditions, so this
+			 * bypasses it. Commercial builds leave the call blocked;
+			 * debug builds may enable debug_mode to BUG_ON below instead,
+			 * for an immediate crash dump.
+			 */
+			if (!fastrpc_debug_mode_enabled()) {
+				/* Reset so a future legitimate SSR on this channel is not silently dropped */
+				cctx->startshutdown = false;
+				goto bail;
+			}
+		}
+	}
+
 	spin_unlock_irqrestore(&cctx->lock, flags);
+
+	/*
+	 * Debug builds may enable debug_mode to BUG_ON here instead of the
+	 * real SSR, for an immediate crash dump. No effect on commercial builds.
+	 * cctx is deliberately not released until after this check, so a
+	 * debug crash dump gets the fullest possible state.
+	 */
+	if (fastrpc_debug_mode_enabled()) {
+		pr_err("%s: BUG_ON triggered for SSR timeout debug\n", __func__);
+		BUG_ON(1);
+	}
+
 	fastrpc_channel_ctx_put(cctx);
 
 	/* Launch kernel worker thread to trigger ssr */

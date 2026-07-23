@@ -2007,6 +2007,15 @@ void fastrpc_file_put(struct fastrpc_user *fl, bool worker);
 bool fastrpc_is_device_crashing(struct fastrpc_channel_ctx *cctx);
 
 /*
+ * fastrpc_debug_mode_enabled - Query the debug_mode debugfs switch
+ *
+ * @return: True if debug-only BUG_ON on FastRPC SSR timeout is enabled,
+ *			otherwise false. Off by default; only settable via the
+ *			debug_mode debugfs node.
+ */
+bool fastrpc_debug_mode_enabled(void);
+
+/*
  * fastrpc_log_internal - Log messages to ring buffer and/or kernel log
  *
  * Logs formatted messages based on the destination mask. Supports logging to

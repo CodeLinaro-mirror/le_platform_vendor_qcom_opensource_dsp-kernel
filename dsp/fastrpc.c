@@ -4030,10 +4030,8 @@ static int fastrpc_pack_root_sharedpage(struct fastrpc_user *fl,
 	return 0;
 
 err_sharedbuf_fail:
-	if (fl->proc_init_sharedbuf) {
-		fastrpc_buf_free(fl->proc_init_sharedbuf, false);
-		fl->proc_init_sharedbuf = NULL;
-	}
+	fastrpc_buf_free(fl->proc_init_sharedbuf, false);
+	fl->proc_init_sharedbuf = NULL;
 	return err;
 }
 
@@ -7941,6 +7939,11 @@ static int fastrpc_get_info_from_kernel(struct fastrpc_ioctl_capability *cap,
 	if (!user_obj)
 		user_obj = fl;
 
+	/* No sctx in TVM case treated as unsupported */
+	if (!user_obj->sctx) {
+		return -EOPNOTSUPP;
+	}
+
 	spin_lock_irqsave(&cctx->lock, flags);
 	/* check if we already have queried dsp for attributes */
 	if (cctx->valid_attributes) {
@@ -10128,8 +10131,10 @@ static void fastrpc_genpool_free(struct fastrpc_smmu *smmucb)
 	}
 	if (buf && smmucb->dev) {
 		domain = iommu_get_domain_for_dev(smmucb->dev);
-		iommu_unmap(domain, smmucb->genpool_iova,
-					smmucb->genpool_size);
+		if (domain) {
+			iommu_unmap(domain, smmucb->genpool_iova,
+						smmucb->genpool_size);
+		}
 		if (buf->phys)
 			dma_free_coherent(buf->dev, buf->size, buf->virt,
 				IOVA_TO_PHYSADDR(buf->phys, smmucb->sid_pos));

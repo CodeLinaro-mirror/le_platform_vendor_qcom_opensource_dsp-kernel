@@ -3516,6 +3516,21 @@ static void print_buf_info(struct seq_file *s_file, struct fastrpc_buf *buf)
 	seq_printf(s_file,"\n %s %s %d", "in_use", ":", buf->in_use);
 }
 
+#ifdef CONFIG_FASTRPC_QNA
+/* Print a discrete (scatter-gather) QNA allocation in debugfs. */
+static void print_sg_alloc_info(struct seq_file *s_file,
+		struct qna_discrete_alloc *sg)
+{
+	u64 ii;
+
+	seq_printf(s_file,"\n %s %2s 0x%llx", "total_size", ":", sg->total_size);
+	seq_printf(s_file,"\n %s %2s %llu", "num_blocks", ":", sg->num_blocks);
+	for (ii = 0; ii < sg->num_blocks; ii++)
+		seq_printf(s_file,"\n   block[%llu] addr 0x%llx size 0x%llx",
+			ii, sg->blocks[ii].addr, sg->blocks[ii].size);
+}
+#endif
+
 static void print_ictx_info(struct seq_file *s_file, struct fastrpc_invoke_ctx *ictx)
 {
 	seq_printf(s_file,"\n %s %7s %d", "nscalars", ":", ictx->nscalars);
@@ -3752,6 +3767,12 @@ static int fastrpc_debugfs_show(struct seq_file *s_file, void *data)
 			buf = fl->init_mem;
 			print_buf_info(s_file, buf);
 		}
+#ifdef CONFIG_FASTRPC_QNA
+		if (fl->init_mem_sg) {
+			seq_printf(s_file,"\n=============== Init Mem (discrete SG) ===============\n");
+			print_sg_alloc_info(s_file, fl->init_mem_sg);
+		}
+#endif
 		if (fl->pers_hdr_buf) {
 			seq_printf(s_file,"\n=============== Persistent Header Buf ===============\n");
 			buf = fl->pers_hdr_buf;
@@ -3859,6 +3880,287 @@ static int fastrpc_create_session_debugfs(struct fastrpc_user *fl)
 return 0;
 }
 #endif
+
+/* Returns true for discrete DSPs. */
+static bool fastrpc_is_discrete_dsp(struct fastrpc_user *fl)
+{
+	return fl && fl->cctx && fl->cctx->domain &&
+		fl->cctx->domain->card != SOC_CARD_ID;
+}
+
+#ifdef CONFIG_FASTRPC_QNA
+/*
+ * fastrpc_discrete_free_sg - release a QNA SG allocation.
+ *
+ * @sg: pointer to the caller's SG handle; cleared to NULL on return.
+ *
+ * Issues a QNA_MEM_PUT to the QNA memory manager for the allocation
+ * previously obtained via fastrpc_qna_alloc().
+ */
+static void fastrpc_discrete_free_sg(struct qna_discrete_alloc **sg)
+{
+	struct qna_mem_put_params put_params;
+	struct qna_mem_req_payload req;
+
+	if (!sg || !*sg)
+		return;
+
+	put_params = (struct qna_mem_put_params){ .alloc = *sg };
+	req = (struct qna_mem_req_payload){
+		.req_id = QNA_MEM_PUT,
+		.params = &put_params,
+		.size   = sizeof(put_params),
+	};
+	qna_mem_request(&req);
+	*sg = NULL;
+}
+
+/*
+ * fastrpc_qna_alloc - allocate a QNA SG buffer for a channel.
+ *
+ * @cctx:  channel context requesting the allocation
+ * @size:  size in bytes to allocate
+ * @label: short tag used in error logs to identify the caller
+ * @sg:    out-param; on success receives the SG allocation handle
+ *
+ * Issues a QNA_MEM_ALLOC to the QNA memory manager on the channel's
+ * domain. Fails if the resulting allocation is too scattered to fit
+ * within FASTRPC_MAX_SG_PAGES_PER_BUF blocks.
+ *
+ * Returns 0 on success, negative errno on failure.
+ */
+static int fastrpc_qna_alloc(struct fastrpc_channel_ctx *cctx,
+	u64 size, const char *label, struct qna_discrete_alloc **sg)
+{
+	struct qna_discrete_alloc *alloc;
+	unsigned int domain_id = (unsigned int)cctx->domain->instance_id;
+	int err;
+	struct qna_mem_alloc_params alloc_params = {
+		.size        = size,
+		.flags       = 0,
+		.type        = FASTRPC_DISCRETE_GLOBAL_MEM,
+		.domains     = &domain_id,
+		.num_domains = 1,
+		.card_no     = cctx->domain->card,
+	};
+	struct qna_mem_req_payload req = {
+		.req_id = QNA_MEM_ALLOC,
+		.params = &alloc_params,
+		.size   = sizeof(alloc_params),
+	};
+
+	err = qna_mem_request(&req);
+	if (err) {
+		dev_err(cctx->dev, "Error %d: %s: QNA alloc failed for %s size %llu\n",
+			err, __func__, label, size);
+		return err;
+	}
+	alloc = alloc_params.alloc;
+	if (!alloc || !alloc->blocks || !alloc->num_blocks) {
+		dev_err(cctx->dev, "Error: %s: invalid QNA alloc for %s size %llu\n",
+			__func__, label, size);
+		if (alloc)
+			fastrpc_discrete_free_sg(&alloc);
+		return -EINVAL;
+	}
+
+	if (alloc->num_blocks > FASTRPC_MAX_SG_PAGES_PER_BUF) {
+		dev_err(cctx->dev, "Error: %s: %s SG has %llu blocks, exceeds cap %u\n",
+			__func__, label, alloc->num_blocks, FASTRPC_MAX_SG_PAGES_PER_BUF);
+		fastrpc_discrete_free_sg(&alloc);
+		return -E2BIG;
+	}
+	*sg = alloc;
+	return 0;
+}
+
+/*
+ * fastrpc_discrete_alloc_rootheap - allocate a rootheap with SG donation.
+ *
+ * @fl:   fastrpc user object for the spawn
+ * @size: size in bytes to allocate
+ *
+ * Adds the donation to cctx->discrete_rootheap_bufs and publishes
+ * it on fl->rootheap_sg as a borrow pointer for this spawn.
+ *
+ * Returns 0 on success, negative errno on failure.
+ */
+static int fastrpc_discrete_alloc_rootheap(struct fastrpc_user *fl, u64 size)
+{
+	struct fastrpc_channel_ctx *cctx = fl->cctx;
+	struct fastrpc_rootheap_sg_node *node = NULL;
+	unsigned long flags;
+	int err;
+
+	node = kzalloc(sizeof(*node), GFP_KERNEL);
+	if (!node)
+		return -ENOMEM;
+
+	INIT_LIST_HEAD(&node->node);
+	err = fastrpc_qna_alloc(cctx, size, "rootheap", &node->alloc);
+	if (err) {
+		kfree(node);
+		return err;
+	}
+
+	/* Track the donation on the channel and publish it for this spawn. */
+	spin_lock_irqsave(&cctx->lock, flags);
+	list_add_tail(&node->node, &cctx->discrete_rootheap_bufs.list);
+	cctx->discrete_rootheap_bufs.num++;
+	spin_unlock_irqrestore(&cctx->lock, flags);
+
+	fl->rootheap_sg = node->alloc;
+	return 0;
+}
+
+/*
+ * fastrpc_discrete_drop_rootheap - remove and free every rootheap SG node from
+ * the dedicated discrete SG list (cctx->discrete_rootheap_bufs).
+ *
+ * @cctx: channel context owning the rootheap SG list
+ *
+ * Called on channel teardown to release all channel-scoped rootheap donations.
+ */
+static void fastrpc_discrete_drop_rootheap(struct fastrpc_channel_ctx *cctx)
+{
+	struct fastrpc_rootheap_sg_node *n, *found;
+	unsigned long flags;
+
+	if (!cctx)
+		return;
+
+	do {
+		found = NULL;
+		spin_lock_irqsave(&cctx->lock, flags);
+		list_for_each_entry(n, &cctx->discrete_rootheap_bufs.list, node) {
+			list_del(&n->node);
+			cctx->discrete_rootheap_bufs.num--;
+			found = n;
+			break;
+		}
+		spin_unlock_irqrestore(&cctx->lock, flags);
+
+		if (found) {
+			fastrpc_discrete_free_sg(&found->alloc);
+			kfree(found);
+		}
+	} while (found);
+}
+
+/*
+ * fastrpc_build_init_create_sgl - flatten per-role SG buffers for spawn.
+ *
+ * @fl:              fastrpc user object being spawned
+ * @pages:           per-role page table
+ * @pageslen:        number of role slots in @pages
+ * @flat_pages:      out-array; receives the concatenated SG page list
+ * @flat_pages_cap:  capacity of @flat_pages (entries)
+ * @flat_pages_len:  out-param; total number of entries written to @flat_pages
+ * @buffer_types:    out-array; role index for each contributing buffer
+ * @pages_per_buf:   out-array; page count contributed by each buffer
+ * @buffers_cap:     capacity of @buffer_types and @pages_per_buf
+ * @num_buffers:     out-param; number of buffers described in the output arrays
+ *
+ * Walks the per-role SG allocations (init_mem, rootheap, dbglogbuf, ...) and
+ * flattens them into the parallel @flat_pages / @buffer_types / @pages_per_buf
+ * arrays consumed by RMID_INIT_CREATE_ATTR_SGL.
+ *
+ * Returns 0 on success, negative errno on failure.
+ */
+static int fastrpc_build_init_create_sgl(struct fastrpc_user *fl,
+	struct fastrpc_phy_page *pages, u32 pageslen,
+	struct fastrpc_phy_page *flat_pages, u32 flat_pages_cap, u32 *flat_pages_len,
+	u32 *buffer_types, u32 *pages_per_buf, u32 buffers_cap, u32 *num_buffers)
+{
+	struct qna_discrete_alloc *init_mem_sg = NULL, *sg = NULL;
+	u32 buffer_count = 0, total_pages = 0, ii = 0, jj = 0;
+
+	if (!fl || !flat_pages || !flat_pages_len || !buffer_types ||
+		!pages_per_buf || !num_buffers)
+		return -EINVAL;
+
+	/* init_mem is always the first buffer  (NUM_PAGES_WITH_INIT_MEM_BUF-1). */
+	init_mem_sg = fl->init_mem_sg;
+	if (!init_mem_sg || !init_mem_sg->blocks || !init_mem_sg->num_blocks)
+		return -EINVAL;
+
+	if (total_pages + init_mem_sg->num_blocks > flat_pages_cap)
+		return -E2BIG;
+
+	/* Append init_mem SG blocks and record its role/page-count. */
+	buffer_types[buffer_count] = NUM_PAGES_WITH_INIT_MEM_BUF - 1;
+	pages_per_buf[buffer_count] = init_mem_sg->num_blocks;
+	buffer_count++;
+	for (ii = 0; ii < init_mem_sg->num_blocks; ++ii) {
+		flat_pages[total_pages].addr = init_mem_sg->blocks[ii].addr;
+		flat_pages[total_pages].size = init_mem_sg->blocks[ii].size;
+		total_pages++;
+	}
+
+	/* Walk remaining role slots; skip init_mem slot (already handled above). */
+	for (ii = 0; ii < pageslen; ++ii) {
+		if (ii == NUM_PAGES_WITH_INIT_MEM_BUF - 1)
+			continue;
+
+		/* Skip empty slots unless they are SG-backed (rootheap or dbglogbuf). */
+		if ((!pages[ii].addr || !pages[ii].size) &&
+			!(ii == NUM_PAGES_WITH_ROOTHEAP_BUF - 1 && fl->rootheap_sg) &&
+			!(ii == NUM_PAGES_WITH_MAP_DEBUG_BUF - 1 && fl->dbglogbuf_sg))
+			continue;
+
+		if ((ii == NUM_PAGES_WITH_ROOTHEAP_BUF - 1 && fl->rootheap_sg) ||
+			(ii == NUM_PAGES_WITH_MAP_DEBUG_BUF - 1 && fl->dbglogbuf_sg)) {
+			/* Multi-block SG buffer: flatten all its blocks. */
+			sg = (ii == NUM_PAGES_WITH_ROOTHEAP_BUF - 1) ? fl->rootheap_sg :
+				fl->dbglogbuf_sg;
+			if (buffer_count >= buffers_cap ||
+				total_pages + sg->num_blocks > flat_pages_cap)
+				return -E2BIG;
+			buffer_types[buffer_count] = ii;
+			pages_per_buf[buffer_count] = sg->num_blocks;
+			for (jj = 0; jj < sg->num_blocks; jj++) {
+				flat_pages[total_pages].addr = sg->blocks[jj].addr;
+				flat_pages[total_pages].size = sg->blocks[jj].size;
+				total_pages++;
+			}
+		} else {
+			/* Single contiguous page: copy it directly. */
+			if (buffer_count >= buffers_cap ||
+				total_pages + 1 > flat_pages_cap)
+				return -E2BIG;
+			buffer_types[buffer_count] = ii;
+			pages_per_buf[buffer_count] = 1;
+			flat_pages[total_pages] = pages[ii];
+			total_pages++;
+		}
+		buffer_count++;
+	}
+
+	*flat_pages_len = total_pages;
+	*num_buffers = buffer_count;
+	return 0;
+}
+#else /* !CONFIG_FASTRPC_QNA */
+/* Integrated targets: no QNA memory manager. */
+static void fastrpc_discrete_free_sg (struct qna_discrete_alloc **sg) {}
+static void fastrpc_discrete_drop_rootheap(struct fastrpc_channel_ctx *cctx) {}
+static inline int fastrpc_qna_alloc (struct fastrpc_channel_ctx *cctx,
+	u64 size, const char *label, struct qna_discrete_alloc **sg)
+{
+	return -ENODEV;
+}
+static inline int fastrpc_discrete_alloc_rootheap(struct fastrpc_user *fl, u64 size)
+{
+	return -ENODEV;
+}
+static inline int fastrpc_build_init_create_sgl(struct fastrpc_user *fl,
+	struct fastrpc_phy_page *pages, u32 pageslen,
+	struct fastrpc_phy_page *flat_pages, u32 flat_pages_cap, u32 *flat_pages_len,
+	u32 *buffer_types, u32 *pages_per_buf, u32 buffers_cap, u32 *num_buffers)
+{
+	return -ENODEV;
+}
+#endif /* CONFIG_FASTRPC_QNA */
 
 static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 					      char __user *argp)
@@ -4197,15 +4499,16 @@ bail:
 
 /*
  * Allocate buffer for growing rootheap on DSP
- * @arg1: channel context.
+ * @arg1: fastrpc user object.
  * @arg2: page array to be sent with process spawn msg
  * @arg3: number of pages
  *
  * Returns 0 on success
  */
-static int fastrpc_alloc_rootheap_buf(struct fastrpc_channel_ctx *cctx,
+static int fastrpc_alloc_rootheap_buf(struct fastrpc_user *fl,
 	struct fastrpc_phy_page *pages, u32 *pageslen)
 {
+	struct fastrpc_channel_ctx *cctx = fl->cctx;
 	struct fastrpc_buf *buf = NULL;
 	int err = 0;
 	unsigned long flags = 0;
@@ -4215,30 +4518,41 @@ static int fastrpc_alloc_rootheap_buf(struct fastrpc_channel_ctx *cctx,
 	const unsigned int NUM_ROOTHEAP_BUFS =
 		(cctx->rootheap_buf_count != 0) ? cctx->rootheap_buf_count :
 		FASTRPC_DEFAULT_ROOTHEAP_BUF_COUNT;
+	bool is_discrete = fastrpc_is_discrete_dsp(fl);
+	unsigned int donated_rootheap_bufs =
+		is_discrete ? cctx->discrete_rootheap_bufs.num : cctx->rootheap_bufs.num;
 
 	/* Allocate buffer only if DSP supports growing of rootheap */
 	if (!cctx->dsp_attributes[ROOTPD_RPC_HEAP_SUPPORT] ||
-		cctx->rootheap_bufs.num >= NUM_ROOTHEAP_BUFS ||
+		donated_rootheap_bufs >= NUM_ROOTHEAP_BUFS ||
 		g_frpc.is_trusted_vm)
 		return err;
 
-	/* Allocate buffer from context bank / session reserved for rootPD */
-	err = fastrpc_alloc_root_session_buf(cctx, &buf,
-						ROOTHEAP_BUF_SIZE,
-						ROOTHEAP_BUF);
-	if (err)
-		goto bail;
+	if (is_discrete) {
+		err = fastrpc_discrete_alloc_rootheap(fl, ROOTHEAP_BUF_SIZE);
+		if (err)
+			goto bail;
+		*pageslen = NUM_PAGES_WITH_ROOTHEAP_BUF;
+	} else {
+		/* Allocate buffer from context bank / session reserved for rootPD */
+		err = fastrpc_alloc_root_session_buf(cctx, &buf,
+							ROOTHEAP_BUF_SIZE,
+							ROOTHEAP_BUF);
+		if (err)
+			goto bail;
 
-	/* Update paramaters of process-spawn with buffer info */
-	*pageslen = NUM_PAGES_WITH_ROOTHEAP_BUF;
-	pages[NUM_PAGES_WITH_ROOTHEAP_BUF - 1].addr = buf->phys;
-	pages[NUM_PAGES_WITH_ROOTHEAP_BUF - 1].size = buf->size;
+		/* Update paramaters of process-spawn with buffer info */
+		*pageslen = NUM_PAGES_WITH_ROOTHEAP_BUF;
+		pages[NUM_PAGES_WITH_ROOTHEAP_BUF - 1].addr = buf->phys;
+		pages[NUM_PAGES_WITH_ROOTHEAP_BUF - 1].size = buf->size;
 
-	/* Add buf to channel's rootheap buf-list and increment count */
-	spin_lock_irqsave(&cctx->lock, flags);
-	list_add_tail(&buf->node, &cctx->rootheap_bufs.list);
-	cctx->rootheap_bufs.num++;
-	spin_unlock_irqrestore(&cctx->lock, flags);
+		/* Add buf to channel's rootheap buf-list and increment count */
+		spin_lock_irqsave(&cctx->lock, flags);
+		list_add_tail(&buf->node, &cctx->rootheap_bufs.list);
+		cctx->rootheap_bufs.num++;
+		spin_unlock_irqrestore(&cctx->lock, flags);
+
+	}
 bail:
 	return err;
 }
@@ -4581,10 +4895,21 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	struct fastrpc_invoke_args args[FASTRPC_CREATE_PROCESS_NARGS] = {0};
 	struct fastrpc_enhanced_invoke ioctl;
 	struct fastrpc_phy_page pages[NUM_PAGES_WITH_PERF_TIMLINE_DSP_K_SHAREDBUF] = {0};
+	struct fastrpc_phy_page flat_pages[(NUM_PAGES_WITH_PERF_TIMLINE_DSP_K_SHAREDBUF - 3) +
+		3 * FASTRPC_MAX_SG_PAGES_PER_BUF] = {0};
 	struct fastrpc_map *configmap = NULL;
 	struct fastrpc_buf *imem = NULL;
 	struct fastrpc_pool_ctx *sctx = NULL;
 	struct fastrpc_timeline *timeline = NULL;
+	struct fastrpc_process_create_args inbuf = {0};
+	struct fastrpc_process_create_sgl_args inbuf_sgl = {0};
+	u32 buffer_types[NUM_PAGES_WITH_PERF_TIMLINE_DSP_K_SHAREDBUF] = {0};
+	u32 pages_per_buf[NUM_PAGES_WITH_PERF_TIMLINE_DSP_K_SHAREDBUF] = {0};
+	u32 flat_pages_len = 0;
+	u32 num_buffers = 0;
+	u32 pageslen = 1;
+
+	bool discrete_spawn = false;
 	int memlen;
 	int err = 0, timeline_err = 0;
 	int user_fd = fl->config.user_fd, user_size = fl->config.user_size;
@@ -4597,15 +4922,6 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	 */
 	u32 pd = 0, compute = 0, tg = 0, mem_thread = 0, threads = 0;
 	u64 compute_size = 0, thread_size = 0, proc_res_size = 0;
-
-	struct {
-		int pgid;
-		u32 namelen;
-		u32 filelen;
-		u32 pageslen;
-		u32 attrs;
-		u32 siglen;
-	} inbuf;
 
 	if (copy_from_user(&init, argp, sizeof(init)))
 		return -EFAULT;
@@ -4700,13 +5016,6 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	/* In case of privileged process update attributes */
 	fastrpc_check_privileged_process(fl, &init);
 
-	inbuf.pgid = fl->tgid_frpc;
-	inbuf.namelen = strlen(fl->name) + 1;
-	inbuf.filelen = init.filelen;
-	inbuf.pageslen = 1;
-	inbuf.attrs = init.attrs;
-	inbuf.siglen = init.siglen;
-
 	/*
 	 * Default value at fastrpc_device_open is set as DEFAULT_UNUSED.
 	 * If pd_type is not configured by the process in fastrpc_set_session_info,
@@ -4724,41 +5033,57 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 		mutex_unlock(&fl->map_mutex);
 		if (err)
 			goto err_out;
-		inbuf.pageslen = NUM_PAGES_WITH_SHARED_BUF;
+		pageslen = NUM_PAGES_WITH_SHARED_BUF;
 		pages[NUM_PAGES_WITH_SHARED_BUF - 1].addr = configmap->phys;
 		pages[NUM_PAGES_WITH_SHARED_BUF - 1].size = configmap->size;
 	}
 
 	/* Process spawn should not fail if unable to alloc rootheap buffer */
-	fastrpc_alloc_rootheap_buf(fl->cctx, pages, &inbuf.pageslen);
+	fastrpc_alloc_rootheap_buf(fl, pages, &pageslen);
 
 	/* Process spawn should not fail if unable to pack root buffer */
-	fastrpc_pack_root_sharedpage(fl, pages, &inbuf.pageslen);
+	fastrpc_pack_root_sharedpage(fl, pages, &pageslen);
 
 	memlen = INIT_MEMLEN_MAX;
 
-	err = fastrpc_smmu_buf_alloc(fl, memlen, INITMEM_BUF, &imem);
+	discrete_spawn = fastrpc_is_discrete_dsp(fl);
+
+	if (discrete_spawn)
+		err = fastrpc_qna_alloc(fl->cctx, memlen, "init_mem", &fl->init_mem_sg);
+	else
+		err = fastrpc_smmu_buf_alloc(fl, memlen, INITMEM_BUF, &imem);
 	if (err)
-		goto err_alloc;
+		goto err_cleanup;
+	if (imem) {
+		fl->init_mem = imem;
+		pages[0].addr = fl->init_mem->phys;
+		pages[0].size = fl->init_mem->size;
+	}
 
 	/*
 	 * If dbglogbuf is supported on DSP, allocate 1MB buffer and send it to DSP
 	 * Process spawn should not fail if unable to alloc debug log buffer
 	 */
 	if (dsp_attributes[DBGLOGBUF_SUPPORT]) {
-		err = fastrpc_smmu_buf_alloc(fl, DBGLOGBUF_SIZE,
-				MAP_DEBUG_BUF, &fl->dbglogbuf);
-		if (err) {
-			if (fl->dbglogbuf) {
-				fastrpc_buf_free(fl->dbglogbuf, false);
-				fl->dbglogbuf = NULL;
-			}
-			dev_err(fl->cctx->dev, "Error %d: %s: Failed to allocate dbglogbuf buffer size %d\n",
-				err, __func__, DBGLOGBUF_SIZE);
+		if (discrete_spawn) {
+			err = fastrpc_qna_alloc(fl->cctx, DBGLOGBUF_SIZE, "dbglogbuf", &fl->dbglogbuf_sg);
+			if (!err)
+				pageslen = NUM_PAGES_WITH_MAP_DEBUG_BUF;
 		} else {
-			pages[NUM_PAGES_WITH_MAP_DEBUG_BUF-1].addr = fl->dbglogbuf->phys;
-			pages[NUM_PAGES_WITH_MAP_DEBUG_BUF-1].size = fl->dbglogbuf->size;
-			inbuf.pageslen = NUM_PAGES_WITH_MAP_DEBUG_BUF;
+			err = fastrpc_smmu_buf_alloc(fl, DBGLOGBUF_SIZE,
+					MAP_DEBUG_BUF, &fl->dbglogbuf);
+			if (err) {
+				if (fl->dbglogbuf) {
+					fastrpc_buf_free(fl->dbglogbuf, false);
+					fl->dbglogbuf = NULL;
+				}
+				dev_err(fl->cctx->dev, "Error %d: %s: Failed to allocate dbglogbuf buffer size %d\n",
+					err, __func__, DBGLOGBUF_SIZE);
+			} else {
+				pages[NUM_PAGES_WITH_MAP_DEBUG_BUF-1].addr = fl->dbglogbuf->phys;
+				pages[NUM_PAGES_WITH_MAP_DEBUG_BUF-1].size = fl->dbglogbuf->size;
+				pageslen = NUM_PAGES_WITH_MAP_DEBUG_BUF;
+			}
 		}
 	}
 
@@ -4791,7 +5116,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 				"Error: %s: Overflow in compute_size: compute=%u tg=%u\n",
 				__func__, compute, tg);
 			err = -EINVAL;
-			goto err_alloc;
+			goto err_cleanup;
 		}
 		compute_size = (u64)compute * (u64)tg;
 
@@ -4800,7 +5125,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 				"Error: %s: Overflow in thread_size: mem_thread=%u threads=%u\n",
 				__func__, mem_thread, threads);
 			err = -EINVAL;
-			goto err_alloc;
+			goto err_cleanup;
 		}
 		thread_size = (u64)mem_thread * (u64)threads;
 
@@ -4809,7 +5134,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 				"Error: %s: Overflow in pd + compute_size: pd=%u compute_size=%llu\n",
 				__func__, pd, compute_size);
 			err = -EINVAL;
-			goto err_alloc;
+			goto err_cleanup;
 		}
 		proc_res_size = (u64)pd + compute_size;
 
@@ -4818,7 +5143,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 				"Error: %s: Overflow in proc_res_size + thread_size: proc_res_size=%llu thread_size=%llu\n",
 				__func__, proc_res_size, thread_size);
 			err = -EINVAL;
-			goto err_alloc;
+			goto err_cleanup;
 		}
 		proc_res_size += thread_size;
 
@@ -4832,17 +5157,17 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 			dev_err(fl->cctx->dev,
 				"Error %d: %s: Failed to allocate process resources buffer size %llu\n",
 				err, __func__, proc_res_size);
-			goto err_alloc;
+			goto err_cleanup;
 		} else {
 			pages[NUM_PAGES_WITH_DSP_RTOS_MEM_DONATION - 1].addr =
 				fl->proc_res_buf->phys;
 			pages[NUM_PAGES_WITH_DSP_RTOS_MEM_DONATION - 1].size =
 				fl->proc_res_buf->size;
-			inbuf.pageslen = NUM_PAGES_WITH_DSP_RTOS_MEM_DONATION;
+			pageslen = NUM_PAGES_WITH_DSP_RTOS_MEM_DONATION;
 		}
 	}
 
-	err = fastrpc_preload_mem_alloc(fl->cctx, pages, &inbuf.pageslen, NUM_PAGES_WITH_PRELOAD_BUF);
+	err = fastrpc_preload_mem_alloc(fl->cctx, pages, &pageslen, NUM_PAGES_WITH_PRELOAD_BUF);
 	if(err)
 		dev_err(fl->cctx->dev, "Error %d: %s: Failed to allocate preload buffer\n",
 				err, __func__);
@@ -4855,46 +5180,94 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 			pr_err("%s: Failed to allocate timeline buffer(err 0x%x)\n",
 				__func__, timeline_err);
 		else
-			inbuf.pageslen = NUM_PAGES_WITH_PERF_TIMLINE_DSP_K_SHAREDBUF;
+			pageslen = NUM_PAGES_WITH_PERF_TIMLINE_DSP_K_SHAREDBUF;
 	}
 
-	fl->init_mem = imem;
-	args[0].ptr = (u64)(uintptr_t)&inbuf;
-	args[0].length = sizeof(inbuf);
-	args[0].fd = -1;
-
-	args[1].ptr = (u64)(uintptr_t)fl->name;
-	args[1].length = inbuf.namelen;
-	args[1].fd = -1;
-
-	args[2].ptr = file ? (u64)(uintptr_t)file : init.file;
-	args[2].length = inbuf.filelen;
-	args[2].fd = init.filefd;
-
-	pages[0].addr = imem->phys;
-	pages[0].size = imem->size;
-
-	args[3].ptr = (u64)(uintptr_t) pages;
-	args[3].length = inbuf.pageslen * sizeof(*pages);
-	args[3].fd = -1;
-
-	args[4].ptr = (u64)(uintptr_t)&inbuf.attrs;
-	args[4].length = sizeof(inbuf.attrs);
-	args[4].fd = -1;
-
-	args[5].ptr = (u64)(uintptr_t) &inbuf.siglen;
-	args[5].length = sizeof(inbuf.siglen);
-	args[5].fd = -1;
-
 	ioctl.inv.handle = FASTRPC_INIT_HANDLE;
-	ioctl.inv.sc = FASTRPC_SCALARS(FASTRPC_RMID_INIT_CREATE, 4, 0);
-	if (init.attrs)
-		ioctl.inv.sc = FASTRPC_SCALARS(FASTRPC_RMID_INIT_CREATE_ATTR, 4, 0);
-	ioctl.inv.args = (__u64)args;
+	if (discrete_spawn) {
+		inbuf_sgl.pgid = fl->tgid_frpc;
+		inbuf_sgl.namelen = strlen(fl->name) + 1;
+		inbuf_sgl.filelen = init.filelen;
+		inbuf_sgl.attrs = init.attrs;
+		inbuf_sgl.siglen = init.siglen;
 
+		err = fastrpc_build_init_create_sgl(fl, pages, pageslen,
+			flat_pages, ARRAY_SIZE(flat_pages), &flat_pages_len,
+			buffer_types, pages_per_buf, ARRAY_SIZE(buffer_types),
+			&num_buffers);
+		if (err)
+			goto err_cleanup;
+
+		inbuf_sgl.buf_types_len = num_buffers;
+		inbuf_sgl.pages_per_buf_len = num_buffers;
+		inbuf_sgl.flat_pages_len = flat_pages_len;
+
+		args[0].ptr = (u64)(uintptr_t)&inbuf_sgl;
+		args[0].length = sizeof(inbuf_sgl);
+		args[0].fd = -1;
+
+		args[1].ptr = (u64)(uintptr_t)fl->name;
+		args[1].length = inbuf_sgl.namelen;
+		args[1].fd = -1;
+
+		args[2].ptr = file ? (u64)(uintptr_t)file : init.file;
+		args[2].length = inbuf_sgl.filelen;
+		args[2].fd = init.filefd;
+
+		args[3].ptr = (u64)(uintptr_t)buffer_types;
+		args[3].length = num_buffers * sizeof(*buffer_types);
+		args[3].fd = -1;
+
+		args[4].ptr = (u64)(uintptr_t)pages_per_buf;
+		args[4].length = num_buffers * sizeof(*pages_per_buf);
+		args[4].fd = -1;
+
+		args[5].ptr = (u64)(uintptr_t)flat_pages;
+		args[5].length = flat_pages_len * sizeof(*flat_pages);
+		args[5].fd = -1;
+
+		ioctl.inv.sc = FASTRPC_SCALARS(FASTRPC_RMID_INIT_CREATE_ATTR_SGL, 6, 0);
+	} else {
+		/* Integrated (non-SGL) path: build the flat create message here. */
+		inbuf.pgid = fl->tgid_frpc;
+		inbuf.namelen = strlen(fl->name) + 1;
+		inbuf.filelen = init.filelen;
+		inbuf.pageslen = pageslen;
+		inbuf.attrs = init.attrs;
+		inbuf.siglen = init.siglen;
+
+		args[0].ptr = (u64)(uintptr_t)&inbuf;
+		args[0].length = sizeof(inbuf);
+		args[0].fd = -1;
+
+		args[1].ptr = (u64)(uintptr_t)fl->name;
+		args[1].length = inbuf.namelen;
+		args[1].fd = -1;
+
+		args[2].ptr = file ? (u64)(uintptr_t)file : init.file;
+		args[2].length = inbuf.filelen;
+		args[2].fd = init.filefd;
+
+		args[3].ptr = (u64)(uintptr_t) pages;
+		args[3].length = inbuf.pageslen * sizeof(*pages);
+		args[3].fd = -1;
+
+		args[4].ptr = (u64)(uintptr_t)&inbuf.attrs;
+		args[4].length = sizeof(inbuf.attrs);
+		args[4].fd = -1;
+
+		args[5].ptr = (u64)(uintptr_t) &inbuf.siglen;
+		args[5].length = sizeof(inbuf.siglen);
+		args[5].fd = -1;
+
+		ioctl.inv.sc = FASTRPC_SCALARS(FASTRPC_RMID_INIT_CREATE, 4, 0);
+		if (init.attrs)
+			ioctl.inv.sc = FASTRPC_SCALARS(FASTRPC_RMID_INIT_CREATE_ATTR, 4, 0);
+	}
+	ioctl.inv.args = (__u64)args;
 	err = fastrpc_internal_invoke(fl, KERNEL_MSG_WITH_ZERO_PID, &ioctl);
 	if (err)
-		goto err_invoke;
+		goto err_cleanup;
 
 	timeline_err = fastrpc_update_timeline_version(timeline);
 	if (!timeline_err)
@@ -4918,13 +5291,20 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 
 	return 0;
 
-err_invoke:
-	spin_lock(&fl->lock);
-	fl->init_mem = NULL;
-	spin_unlock(&fl->lock);
-	fastrpc_buf_free(imem, false);
+err_cleanup:
+	/* Free all allocations made during process spawn setup. */
+	if (fl->init_mem) {
+		fastrpc_buf_free(fl->init_mem, false);
+		fl->init_mem = NULL;
+	}
+	fastrpc_discrete_free_sg(&fl->init_mem_sg);
+	/*
+	 * rootheap_sg is a borrow pointer into the channel-owned
+	 * discrete_rootheap_bufs list; the donation is channel-scoped and
+	 * freed at channel teardown. Just clear the borrow pointer.
+	 */
+	fl->rootheap_sg = NULL;
 	kvfree(timeline);
-err_alloc:
 	if (fl->proc_init_sharedbuf) {
 		fastrpc_buf_free(fl->proc_init_sharedbuf, false);
 		fl->proc_init_sharedbuf = NULL;
@@ -4938,6 +5318,7 @@ err_alloc:
 		fastrpc_buf_free(fl->dbglogbuf, false);
 		fl->dbglogbuf = NULL;
 	}
+	fastrpc_discrete_free_sg(&fl->dbglogbuf_sg);
 	if (fl->proc_res_buf) {
 		fastrpc_buf_free(fl->proc_res_buf, false);
 		fl->proc_res_buf = NULL;
@@ -5017,6 +5398,13 @@ void fastrpc_free_user(struct fastrpc_user *fl)
 		fastrpc_buf_free(fl->init_mem, false);
 		fl->init_mem = NULL;
 	}
+	fastrpc_discrete_free_sg(&fl->init_mem_sg);
+	/*
+	 * rootheap_sg is a borrow pointer into the channel-owned
+	 * discrete_rootheap_bufs list. Successful spawns let channel teardown
+	 * free the node; just clear the borrow pointer here.
+	 */
+	fl->rootheap_sg = NULL;
 
 	mutex_lock(&fl->map_mutex);
 	// During process tear down free the map, even if refcount is non-zero
@@ -5049,6 +5437,7 @@ void fastrpc_free_user(struct fastrpc_user *fl)
 		fastrpc_buf_free(fl->dbglogbuf, false);
 		fl->dbglogbuf = NULL;
 	}
+	fastrpc_discrete_free_sg(&fl->dbglogbuf_sg);
 
 	if (fl->proc_res_buf) {
 		fastrpc_buf_free(fl->proc_res_buf, false);
@@ -11114,6 +11503,7 @@ static int fastrpc_cb_remove(struct platform_device *pdev)
 
 	if (sess->pd_type == ROOT_PD || sess->pd_type == NS_CHANNEL_SHARED) {
 		fastrpc_rootheap_buf_list_free(cctx);
+		fastrpc_discrete_drop_rootheap(cctx);
 		fastrpc_preload_mem_free(cctx);
 	}
 

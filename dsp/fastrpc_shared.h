@@ -42,6 +42,13 @@
 #include <linux/qcom_scm.h>
 #endif
 
+#ifdef CONFIG_FASTRPC_QNA
+#include <qna.h>
+#endif
+
+/* Opaque type; full definition lives in <qna.h> (CONFIG_FASTRPC_QNA only) */
+struct qna_discrete_alloc;
+
 #define ADSP_DOMAIN_ID (0)
 #define MDSP_DOMAIN_ID (1)
 #define SDSP_DOMAIN_ID (2)
@@ -274,15 +281,19 @@
  *     Page 5 : map debug log buf
  *     Page 6 : DSP RTOS memory donation
  *     Page 7 : preload buf
- *     Page 8 : performance timeline buffer for userpsace
+ *     Page 8 : performance timeline buffer for userspace
  *     Page 9 : performance timeline buffer for rootpd
  */
-#define NUM_PAGES_WITH_SHARED_BUF 2
-#define NUM_PAGES_WITH_ROOTHEAP_BUF 3
-#define NUM_PAGES_WITH_PROC_INIT_SHAREDBUF 4
-#define NUM_PAGES_WITH_MAP_DEBUG_BUF 5
-#define NUM_PAGES_WITH_DSP_RTOS_MEM_DONATION 6
-#define NUM_PAGES_WITH_PRELOAD_BUF 7
+#define NUM_PAGES_WITH_INIT_MEM_BUF            1
+#define NUM_PAGES_WITH_SHARED_BUF              2
+#define NUM_PAGES_WITH_ROOTHEAP_BUF            3
+#define NUM_PAGES_WITH_PROC_INIT_SHAREDBUF     4
+#define NUM_PAGES_WITH_MAP_DEBUG_BUF           5
+#define NUM_PAGES_WITH_DSP_RTOS_MEM_DONATION   6
+#define NUM_PAGES_WITH_PRELOAD_BUF             7
+
+/* Max scatter-gather blocks per buffer. */
+#define FASTRPC_MAX_SG_PAGES_PER_BUF 16
 
 /*
  * Num of pages shared with init attach 2 call
@@ -714,6 +725,7 @@ enum fastrpc_process_method_ids {
 	FASTRPC_RMID_KCOMM_REMOTE_CALL  = 14,
 	FASTRPC_RMID_INIT_ATTACH2       = 16,
 	FASTRPC_RMID_INIT_KERNEL_DISPATCH = 17,
+	FASTRPC_RMID_INIT_CREATE_ATTR_SGL = 18,
 	FASTRPC_RMID_INIT_MAX,
 };
 
@@ -920,6 +932,28 @@ struct frpc_transport_session_control {
 struct fastrpc_phy_page {
 	u64 addr;		/* physical address */
 	u64 size;		/* size of contiguous region */
+};
+
+/* Integrated NSP process create payload. */
+struct fastrpc_process_create_args {
+	int pgid;
+	u32 namelen;
+	u32 filelen;
+	u32 pageslen;
+	u32 attrs;
+	u32 siglen;
+};
+
+/* Discrete NSP process create payload. */
+struct fastrpc_process_create_sgl_args {
+	int pgid;
+	u32 namelen;
+	u32 filelen;
+	u32 buf_types_len;
+	u32 pages_per_buf_len;
+	u32 flat_pages_len;
+	u32 attrs;
+	u32 siglen;
 };
 
 struct fastrpc_phy_page2 {
@@ -1318,6 +1352,13 @@ struct heap_bufs {
 	unsigned int num;
 };
 
+#ifdef CONFIG_FASTRPC_QNA
+struct fastrpc_rootheap_sg_node {
+	struct list_head node;
+	struct qna_discrete_alloc *alloc;
+};
+#endif /* CONFIG_FASTRPC_QNA */
+
 struct fastrpc_domain;
 
 struct kcomm_worker {
@@ -1448,6 +1489,8 @@ struct fastrpc_channel_ctx {
 	atomic_t teardown;
 	/* Buffers donated to grow rootheap on DSP */
 	struct heap_bufs rootheap_bufs;
+	/* Discrete buffers donated to grow rootheap on DSP */
+	struct heap_bufs discrete_rootheap_bufs;
 	/* jobid counter to prepend into ctxid */
 	u64 jobid;
 	/* Flag to indicate CB pooling is enabled for channel */
@@ -1709,6 +1752,12 @@ struct fastrpc_user {
 	struct fastrpc_pool_ctx *extctx;
 
 	struct fastrpc_buf *init_mem;
+	/* SG allocation backing init_mem on discrete (Firewheel) DSP */
+	struct qna_discrete_alloc *init_mem_sg;
+	/* Rootheap SG donated by this spawn (borrowed; owned by cctx list) */
+	struct qna_discrete_alloc *rootheap_sg;
+	/* SG allocation backing dbglogbuf on discrete (Firewheel) DSP */
+	struct qna_discrete_alloc *dbglogbuf_sg;
 	/* Pre-allocated header buffer */
 	struct fastrpc_buf *pers_hdr_buf;
 	/* proc_init shared buffer */

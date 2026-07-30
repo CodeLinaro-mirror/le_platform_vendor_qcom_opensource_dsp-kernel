@@ -9416,7 +9416,7 @@ void fastrpc_driver_unregister(struct fastrpc_driver *frpc_driver){
 		frpc_driver->device = NULL;
 		spin_unlock_irqrestore(glock, irq_flags);
 		kfree(frpc_dev);
-		pr_info("Un-registering fastrpc driver with handle 0x%x\n",
+		pr_info("Device already closed, un-registering fastrpc driver with handle 0x%x\n",
 			frpc_driver->handle);
 		return;
 	}
@@ -9467,6 +9467,7 @@ int fastrpc_driver_register(struct fastrpc_driver *frpc_driver)
 	struct fastrpc_user *user = NULL;
 	struct fastrpc_channel_ctx *cctx = NULL;
 	struct fastrpc_domain *domain = NULL;
+	int dsp_state;
 
 	if(frpc_driver == NULL) {
 		pr_err("%s : invalid registraion request", __func__);
@@ -9510,9 +9511,13 @@ out:
 	return -ESRCH;
 
 process_found:
-	if(atomic_read(&user->state) >= DSP_EXIT_START) {
+	/*
+	 * Registration requires user->device to be valid
+	 * (set only when state equals DSP_CREATE_COMPLETE)
+	 */
+	if ((dsp_state = atomic_read(&user->state)) != DSP_CREATE_COMPLETE) {
 		spin_unlock_irqrestore(&cctx->lock, irq_flags);
-		pr_err("%s : process already exited", __func__);
+		pr_err("%s : process found with state invalid for registration, state %d\n", __func__, dsp_state);
 		fastrpc_file_put(user, false);
 		return -ESRCH;
 	}

@@ -14,6 +14,7 @@
 #include <linux/wait.h>
 #include "../include/uapi/misc/fastrpc.h"
 #include "fastrpc_shared.h"
+#include "fastrpc_trace.h"
 
 #define FASTRPC_APP_PRIORITY_DEFAULT	1000
 
@@ -48,6 +49,8 @@ static void fastrpc_workinfo_notify(struct fastrpc_scheduler *sched,
 		reason, work->handle, work->app_id,
 		(int)work->work_prio, (int)work->eff_prio,
 		cctx->domain_id);
+	trace_fastrpc_npu_workinfo(cctx->domain_id, (s32)work->work_id,
+				   (s32)work->app_id, (u32)event, reason, 0);
 	fastrpc_npu_post_workinfo(cctx, &info);
 }
 
@@ -369,6 +372,10 @@ static void fastrpc_apply_prio_updates(struct fastrpc_scheduler *sched)
 		pr_debug("%s: prio update app_id=%d old=%u new=%u\n",
 			__func__, entry->app_id, entry->cur_prio, new_prio);
 
+		trace_fastrpc_npu_sched(__func__, 0, entry->app_id, NULL,
+					-1, entry->cur_prio, new_prio,
+					sched->ref_prio, 0);
+
 		/* Re-key only PENDING works for this app */
 		list_for_each_entry_safe(work, tmp,
 					 &entry->works, app_node) {
@@ -420,7 +427,7 @@ static void fastrpc_drain_incoming(struct fastrpc_scheduler *sched)
 	struct fastrpc_channel_ctx *cctx =
 		container_of(sched, struct fastrpc_channel_ctx,
 			     scheduler);
-	struct fastrpc_work_node *work, *tmp;
+	struct fastrpc_work_node *work, *tmp, *exec;
 	struct fastrpc_app_entry *entry;
 	u32 app_prio;
 
@@ -440,6 +447,9 @@ static void fastrpc_drain_incoming(struct fastrpc_scheduler *sched)
 		if (atomic_read(&work->state) == WORK_STATE_ABORTED) {
 			pr_debug("%s: handle=0x%llx app_id=%d aborted, freeing\n",
 				__func__, work->handle, work->app_id);
+			trace_fastrpc_npu_sched(__func__, work->handle, work->app_id, work->fl,
+						WORK_STATE_ABORTED, work->work_prio,
+						0, sched->ref_prio, 0);
 			list_del(&work->app_node);
 			list_del_init(&work->user_node);
 			fastrpc_work_node_free(work);
@@ -459,6 +469,9 @@ static void fastrpc_drain_incoming(struct fastrpc_scheduler *sched)
 		 */
 		entry = fastrpc_app_entry_get(sched, work->app_id);
 		if (WARN_ON(!entry)) {
+			trace_fastrpc_npu_sched(__func__, work->handle, work->app_id, work->fl,
+						WORK_STATE_INCOMING, work->work_prio,
+						0, sched->ref_prio, -ENOMEM);
 			list_del(&work->app_node);
 			WRITE_ONCE(*work->result, -ENOMEM);
 			complete(work->wait_done);
@@ -482,11 +495,32 @@ static void fastrpc_drain_incoming(struct fastrpc_scheduler *sched)
 
 		/* Transition to PENDING and insert into rbtree */
 		atomic_set(&work->state, WORK_STATE_PENDING);
+		trace_fastrpc_npu_sched(__func__, work->handle, work->app_id, work->fl,
+					WORK_STATE_PENDING, work->work_prio,
+					work->eff_prio, sched->ref_prio, 0);
 		fastrpc_pending_tree_insert(sched, work);
 
 		/* Notify that the work has been received and queued */
 		fastrpc_workinfo_notify(sched, work, WORK_REQUESTED,
 					NPU_WORK_REASON_NONE);
+
+		/*
+		 * Hang-debug aid: with this work now PENDING, walk the
+		 * executing_list and emit a trace for each currently
+		 * executing job.  A pending work is only held back from
+		 * admission (Stage 5) by executing works with a better
+		 * eff_prio; if one of those never completes it blocks this
+		 * work forever.  This snapshot records exactly which jobs
+		 * are occupying the executing_list at enqueue time, which
+		 * is what we needed to diagnose the scheduler hang.
+		 * Runs under sched->lock, so executing_list is stable.
+		 */
+		list_for_each_entry(exec, &sched->executing_list, exec_node)
+			trace_fastrpc_npu_sched(__func__, exec->handle,
+						exec->app_id, exec->fl,
+						atomic_read(&exec->state),
+						exec->work_prio, exec->eff_prio,
+						sched->ref_prio, 0);
 	}
 }
 
@@ -509,6 +543,10 @@ static void fastrpc_drain_abort_list(struct fastrpc_scheduler *sched)
 
 		pr_debug("%s: handle=0x%llx app_id=%d freeing aborted PENDING\n",
 			__func__, work->handle, work->app_id);
+
+		trace_fastrpc_npu_sched(__func__, work->handle, work->app_id, work->fl,
+					WORK_STATE_ABORTED, work->work_prio,
+					work->eff_prio, sched->ref_prio, 0);
 
 		/* Remove from rbtree, per-app list, and per-user list */
 		rb_erase(&work->rb_node, &sched->pending_tree);
@@ -551,6 +589,9 @@ static void fastrpc_drain_done_list(struct fastrpc_scheduler *sched)
 		fastrpc_recalc_ref_prio(sched);
 		pr_debug("%s: handle=0x%llx app_id=%d DONE, freeing\n",
 			__func__, work->handle, work->app_id);
+		trace_fastrpc_npu_sched(__func__, work->handle, work->app_id, work->fl,
+					WORK_STATE_DONE, work->work_prio,
+					work->eff_prio, sched->ref_prio, 0);
 		fastrpc_workinfo_notify(sched, work, WORK_ENDED,
 					work->end_reason);
 		fastrpc_work_node_free(work);
@@ -650,6 +691,9 @@ static int fastrpc_scheduler_thread(void *data)
 				pr_debug("%s: admission: handle=0x%llx eff_prio=%u > ref_prio=%u, holding\n",
 					__func__, work->handle, work->eff_prio,
 					sched->ref_prio);
+				trace_fastrpc_npu_sched(__func__, work->handle, work->app_id, work->fl,
+							WORK_STATE_PENDING, work->work_prio,
+							work->eff_prio, sched->ref_prio, 0);
 				break;
 			}
 
@@ -678,6 +722,9 @@ static int fastrpc_scheduler_thread(void *data)
 			list_add_tail(&work->exec_node,
 				      &sched->executing_list);
 			sched->ref_prio = min(work->eff_prio, sched->ref_prio);
+			trace_fastrpc_npu_sched(__func__, work->handle, work->app_id, work->fl,
+						WORK_STATE_ADMITTED, work->work_prio,
+						work->eff_prio, sched->ref_prio, 0);
 
 			/*
 			 * Post the STARTED notification before unblocking
@@ -790,22 +837,33 @@ int fastrpc_work_add(struct fastrpc_user *fl,
 	 * documented above fastrpc_npu_check_access().
 	 */
 	err = fastrpc_npu_check_access(fl->cctx, fl->uid, work->appid);
-	if (err)
+	if (err) {
+		trace_fastrpc_npu_sched(__func__, work->handle, work->appid, fl,
+					-1, 0, 0, 0, err);
 		return err;
+	}
 
 	if (work->group_id && work->group_id_len > 0) {
-		if (work->group_id_len > NPU_MAX_WORKINFO_FIELD_LEN)
+		if (work->group_id_len > NPU_MAX_WORKINFO_FIELD_LEN) {
+			trace_fastrpc_npu_sched(__func__, work->handle, work->appid, fl,
+						-1, 0, 0, 0, -EINVAL);
 			return -EINVAL;
+		}
 		group_id = strndup_user(
 			(void __user *)(uintptr_t)work->group_id,
 			work->group_id_len + 1);
-		if (IS_ERR(group_id))
+		if (IS_ERR(group_id)) {
+			trace_fastrpc_npu_sched(__func__, work->handle, work->appid, fl,
+						-1, 0, 0, 0, (int)PTR_ERR(group_id));
 			return PTR_ERR(group_id);
+		}
 	}
 
 	if (work->feature_id && work->feature_id_len > 0) {
 		if (work->feature_id_len > NPU_MAX_WORKINFO_FIELD_LEN) {
 			kfree(group_id);
+			trace_fastrpc_npu_sched(__func__, work->handle, work->appid, fl,
+						-1, 0, 0, 0, -EINVAL);
 			return -EINVAL;
 		}
 		feature_id = strndup_user(
@@ -813,6 +871,8 @@ int fastrpc_work_add(struct fastrpc_user *fl,
 			work->feature_id_len + 1);
 		if (IS_ERR(feature_id)) {
 			kfree(group_id);
+			trace_fastrpc_npu_sched(__func__, work->handle, work->appid, fl,
+						-1, 0, 0, 0, (int)PTR_ERR(feature_id));
 			return PTR_ERR(feature_id);
 		}
 	}
@@ -822,6 +882,8 @@ int fastrpc_work_add(struct fastrpc_user *fl,
 	if (!wnode) {
 		kfree(group_id);
 		kfree(feature_id);
+		trace_fastrpc_npu_sched(__func__, work->handle, work->appid, fl,
+					-1, 0, 0, 0, -ENOMEM);
 		return -ENOMEM;
 	}
 
@@ -884,6 +946,7 @@ int fastrpc_work_add(struct fastrpc_user *fl,
 			spin_unlock(&sched->lock);
 			pr_debug("%s: handle=0x%llx scheduler stopped, rejecting\n",
 				 __func__, work->handle);
+			trace_fastrpc_npu_sched(__func__, wnode->handle, wnode->app_id, fl, -1, 0, 0, sched->ref_prio, -ESHUTDOWN);
 			fastrpc_work_node_free(wnode);
 			return -ESHUTDOWN;
 		}
@@ -893,6 +956,7 @@ int fastrpc_work_add(struct fastrpc_user *fl,
 			spin_unlock(&sched->lock);
 			pr_err("%s: handle=0x%llx app_id=%d rejected, duplicate\n",
 				__func__, work->handle, work->appid);
+			trace_fastrpc_npu_sched(__func__, wnode->handle, wnode->app_id, fl, -1, 0, 0, sched->ref_prio, -EEXIST);
 			fastrpc_work_node_free(wnode);
 			return -EEXIST;
 		}
@@ -902,6 +966,7 @@ int fastrpc_work_add(struct fastrpc_user *fl,
 			spin_unlock(&sched->lock);
 			pr_debug("%s: handle=0x%llx app_id=%d, app_entry alloc failed\n",
 				__func__, work->handle, work->appid);
+			trace_fastrpc_npu_sched(__func__, wnode->handle, wnode->app_id, fl, -1, 0, 0, sched->ref_prio, -ENOMEM);
 			fastrpc_work_node_free(wnode);
 			return -ENOMEM;
 		}
@@ -914,6 +979,9 @@ int fastrpc_work_add(struct fastrpc_user *fl,
 			wnode->work_prio,
 			wnode->group_id ? wnode->group_id : "(none)",
 			wnode->feature_id ? wnode->feature_id : "(none)");
+		trace_fastrpc_npu_sched(__func__, wnode->handle, wnode->app_id, fl,
+					WORK_STATE_INCOMING, wnode->work_prio,
+					0, sched->ref_prio, 0);
 	}
 	spin_unlock(&sched->lock);
 
@@ -930,6 +998,8 @@ int fastrpc_work_add(struct fastrpc_user *fl,
 
 	pr_debug("%s: handle=0x%llx app_id=%d result=%d\n",
 		__func__, work->handle, work->appid, result);
+
+	trace_fastrpc_npu_sched(__func__, work->handle, work->appid, fl, -1, 0, 0, sched->ref_prio, result);
 
 	return result;
 }
@@ -969,6 +1039,7 @@ int fastrpc_work_remove(struct fastrpc_user *fl,
 		spin_unlock(&sched->lock);
 		pr_debug("%s: handle=0x%llx app_id=%d not found\n",
 			__func__, work->handle, work->appid);
+		trace_fastrpc_npu_sched(__func__, work->handle, work->appid, fl, -1, 0, 0, sched->ref_prio, -ENOENT);
 		return -ENOENT;
 	}
 
@@ -989,6 +1060,9 @@ int fastrpc_work_remove(struct fastrpc_user *fl,
 			break;
 		pr_debug("%s: handle=0x%llx app_id=%d INCOMING -> ABORTED\n",
 			__func__, wnode->handle, wnode->app_id);
+		trace_fastrpc_npu_sched(__func__, wnode->handle, wnode->app_id, fl,
+					WORK_STATE_ABORTED, wnode->work_prio,
+					0, sched->ref_prio, 0);
 		/*
 		 * Remove user_node now to protect against fl being freed
 		 * before the kthread drains incoming_list and calls
@@ -1014,6 +1088,9 @@ int fastrpc_work_remove(struct fastrpc_user *fl,
 			break;
 		pr_debug("%s: handle=0x%llx app_id=%d PENDING -> ABORTED\n",
 			__func__, wnode->handle, wnode->app_id);
+		trace_fastrpc_npu_sched(__func__, wnode->handle, wnode->app_id, fl,
+					WORK_STATE_ABORTED, wnode->work_prio,
+					wnode->eff_prio, sched->ref_prio, 0);
 		/*
 		 * Remove user_node now to protect against fl being freed
 		 * before the kthread drains abort_list and calls
@@ -1045,6 +1122,9 @@ int fastrpc_work_remove(struct fastrpc_user *fl,
 			break;
 		pr_debug("%s: handle=0x%llx app_id=%d ADMITTED -> DONE\n",
 			__func__, wnode->handle, wnode->app_id);
+		trace_fastrpc_npu_sched(__func__, wnode->handle, wnode->app_id, fl,
+					WORK_STATE_DONE, wnode->work_prio,
+					wnode->eff_prio, sched->ref_prio, 0);
 		list_del_init(&wnode->user_node);
 		list_add_tail(&wnode->staging_node,
 			      &sched->done_list);
@@ -1057,6 +1137,9 @@ int fastrpc_work_remove(struct fastrpc_user *fl,
 		break;
 	}
 
+	trace_fastrpc_npu_sched(__func__, wnode->handle, wnode->app_id, fl,
+				atomic_read(&wnode->state), wnode->work_prio,
+				wnode->eff_prio, sched->ref_prio, -ENOENT);
 	spin_unlock(&sched->lock);
 	return -ENOENT;
 }
@@ -1088,6 +1171,8 @@ int fastrpc_scheduler_init(struct fastrpc_scheduler *sched)
 
 		pr_err("%s: kthread creation failed: %d\n",
 		       __func__, ret);
+		trace_fastrpc_npu_sched(__func__, 0, -1, NULL, -1, 0, 0,
+					sched->ref_prio, ret);
 		sched->kthread = NULL;
 		return ret;
 	}
@@ -1150,6 +1235,11 @@ void fastrpc_scheduler_abort_all(struct fastrpc_scheduler *sched)
 				   WORK_STATE_ABORTED) == WORK_STATE_INCOMING) {
 			pr_debug("%s: handle=0x%llx app_id=%d INCOMING -> ABORTED\n",
 				 __func__, work->handle, work->app_id);
+			trace_fastrpc_npu_sched(__func__, work->handle,
+						work->app_id, work->fl,
+						WORK_STATE_ABORTED,
+						work->work_prio, 0,
+						sched->ref_prio, 0);
 			WRITE_ONCE(*work->result, -ECANCELED);
 			complete(work->wait_done);
 		}
@@ -1169,6 +1259,12 @@ void fastrpc_scheduler_abort_all(struct fastrpc_scheduler *sched)
 				   WORK_STATE_ABORTED) == WORK_STATE_PENDING) {
 			pr_debug("%s: handle=0x%llx app_id=%d PENDING -> ABORTED\n",
 				 __func__, work->handle, work->app_id);
+			trace_fastrpc_npu_sched(__func__, work->handle,
+						work->app_id, work->fl,
+						WORK_STATE_ABORTED,
+						work->work_prio,
+						work->eff_prio,
+						sched->ref_prio, 0);
 			WRITE_ONCE(*work->result, -ECANCELED);
 			complete(work->wait_done);
 		}
@@ -1218,6 +1314,9 @@ void fastrpc_scheduler_deinit(struct fastrpc_scheduler *sched)
 				 staging_node) {
 		list_del(&work->staging_node);
 		if (atomic_read(&work->state) == WORK_STATE_INCOMING) {
+			trace_fastrpc_npu_sched(__func__, work->handle, work->app_id, work->fl,
+						WORK_STATE_INCOMING, work->work_prio,
+						work->eff_prio, sched->ref_prio, -ECANCELED);
 			WRITE_ONCE(*work->result, -ECANCELED);
 			complete(work->wait_done);
 		}
@@ -1278,6 +1377,9 @@ void fastrpc_scheduler_deinit(struct fastrpc_scheduler *sched)
 		 * call complete() again.
 		 */
 		if (atomic_read(&work->state) != WORK_STATE_ABORTED) {
+			trace_fastrpc_npu_sched(__func__, work->handle, work->app_id, work->fl,
+						WORK_STATE_PENDING, work->work_prio,
+						work->eff_prio, sched->ref_prio, -ECANCELED);
 			WRITE_ONCE(*work->result, -ECANCELED);
 			complete(work->wait_done);
 		}
@@ -1350,6 +1452,11 @@ void fastrpc_scheduler_user_cleanup(struct fastrpc_user *fl)
 			if (old == WORK_STATE_INCOMING) {
 				pr_debug("%s: handle=0x%llx app_id=%d INCOMING -> ABORTED\n",
 					__func__, work->handle, work->app_id);
+				trace_fastrpc_npu_sched(__func__, work->handle,
+							work->app_id, work->fl,
+							WORK_STATE_ABORTED,
+							work->work_prio, 0,
+							sched->ref_prio, 0);
 				list_del_init(&work->user_node);
 				WRITE_ONCE(*work->result,
 					   -ECANCELED);
@@ -1369,6 +1476,12 @@ void fastrpc_scheduler_user_cleanup(struct fastrpc_user *fl)
 			if (old == WORK_STATE_PENDING) {
 				pr_debug("%s: handle=0x%llx app_id=%d PENDING -> ABORTED\n",
 					__func__, work->handle, work->app_id);
+				trace_fastrpc_npu_sched(__func__, work->handle,
+							work->app_id, work->fl,
+							WORK_STATE_ABORTED,
+							work->work_prio,
+							work->eff_prio,
+							sched->ref_prio, 0);
 				list_del_init(&work->user_node);
 				list_add_tail(&work->staging_node,
 					      &sched->abort_list);
@@ -1394,6 +1507,12 @@ void fastrpc_scheduler_user_cleanup(struct fastrpc_user *fl)
 			if (old == WORK_STATE_ADMITTED) {
 				pr_debug("%s: handle=0x%llx app_id=%d ADMITTED -> DONE\n",
 					__func__, work->handle, work->app_id);
+				trace_fastrpc_npu_sched(__func__, work->handle,
+							work->app_id, work->fl,
+							WORK_STATE_DONE,
+							work->work_prio,
+							work->eff_prio,
+							sched->ref_prio, 0);
 				work->end_reason = NPU_WORK_REASON_END_CANCELLED;
 				list_del_init(&work->user_node);
 				list_add_tail(&work->staging_node,

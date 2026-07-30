@@ -1302,11 +1302,23 @@ int fastrpc_work_remove(struct fastrpc_user *fl,
  * The kthread runs at SCHED_FIFO priority MAX_RT_PRIO/2 because every
  * remote_work_control(START) blocks on its admission pass; see the comment
  * at the kthread_create() call below.
+ * The NPU priority scheduler is only meaningful on the integrated NSP
+ * (cdsp) channel: the adsp (LPASS) channel never receives
+ * FASTRPC_INVOKE_REMOTE_WORK traffic, so the kthread is skipped for it.
+ * Discrete PCIe DSP cards (FASTRPC_DOMAIN_IS_DISCRETE) can receive
+ * that traffic, but the scheduler is not used for them either.
+ * For both cases, all data structures are still initialized and
+ * sched->stop is pre-set so that fastrpc_work_add() takes its existing
+ * early-reject path (-ESHUTDOWN) instead of blocking on a completion
+ * no kthread will ever signal.
  */
-int fastrpc_scheduler_init(struct fastrpc_scheduler *sched)
+int fastrpc_scheduler_init(struct fastrpc_scheduler *sched,
+			   struct fastrpc_domain *domain)
 {
 	struct sched_param param = { .sched_priority = MAX_RT_PRIO / 2 };
 	int ret = 0;
+	bool skip_kthread = FASTRPC_DOMAIN_IS_DISCRETE(domain) ||
+			    (domain && domain->type == FASTRPC_LPASS);
 
 	sched->pending_tree = RB_ROOT;
 	INIT_LIST_HEAD(&sched->executing_list);
@@ -1339,6 +1351,17 @@ int fastrpc_scheduler_init(struct fastrpc_scheduler *sched)
 	 */
 	sched->kthread = kthread_create(fastrpc_scheduler_thread, sched,
 					"fastrpc_sched");
+	sched->stop = skip_kthread;
+	sched->kthread = NULL;
+
+	if (skip_kthread) {
+		pr_info("%s: scheduler kthread disabled for domain %s (id %u)\n",
+			__func__, domain->name, domain->id);
+		return 0;
+	}
+
+	sched->kthread = kthread_run(fastrpc_scheduler_thread, sched,
+				     "fastrpc_sched");
 	if (IS_ERR(sched->kthread)) {
 		ret = PTR_ERR(sched->kthread);
 

@@ -432,7 +432,7 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 #if FRPC_RING_BUFFER_ENABLED
 	init_waitqueue_head(&data->log.wq);
 #endif
-	err = fastrpc_scheduler_init(&data->scheduler);
+	err = fastrpc_scheduler_init(&data->scheduler, domain);
 	if (err)
 		goto free_data;
 	data->domain_id = domain->id;

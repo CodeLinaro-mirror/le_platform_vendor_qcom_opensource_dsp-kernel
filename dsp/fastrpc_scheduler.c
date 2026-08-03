@@ -9,6 +9,8 @@
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/rbtree.h>
+#include <linux/sched.h>
+#include <linux/sched/prio.h>
 #include <linux/slab.h>
 #include <linux/timekeeping.h>
 #include <linux/wait.h>
@@ -1147,9 +1149,16 @@ int fastrpc_work_remove(struct fastrpc_user *fl,
 /*
  * Initialize per-channel scheduler state and start the scheduler
  * kthread. Called during channel context probe (rpmsg).
+ *
+ * The kthread runs at SCHED_FIFO priority MAX_RT_PRIO/2 because every
+ * remote_work_control(START) blocks on its admission pass; see the comment
+ * at the kthread_create() call below.
  */
 int fastrpc_scheduler_init(struct fastrpc_scheduler *sched)
 {
+	struct sched_param param = { .sched_priority = MAX_RT_PRIO / 2 };
+	int ret = 0;
+
 	sched->pending_tree = RB_ROOT;
 	INIT_LIST_HEAD(&sched->executing_list);
 	INIT_LIST_HEAD(&sched->incoming_list);
@@ -1164,10 +1173,24 @@ int fastrpc_scheduler_init(struct fastrpc_scheduler *sched)
 	sched->stop = false;
 	sched->kthread = NULL;
 
-	sched->kthread = kthread_run(fastrpc_scheduler_thread, sched,
-				     "fastrpc_sched");
+	/*
+	 * Every remote_work_control(START) blocks in fastrpc_work_add() until
+	 * this thread runs an admission pass, so at the default SCHED_OTHER
+	 * policy the wakeup is at the mercy of CPU load.  Run SCHED_FIFO at
+	 * MAX_RT_PRIO/2: high enough to preempt ordinary work, and
+	 * deliberately below the MAX_RT_PRIO-1 band reserved for core
+	 * scheduler, watchdog and hypervisor core control infrastructure.
+	 * The thread loop does bounded work under sched->lock and then sleeps
+	 * in wait_event_interruptible, so it cannot monopolise a CPU.
+	 *
+	 * Create the thread stopped and wake it only after the policy has
+	 * been applied, so it cannot admit its first work at the default
+	 * priority.
+	 */
+	sched->kthread = kthread_create(fastrpc_scheduler_thread, sched,
+					"fastrpc_sched");
 	if (IS_ERR(sched->kthread)) {
-		int ret = PTR_ERR(sched->kthread);
+		ret = PTR_ERR(sched->kthread);
 
 		pr_err("%s: kthread creation failed: %d\n",
 		       __func__, ret);
@@ -1176,6 +1199,19 @@ int fastrpc_scheduler_init(struct fastrpc_scheduler *sched)
 		sched->kthread = NULL;
 		return ret;
 	}
+
+	/*
+	 * A failure here is not fatal: the priority is purely a latency
+	 * optimisation and the scheduler remains functionally correct at
+	 * SCHED_OTHER, so warn and continue rather than failing the channel
+	 * probe.
+	 */
+	ret = sched_setscheduler_nocheck(sched->kthread, SCHED_FIFO, &param);
+	if (ret)
+		pr_warn("%s: failed to set SCHED_FIFO (prio %d): %d\n",
+			__func__, param.sched_priority, ret);
+
+	wake_up_process(sched->kthread);
 
 	pr_info("%s: kthread started\n", __func__);
 	return 0;

@@ -8934,7 +8934,7 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int cmd,
 	 	 * this ioctl. This is NOT expected to block 3rd party-apps and is only a
 	 	 * temporary placeholder.
 	 	 */
-		if (fl->tgid >= THIRD_PARTY_APP_PID) {
+		if (fl->tgid_app >= THIRD_PARTY_APP_PID) {
 			err = -EPERM;
 			break;
 		}

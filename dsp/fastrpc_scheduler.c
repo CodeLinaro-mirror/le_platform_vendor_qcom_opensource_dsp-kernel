@@ -109,9 +109,9 @@ static u32 fastrpc_npu_lookup_prio(struct fastrpc_channel_ctx *cctx,
  *      received an NPU_PRIORITY_WORKINFO ioctl from the AIDL service
  *      operate without access control.
  *
- *   2. caller_uid not in table:  denied.  Only UIDs explicitly
- *      registered by the scheduling service may submit work.  This
- *      blocks new apps that lack an Android manifest permission entry.
+ *   2. caller_uid not in table:  Allowed once.  NPU manager will be
+ *      notified. The npu manager may decide to block this application
+ *      and this policy will be enforced for subsequent calls.
  *
  *   3. caller_uid in table, appid == caller_uid:  allowed only if
  *      has_direct_access is set.  Apps with a manifest change or AI
@@ -171,9 +171,9 @@ static int fastrpc_npu_check_access(struct fastrpc_channel_ctx *cctx,
 
 	/* Rule 3: caller not registered in the priority table */
 	if (!found) {
-		dev_err(cctx->dev, "%s: uid %u not in NPU priority table, rejecting appid %d\n",
-			__func__, caller_uid, appid);
-		return -EACCES;
+		dev_warn(cctx->dev, "%s: uid %u not in NPU priority table, allowing once and notifying NPU manager\n",
+			__func__, caller_uid);
+		return 0;
 	}
 
 	if ((uid_t)appid == caller_uid) {

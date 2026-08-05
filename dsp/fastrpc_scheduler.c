@@ -973,9 +973,73 @@ int fastrpc_work_add(struct fastrpc_user *fl,
 			return -ENOMEM;
 		}
 		list_add_tail(&wnode->app_node, &entry->works);
+		list_add_tail(&wnode->user_node, &fl->sched_works);
+
+		/*
+		 * Inline fast-path admission.
+		 *
+		 * The caller does not wait_for_completion(), so its on-stack
+		 * completion/result vanish once fastrpc_work_add() returns.
+		 * wait_done and result are cleared to NULL.  Every consumer
+		 * of an ADMITTED or DONE node (work_remove ADMITTED->DONE,
+		 * user_cleanup, drain_done_list, deinit) already avoids these
+		 * fields; NULLing them turns any future violation into an
+		 * immediate NULL dereference rather than silent corruption of
+		 * a returned stack frame.  fastrpc_scheduler_abort_all()
+		 * only completes INCOMING and PENDING waiters, so it cannot
+		 * reach an inline-admitted node's back-pointers either.
+		 */
+		if (list_empty(&sched->incoming_list) &&
+		    list_empty(&sched->done_list) &&
+		    list_empty(&sched->abort_list) &&
+		    !sched->prio_update_pending) {
+			u32 app_prio = fl->cctx->npu_app_prio ?
+				fastrpc_npu_lookup_prio(fl->cctx, work->appid) :
+				entry->cur_prio;
+
+			wnode->eff_prio = app_prio + wnode->work_prio;
+
+			if (list_empty(&sched->executing_list) ||
+			    wnode->eff_prio <= sched->ref_prio) {
+				RB_CLEAR_NODE(&wnode->rb_node);
+				INIT_LIST_HEAD(&wnode->staging_node);
+				atomic_set(&wnode->state,
+					   WORK_STATE_ADMITTED);
+				list_add_tail(&wnode->exec_node,
+					      &sched->executing_list);
+				sched->ref_prio = min(wnode->eff_prio,
+						      sched->ref_prio);
+				wnode->wait_done = NULL;
+				wnode->result = NULL;
+
+				/*
+				 * Same two events, same order, that the
+				 * kthread emits from stage 3 and stage 5,
+				 * so the HAL's workinfo stream is
+				 * indistinguishable between paths.
+				 */
+				fastrpc_workinfo_notify(sched, wnode,
+					WORK_REQUESTED,
+					NPU_WORK_REASON_NONE);
+				fastrpc_workinfo_notify(sched, wnode,
+					WORK_STARTED,
+					NPU_WORK_REASON_START_INITIAL);
+
+				pr_debug("%s: handle=0x%llx app_id=%d raw_prio=%u work_prio=%u eff_prio=%u ref_prio=%u -> ADMITTED (inline)\n",
+					__func__, work->handle, work->appid,
+					work->priority, wnode->work_prio,
+					wnode->eff_prio, sched->ref_prio);
+				spin_unlock(&sched->lock);
+				return 0;
+			}
+		}
+
+		/*
+		 * Slow path: queue for the kthread.  Everything below this
+		 * point is byte-identical to the pre-fast-path behaviour.
+		 */
 		list_add_tail(&wnode->staging_node,
 			      &sched->incoming_list);
-		list_add_tail(&wnode->user_node, &fl->sched_works);
 		pr_debug("%s: handle=0x%llx app_id=%d raw_prio=%u work_prio=%u group=%s feature=%s -> INCOMING\n",
 			__func__, work->handle, work->appid, work->priority,
 			wnode->work_prio,

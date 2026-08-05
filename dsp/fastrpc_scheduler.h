@@ -41,12 +41,19 @@ enum fastrpc_work_state {
  * Lifetime: allocated by fastrpc_work_add(), freed exclusively by the
  * scheduler kthread.  The IOCTL caller never calls kfree on this.
  *
- * The caller's stack holds a DECLARE_COMPLETION_ONSTACK and an int result.
- * Pointers wait_done / result point into that stack frame.  The kthread
- * writes *result and calls complete(wait_done) to unblock the caller,
- * and may kfree this node at any later time — the stack variables
- * outlive the work struct because the caller only returns after
- * wait_for_completion().
+ * On the slow admission path the caller's stack holds a
+ * DECLARE_COMPLETION_ONSTACK and an int result.  wait_done / result
+ * point into that stack frame; the kthread writes *result and calls
+ * complete(wait_done) to unblock the caller, and may kfree this node
+ * at any later time — the stack variables outlive the work struct
+ * because the caller only returns after wait_for_completion().
+ *
+ * On the inline fast admission path in fastrpc_work_add() the caller
+ * does not block, so wait_done and result are cleared to NULL.  Every
+ * ADMITTED / DONE consumer (work_remove, user_cleanup, drain_done_list)
+ * already avoids these fields, and abort_all() completes only INCOMING
+ * and PENDING waiters, so no path reaches back into the (now returned)
+ * caller's stack frame.
  */
 struct fastrpc_work_node {
 	struct rb_node		rb_node;	/* rbtree linkage (pending_tree) */

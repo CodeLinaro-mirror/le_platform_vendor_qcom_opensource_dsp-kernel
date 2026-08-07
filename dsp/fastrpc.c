@@ -4282,6 +4282,12 @@ static inline void fastrpc_channel_update_invoke_cnt(
 void fastrpc_free_user(struct fastrpc_user *fl)
 {
 	struct fastrpc_map *map = NULL, *m = NULL;
+	unsigned long flags;
+
+	spin_lock_irqsave(&fl->proc_state_notif.nqlock, flags);
+	atomic_add(1, &fl->proc_state_notif.notif_queue_count);
+	wake_up_interruptible(&fl->proc_state_notif.notif_wait_queue);
+	spin_unlock_irqrestore(&fl->proc_state_notif.nqlock, flags);
 
 	fastrpc_context_list_free(fl);
 
@@ -4470,11 +4476,6 @@ static int fastrpc_user_obj_free(struct fastrpc_user *user,
 	spin_lock_irqsave(&cctx->lock, flags);
 	list_del(&fl->user);
 	spin_unlock_irqrestore(&cctx->lock, flags);
-
-	spin_lock_irqsave(&fl->proc_state_notif.nqlock, flags);
-	atomic_add(1, &fl->proc_state_notif.notif_queue_count);
-	wake_up_interruptible(&fl->proc_state_notif.notif_wait_queue);
-	spin_unlock_irqrestore(&fl->proc_state_notif.nqlock, flags);
 
 	if (fl->tgid_frpc != -1)
 		ida_free(&cctx->tgid_frpc_ida, fl->tgid_frpc-(cctx->domain_id*FASTRPC_UNIQUE_ID_CONST));

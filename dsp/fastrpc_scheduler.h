@@ -120,6 +120,12 @@ static inline void fastrpc_scheduler_deinit(struct fastrpc_scheduler *sched)
 static inline void fastrpc_scheduler_notify_prio_update(struct fastrpc_scheduler *sched)
 { return; }
 
+static inline void fastrpc_scheduler_prio_update_begin(struct fastrpc_scheduler *sched)
+{ return; }
+
+static inline void fastrpc_scheduler_prio_update_finish(struct fastrpc_scheduler *sched)
+{ return; }
+
 static inline int fastrpc_work_add(struct fastrpc_user *fl,
 				   struct fastrpc_ioctl_remote_work *work)
 { return 0; }
@@ -142,6 +148,8 @@ int fastrpc_scheduler_init(struct fastrpc_scheduler *sched);
 void fastrpc_scheduler_abort_all(struct fastrpc_scheduler *sched);
 void fastrpc_scheduler_deinit(struct fastrpc_scheduler *sched);
 void fastrpc_scheduler_notify_prio_update(struct fastrpc_scheduler *sched);
+void fastrpc_scheduler_prio_update_begin(struct fastrpc_scheduler *sched);
+void fastrpc_scheduler_prio_update_finish(struct fastrpc_scheduler *sched);
 int fastrpc_work_add(struct fastrpc_user *fl,
 		    struct fastrpc_ioctl_remote_work *work);
 int fastrpc_work_remove(struct fastrpc_user *fl,

@@ -385,10 +385,6 @@ static void fastrpc_socket_callback_wq(struct work_struct *work)
 	__u32 sq_node = 0, sq_port = 0;
 
 	session_control = container_of(work, struct frpc_transport_session_control, work);
-	if (session_control == NULL) {
-		err = -EFAULT;
-		goto bail;
-	}
 
 	remote_server.msg_name = &remote_sock_addr;
 	remote_server.msg_namelen = sizeof(remote_sock_addr);

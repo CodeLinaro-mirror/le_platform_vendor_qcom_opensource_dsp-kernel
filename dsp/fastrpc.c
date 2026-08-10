@@ -655,6 +655,9 @@ static int fastrpc_discrete_map_create(struct fastrpc_user *fl, int fd, int flag
 	list_add_tail(&map->node, &fl->discrete_maps);
 	spin_unlock(&fl->lock);
 
+	trace_fastrpc_discrete_mem_fd_map(fd, fl->cctx->domain->card, fl->cctx->domain_id,
+		map->size, alloc->num_blocks, kref_read(&map->refcount), flags);
+
 	*discrete_map = map;
 	return 0;
 }
@@ -671,6 +674,8 @@ static void fastrpc_discrete_map_free(struct fastrpc_user *fl,
 {
 	if (!fl || !tmap)
 		return;
+
+	trace_fastrpc_discrete_mem_fd_unmap(tmap->fd, fl->cctx->domain_id, tmap->size);
 
 	spin_lock(&fl->lock);
 	list_del(&tmap->node);

@@ -108,6 +108,12 @@ struct fastrpc_scheduler {
 	u32			ref_prio;	/* min eff_prio of executing works */
 	atomic_t		workid_seq;	/* monotonic counter for workinfo id */
 	bool			prio_update_pending;
+	/*
+	 * Set by the fast END path when freeing a work may have made a
+	 * PENDING work admissible, since the kthread's wait condition does
+	 * not watch pending_tree.  Written under lock, read with READ_ONCE.
+	 */
+	bool			admit_pending;
 	bool			stop;		/* set to stop kthread */
 };
 

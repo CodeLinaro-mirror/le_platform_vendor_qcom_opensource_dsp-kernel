@@ -3930,14 +3930,14 @@ static void fastrpc_discrete_free_sg(struct qna_discrete_alloc **sg)
  * Returns 0 on success, negative errno on failure.
  */
 static int fastrpc_qna_alloc(struct fastrpc_channel_ctx *cctx,
-	u64 size, const char *label, struct qna_discrete_alloc **sg)
+	u64 size, const char *label, u64 flags, struct qna_discrete_alloc **sg)
 {
 	struct qna_discrete_alloc *alloc;
 	unsigned int domain_id = (unsigned int)cctx->domain->instance_id;
 	int err;
 	struct qna_mem_alloc_params alloc_params = {
 		.size        = size,
-		.flags       = 0,
+		.flags       = flags,
 		.type        = FASTRPC_DISCRETE_GLOBAL_MEM,
 		.domains     = &domain_id,
 		.num_domains = 1,
@@ -3997,7 +3997,8 @@ static int fastrpc_discrete_alloc_rootheap(struct fastrpc_user *fl, u64 size)
 		return -ENOMEM;
 
 	INIT_LIST_HEAD(&node->node);
-	err = fastrpc_qna_alloc(cctx, size, "rootheap", &node->alloc);
+	err = fastrpc_qna_alloc(cctx, size, "rootheap",
+		QNA_MEM_FLAG_CHANNEL_SCOPED, &node->alloc);
 	if (err) {
 		kfree(node);
 		return err;
@@ -4145,7 +4146,7 @@ static int fastrpc_build_init_create_sgl(struct fastrpc_user *fl,
 static void fastrpc_discrete_free_sg (struct qna_discrete_alloc **sg) {}
 static void fastrpc_discrete_drop_rootheap(struct fastrpc_channel_ctx *cctx) {}
 static inline int fastrpc_qna_alloc (struct fastrpc_channel_ctx *cctx,
-	u64 size, const char *label, struct qna_discrete_alloc **sg)
+	u64 size, const char *label, u64 flags, struct qna_discrete_alloc **sg)
 {
 	return -ENODEV;
 }
@@ -5049,7 +5050,8 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	discrete_spawn = fastrpc_is_discrete_dsp(fl);
 
 	if (discrete_spawn)
-		err = fastrpc_qna_alloc(fl->cctx, memlen, "init_mem", &fl->init_mem_sg);
+		err = fastrpc_qna_alloc(fl->cctx, memlen, "init_mem", 0,
+			&fl->init_mem_sg);
 	else
 		err = fastrpc_smmu_buf_alloc(fl, memlen, INITMEM_BUF, &imem);
 	if (err)
@@ -5066,7 +5068,8 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	 */
 	if (dsp_attributes[DBGLOGBUF_SUPPORT]) {
 		if (discrete_spawn) {
-			err = fastrpc_qna_alloc(fl->cctx, DBGLOGBUF_SIZE, "dbglogbuf", &fl->dbglogbuf_sg);
+			err = fastrpc_qna_alloc(fl->cctx, DBGLOGBUF_SIZE, "dbglogbuf", 0,
+				&fl->dbglogbuf_sg);
 			if (!err)
 				pageslen = NUM_PAGES_WITH_MAP_DEBUG_BUF;
 		} else {

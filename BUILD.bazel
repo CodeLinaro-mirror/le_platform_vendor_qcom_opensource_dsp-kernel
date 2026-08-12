@@ -83,9 +83,9 @@ define_modules("x1p42100", "perf", "no")
 
 define_modules("x1p42100", "consolidate", "no")
 
-define_modules("art", "perf", "no")
+define_modules("art", "perf", "no", "yes")
 
-define_modules("art", "consolidate", "no")
+define_modules("art", "consolidate", "no", "yes")
 
 define_modules("chora", "perf", "no")
 
@@ -99,9 +99,9 @@ define_modules("hamoa", "perf", "no")
 
 define_modules("hamoa", "consolidate", "no")
 
-define_modules("art16k", "perf", "no")
+define_modules("art16k", "perf", "no", "yes")
 
-define_modules("art16k", "consolidate", "no")
+define_modules("art16k", "consolidate", "no", "yes")
 
 define_modules("malabar", "consolidate", "no")
 

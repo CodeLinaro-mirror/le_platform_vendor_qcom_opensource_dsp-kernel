@@ -234,7 +234,15 @@ struct npu_work_info {
 	/* enum npu_work_event: WORK_REQUESTED, WORK_STARTED, or WORK_ENDED */
 	__u32 event;
 
-	/* Monotonically increasing work identifier assigned by the kernel */
+	/*
+	 * Monotonically increasing sequence number, unique per notification
+	 * actually delivered to the HAL.  Assigned when the event is dequeued
+	 * for delivery, not when the underlying work item is created -- a
+	 * job's REQUESTED, STARTED, and ENDED notifications each get their
+	 * own distinct value here.  Not a job-correlation id; use
+	 * (uid, group_id, debug_feature_id) to correlate notifications
+	 * belonging to the same job.
+	 */
 	__s32  id;
 
 	/* UID of the application that submitted this work item */

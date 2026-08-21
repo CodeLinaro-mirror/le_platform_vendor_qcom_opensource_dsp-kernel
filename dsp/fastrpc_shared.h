@@ -1843,6 +1843,8 @@ struct fastrpc_user {
 	bool untrusted_process;
 	/* This process currently owns the discrete card */
 	bool claimed_discrete;
+	/* card_id cached at claim time; used in release to avoid cctx/domain deref */
+	u32 claimed_discrete_card_id;
 	bool set_session_info;
 	/* Various states throughout process life cycle */
 	atomic_t state;

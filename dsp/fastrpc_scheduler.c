@@ -37,7 +37,6 @@ static void fastrpc_workinfo_notify(struct fastrpc_scheduler *sched,
 	info.timestamp_ms	 = ktime_to_ms(ktime_get_real());
 	info.event		 = (u32)event;
 	info.reason		 = reason;
-	info.id			 = (s32)work->work_id;
 	info.uid		 = work->app_id;
 	info.debug_pid		 = work->app_id;
 	info.domain		 = cctx->domain_id;
@@ -52,7 +51,7 @@ static void fastrpc_workinfo_notify(struct fastrpc_scheduler *sched,
 		(int)work->work_prio, (int)work->eff_prio,
 		cctx->domain_id);
 	trace_fastrpc_npu_workinfo(cctx->domain_id, (s32)work->work_id,
-				   (s32)work->app_id, (u32)event, reason, 0);
+		(s32)work->app_id, (u32)event, reason, 0);
 	fastrpc_npu_post_workinfo(cctx, &info);
 }
 

@@ -1425,6 +1425,13 @@ struct fastrpc_channel_ctx {
 	struct semaphore          npu_workinfo_sem;
 	/* Number of nodes currently in the NPU workinfo queue */
 	u32                       npu_workinfo_queue_len;
+	/*
+	 * Per-notification sequence counter for struct npu_work_info.id.
+	 * Incremented once per event actually dequeued for delivery to the
+	 * HAL in fastrpc_npu_workinfo_drain_queue() -- see the comment on
+	 * that field in include/uapi/misc/fastrpc.h.
+	 */
+	atomic_t                  npu_workinfo_notif_seq;
 #if FRPC_RING_BUFFER_ENABLED
 	/* log context for storing kernel logs */
 	struct fastrpc_log_context log;

@@ -7613,9 +7613,6 @@ retry_wait:
 	cctx->npu_workinfo_queue_len--;
 	spin_unlock_irqrestore(&cctx->lock, flags);
 
-	trace_fastrpc_npu_workinfo(cctx->domain_id, node->info.id, node->info.uid,
-				   node->info.event, node->info.reason, 0);
-
 	if (kbuf.group_id != 0 && node->info.group_id != 0 &&
 	    node->info.group_id_len > 0) {
 		if (node->info.group_id_len > NPU_MAX_WORKINFO_FIELD_LEN) {
@@ -7668,6 +7665,20 @@ retry_wait:
 		node->info.debug_feature_id     = 0;
 		node->info.debug_feature_id_len = 0;
 	}
+
+	/*
+	 * Assign a fresh, per-notification sequence number here, at delivery
+	 * time, rather than at enqueue time in fastrpc_npu_post_workinfo().
+	 * This is deliberately separate from the job-scoped work_id set in
+	 * fastrpc_workinfo_notify() -- the HAL's debounce logic keys on the
+	 * id staying stable across a job's REQUESTED/STARTED/ENDED lifecycle,
+	 * so job correlation must go through (uid, group_id, debug_feature_id)
+	 * instead, not through this field.
+	 */
+	node->info.id = (s32)(atomic_fetch_add(1, &cctx->npu_workinfo_notif_seq) & INT_MAX);
+
+	trace_fastrpc_npu_workinfo(cctx->domain_id, node->info.id, node->info.uid,
+				   node->info.event, node->info.reason, 0);
 
 	/*
 	 * ubuf points directly to

@@ -93,4 +93,8 @@ define_modules("hamoa_la", "consolidate")
 
 define_modules("hamoa_la", "perf")
 
+define_modules("mahua", "consolidate")
+
+define_modules("mahua", "perf")
+
 define_target_modules()

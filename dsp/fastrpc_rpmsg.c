@@ -461,9 +461,6 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 		if (err)
 			goto fdev_error;
 
-	/* Configure_wakeup_sources */
-	fastrpc_configure_wakeup_source(data);
-
 	/* Create default user for channel */
 	err = fastrpc_channel_default_user_create(data);
 	if (err)
@@ -473,6 +470,9 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	err = fastrpc_configure_device_nodes(data, rdev);
 		if (err)
 			goto fdev_error;
+
+	/* Configure_wakeup_sources - must be called after device registration */
+	fastrpc_configure_wakeup_source(data);
 
 	/* Update domain status and global ctx */
 	domain->status = DSP_STATUS_UP;

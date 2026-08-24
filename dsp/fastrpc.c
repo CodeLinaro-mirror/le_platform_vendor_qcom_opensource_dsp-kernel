@@ -4202,8 +4202,6 @@ static void fastrpc_get_sessions_info(struct fastrpc_channel_ctx *cctx)
 	list_for_each_entry(fl, &cctx->users, user) {
 		ret = fastrpc_file_get(fl);
 		if (ret) {
-			dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
-				__func__, fl);
 			continue;
 		}
 		list_add_tail(&fl->rb_log_node, &users_list);
@@ -5525,9 +5523,14 @@ static void fastrpc_notif_find_process(int domain, struct fastrpc_channel_ctx *c
 		if (user->tgid_frpc == notif->pid) {
 			err = fastrpc_file_get(user);
 			if (err) {
+				spin_unlock_irqrestore(&cctx->lock, irq_flags);
+				/*
+				 * Emit warning outside the spinlock to avoid holding cctx->lock
+				 * across slow console output (serial UART busy-wait in __delay).
+				 */
 				dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
 					__func__, user);
-				break;
+				return;
 			}
 			is_process_found = true;
 			break;
@@ -7356,23 +7359,30 @@ static int fastrpc_npu_app_prio_set(struct fastrpc_channel_ctx *cctx,
 	if (!user_configs) {
 		pr_err("%s: invalid args: cctx=%pK user_configs=0x%llx num_configs=%u\n",
 		       __func__, cctx, user_configs, num_configs);
+		trace_fastrpc_npu_prio_update(cctx->domain_id, num_configs, -EINVAL);
 		return -EINVAL;
 	}
 
 	err = fastrpc_npu_app_prio_init(cctx);
-	if (err)
+	if (err) {
+		trace_fastrpc_npu_prio_update(cctx->domain_id, num_configs, err);
 		return err;
+	}
 
 	/* Fast-path rejection before doing any expensive work */
-	if (atomic_read(&cctx->teardown))
+	if (atomic_read(&cctx->teardown)) {
+		trace_fastrpc_npu_prio_update(cctx->domain_id, num_configs, -EPIPE);
 		return -EPIPE;
+	}
 
 	/* kcalloc(GFP_KERNEL) and copy_from_user can both sleep;
 	 * neither can be called while holding a spinlock.
 	 */
 	new_buf = kcalloc(num_configs, sizeof(*new_buf), GFP_KERNEL);
-	if (!new_buf)
+	if (!new_buf) {
+		trace_fastrpc_npu_prio_update(cctx->domain_id, num_configs, -ENOMEM);
 		return -ENOMEM;
+	}
 
 	if (copy_from_user(new_buf, (void __user *)(uintptr_t)user_configs,
 			   array_size(num_configs, sizeof(*new_buf)))) {
@@ -7462,7 +7472,10 @@ static int fastrpc_npu_app_prio_set(struct fastrpc_channel_ctx *cctx,
 
 	kfree(old_buf);
 	new_buf = NULL;
+	trace_fastrpc_npu_prio_update(cctx->domain_id, num_configs, 0);
 bail:
+	if (err)
+		trace_fastrpc_npu_prio_update(cctx->domain_id, num_configs, err);
 	kfree(new_buf);
 	return err;
 }
@@ -7483,6 +7496,8 @@ static int fastrpc_npu_priority(struct fastrpc_user *fl,
 	if (npu_sched->num_configs > NPU_MAX_APP_PRIO_ENTRIES) {
 		dev_err(fl->cctx->dev, "Invalid num_configs: %u (max %u)\n",
 			npu_sched->num_configs, NPU_MAX_APP_PRIO_ENTRIES);
+		trace_fastrpc_npu_prio_update(fl->cctx->domain_id,
+					      npu_sched->num_configs, -EINVAL);
 		return -EINVAL;
 	}
 
@@ -7500,6 +7515,8 @@ static int fastrpc_npu_priority(struct fastrpc_user *fl,
 			"NPU sched: unsupported config version %u\n",
 			npu_sched->version);
 		err = -EINVAL;
+		trace_fastrpc_npu_prio_update(fl->cctx->domain_id,
+					      npu_sched->num_configs, err);
 		break;
 	}
 
@@ -7556,16 +7573,21 @@ static int fastrpc_npu_workinfo_drain_queue(struct fastrpc_user *fl,
 	u32 copy_len = 0;
 	int err = 0;
 
-	if (copy_from_user(&kbuf, ubuf, sizeof(kbuf)))
+	if (copy_from_user(&kbuf, ubuf, sizeof(kbuf))) {
+		trace_fastrpc_npu_workinfo(cctx->domain_id, -1, -1, 0, 0, -EFAULT);
 		return -EFAULT;
+	}
 
 retry_wait:
 	err = down_interruptible(&cctx->npu_workinfo_sem);
-	if (err)
+	if (err) {
+		trace_fastrpc_npu_workinfo(cctx->domain_id, -1, -1, 0, 0, -ERESTARTSYS);
 		return -ERESTARTSYS;
+	}
 
 	if (atomic_read(&cctx->teardown)) {
 		up(&cctx->npu_workinfo_sem);
+		trace_fastrpc_npu_workinfo(cctx->domain_id, -1, -1, 0, 0, -EPIPE);
 		return -EPIPE;
 	}
 
@@ -7577,6 +7599,7 @@ retry_wait:
 	spin_lock_irqsave(&cctx->lock, flags);
 	if (atomic_read(&cctx->teardown)) {
 		spin_unlock_irqrestore(&cctx->lock, flags);
+		trace_fastrpc_npu_workinfo(cctx->domain_id, -1, -1, 0, 0, -EPIPE);
 		return -EPIPE;
 	}
 	node = cctx->npu_workinfo_head;
@@ -7589,6 +7612,9 @@ retry_wait:
 		cctx->npu_workinfo_tail = NULL;
 	cctx->npu_workinfo_queue_len--;
 	spin_unlock_irqrestore(&cctx->lock, flags);
+
+	trace_fastrpc_npu_workinfo(cctx->domain_id, node->info.id, node->info.uid,
+				   node->info.event, node->info.reason, 0);
 
 	if (kbuf.group_id != 0 && node->info.group_id != 0 &&
 	    node->info.group_id_len > 0) {
@@ -7649,6 +7675,11 @@ retry_wait:
 	 */
 	err = copy_to_user(ubuf, &node->info, sizeof(*ubuf)) ? -EFAULT : 0;
 
+	if (err)
+		trace_fastrpc_npu_workinfo(cctx->domain_id, node->info.id,
+					   node->info.uid, node->info.event,
+					   node->info.reason, err);
+
 	kfree(node);
 	return err;
 }
@@ -7660,8 +7691,10 @@ static int fastrpc_npu_workinfo(struct fastrpc_user *fl,
 	u32 version = 0;
 	int err = 0;
 
-	if (get_user(version, &ubuf->version))
+	if (get_user(version, &ubuf->version)) {
+		trace_fastrpc_npu_workinfo(cctx->domain_id, -1, -1, 0, 0, -EFAULT);
 		return -EFAULT;
+	}
 
 	switch (version) {
 	case NPU_WORKINFO_VERSION:
@@ -7671,6 +7704,7 @@ static int fastrpc_npu_workinfo(struct fastrpc_user *fl,
 		dev_err(cctx->dev, "NPU workinfo: unsupported version %u\n",
 			version);
 		err = -EINVAL;
+		trace_fastrpc_npu_workinfo(cctx->domain_id, -1, -1, 0, 0, err);
 		break;
 	}
 	return err;
@@ -7692,6 +7726,8 @@ int fastrpc_npu_post_workinfo(struct fastrpc_channel_ctx *cctx,
 			info->event);
 		kfree((void *)(uintptr_t)info->group_id);
 		kfree((void *)(uintptr_t)info->debug_feature_id);
+		trace_fastrpc_npu_workinfo(cctx->domain_id, info->id, info->uid,
+					   info->event, info->reason, -EINVAL);
 		return -EINVAL;
 	}
 	if (info->event == WORK_STARTED &&
@@ -7701,6 +7737,8 @@ int fastrpc_npu_post_workinfo(struct fastrpc_channel_ctx *cctx,
 			 info->reason);
 		kfree((void *)(uintptr_t)info->group_id);
 		kfree((void *)(uintptr_t)info->debug_feature_id);
+		trace_fastrpc_npu_workinfo(cctx->domain_id, info->id, info->uid,
+					   info->event, info->reason, -EINVAL);
 		return -EINVAL;
 	}
 	if (info->event == WORK_ENDED &&
@@ -7711,6 +7749,8 @@ int fastrpc_npu_post_workinfo(struct fastrpc_channel_ctx *cctx,
 			 info->reason);
 		kfree((void *)(uintptr_t)info->group_id);
 		kfree((void *)(uintptr_t)info->debug_feature_id);
+		trace_fastrpc_npu_workinfo(cctx->domain_id, info->id, info->uid,
+					   info->event, info->reason, -EINVAL);
 		return -EINVAL;
 	}
 
@@ -7723,6 +7763,8 @@ int fastrpc_npu_post_workinfo(struct fastrpc_channel_ctx *cctx,
 		dev_err(cctx->dev, "NPU workinfo: failed to alloc node\n");
 		kfree((void *)(uintptr_t)info->group_id);
 		kfree((void *)(uintptr_t)info->debug_feature_id);
+		trace_fastrpc_npu_workinfo(cctx->domain_id, info->id, info->uid,
+					   info->event, info->reason, -ENOMEM);
 		return -ENOMEM;
 	}
 
@@ -7737,6 +7779,9 @@ int fastrpc_npu_post_workinfo(struct fastrpc_channel_ctx *cctx,
 		spin_unlock_irqrestore(&cctx->lock, flags);
 		dev_err(cctx->dev, "NPU workinfo: queue full (%d), dropping event\n",
 			NPU_WORKINFO_QUEUE_MAX);
+		trace_fastrpc_npu_workinfo(cctx->domain_id, node->info.id,
+					   node->info.uid, node->info.event,
+					   node->info.reason, -ENOSPC);
 		kfree((void *)(uintptr_t)node->info.group_id);
 		kfree((void *)(uintptr_t)node->info.debug_feature_id);
 		kfree(node);
@@ -7751,6 +7796,8 @@ int fastrpc_npu_post_workinfo(struct fastrpc_channel_ctx *cctx,
 	cctx->npu_workinfo_queue_len++;
 	spin_unlock_irqrestore(&cctx->lock, flags);
 
+	trace_fastrpc_npu_workinfo(cctx->domain_id, info->id, info->uid,
+				   info->event, info->reason, 0);
 	/* Wake the HAL consumer thread blocked in fastrpc_npu_workinfo_drain_queue(). */
 	up(&cctx->npu_workinfo_sem);
 	return 0;
@@ -7777,6 +7824,8 @@ static int fastrpc_npu_priority_workinfo(struct fastrpc_user *fl,
 	struct npu_work_info __user *ubuf = NULL;
 	int err = 0;
 
+	trace_fastrpc_msg("npu_priority_workinfo: entry");
+
 	if (copy_from_user(&args, argp, sizeof(args)))
 		return -EFAULT;
 
@@ -7795,13 +7844,18 @@ static int fastrpc_npu_priority_workinfo(struct fastrpc_user *fl,
 	 * new work event.  Return -EPIPE so userspace can distinguish teardown
 	 * from a permission error or malformed request.
 	 */
-	if (atomic_read(&cctx->teardown))
+	if (atomic_read(&cctx->teardown)) {
+		trace_fastrpc_msg("npu_priority_workinfo: teardown -EPIPE");
 		return -EPIPE;
+	}
 
 	switch (args.op) {
 	case FASTRPC_NPU_OP_PRIORITY:
-		if (memchr_inv(args.prio.reserved, 0, sizeof(args.prio.reserved)))
+		if (memchr_inv(args.prio.reserved, 0, sizeof(args.prio.reserved))) {
+			trace_fastrpc_npu_prio_update(cctx->domain_id,
+						      args.prio.num_configs, -EINVAL);
 			return -EINVAL;
+		}
 		if (args.prio.num_configs == 0) {
 			/*
 			 * Empty config list = clear all UID restrictions.
@@ -7829,8 +7883,10 @@ static int fastrpc_npu_priority_workinfo(struct fastrpc_user *fl,
 		err = fastrpc_npu_priority(fl, &args.prio);
 		break;
 	case FASTRPC_NPU_OP_WORKINFO:
-		if (memchr_inv(args.workinfo.reserved, 0, sizeof(args.workinfo.reserved)))
+		if (memchr_inv(args.workinfo.reserved, 0, sizeof(args.workinfo.reserved))) {
+			trace_fastrpc_npu_workinfo(cctx->domain_id, -1, -1, 0, 0, -EINVAL);
 			return -EINVAL;
+		}
 		/*
 		 * ubuf points directly at the workinfo union member inside the
 		 * user's ioctl args struct.  fastrpc_npu_workinfo() dequeues one
@@ -7840,6 +7896,7 @@ static int fastrpc_npu_priority_workinfo(struct fastrpc_user *fl,
 		err = fastrpc_npu_workinfo(fl, ubuf);
 		break;
 	default:
+		trace_fastrpc_msg("npu_priority_workinfo: invalid op -EINVAL");
 		err = -EINVAL;
 		break;
 	}
@@ -9359,7 +9416,7 @@ void fastrpc_driver_unregister(struct fastrpc_driver *frpc_driver){
 		frpc_driver->device = NULL;
 		spin_unlock_irqrestore(glock, irq_flags);
 		kfree(frpc_dev);
-		pr_info("Un-registering fastrpc driver with handle 0x%x\n",
+		pr_info("Device already closed, un-registering fastrpc driver with handle 0x%x\n",
 			frpc_driver->handle);
 		return;
 	}
@@ -9410,6 +9467,7 @@ int fastrpc_driver_register(struct fastrpc_driver *frpc_driver)
 	struct fastrpc_user *user = NULL;
 	struct fastrpc_channel_ctx *cctx = NULL;
 	struct fastrpc_domain *domain = NULL;
+	int dsp_state;
 
 	if(frpc_driver == NULL) {
 		pr_err("%s : invalid registraion request", __func__);
@@ -9433,23 +9491,33 @@ int fastrpc_driver_register(struct fastrpc_driver *frpc_driver)
 			if (user->tgid_frpc == frpc_driver->handle) {
 				err = fastrpc_file_get(user);
 				if (err) {
+					spin_unlock_irqrestore(&cctx->lock, irq_flags);
+					/*
+					 * Emit warning outside the spinlock to avoid holding cctx->lock
+					 * across slow console output (serial UART busy-wait in __delay).
+					 */
 					dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
 						__func__, user);
-					break;
+					goto out;
 				}
 				goto process_found;
 			}
 		}
 		spin_unlock_irqrestore(&cctx->lock, irq_flags);
 	}
+out:
 	pr_err("%s: no client found for handle 0x%x",
 		__func__, frpc_driver->handle);
 	return -ESRCH;
 
 process_found:
-	if(atomic_read(&user->state) >= DSP_EXIT_START) {
+	/*
+	 * Registration requires user->device to be valid
+	 * (set only when state equals DSP_CREATE_COMPLETE)
+	 */
+	if ((dsp_state = atomic_read(&user->state)) != DSP_CREATE_COMPLETE) {
 		spin_unlock_irqrestore(&cctx->lock, irq_flags);
-		pr_err("%s : process already exited", __func__);
+		pr_err("%s : process found with state invalid for registration, state %d\n", __func__, dsp_state);
 		fastrpc_file_put(user, false);
 		return -ESRCH;
 	}
@@ -9526,8 +9594,6 @@ static void fastrpc_notify_pdr_drivers(struct fastrpc_channel_ctx *cctx,
 	list_for_each_entry(fl, &cctx->users, user) {
 		err = fastrpc_file_get(fl);
 		if (err) {
-			dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
-				__func__, fl);
 			continue;
 		}
 		if (fl->spd_id == pid)
@@ -10490,9 +10556,14 @@ static void fastrpc_handle_signal_rpmsg(uint64_t msg, struct fastrpc_channel_ctx
 		if (fl->tgid_frpc == pid) {
 			err = fastrpc_file_get(fl);
 			if (err) {
+				spin_unlock_irqrestore(&cctx->lock, irq_flags);
+				/*
+				 * Emit warning outside the spinlock to avoid holding cctx->lock
+				 * across slow console output (serial UART busy-wait in __delay).
+				 */
 				dev_warn(cctx->dev, "Warning: %s: user-obj for fl (%pK) being released\n",
 					__func__, fl);
-				break;
+				goto out;
 			}
 			process_found = true;
 			break;
@@ -10500,6 +10571,7 @@ static void fastrpc_handle_signal_rpmsg(uint64_t msg, struct fastrpc_channel_ctx
 	}
 	spin_unlock_irqrestore(&cctx->lock, irq_flags);
 
+out:
 	if (!process_found) {
 		pr_warn("Warning: %s: no active processes found for pid %u, signal id %u",
 			__func__, pid, signal_id);

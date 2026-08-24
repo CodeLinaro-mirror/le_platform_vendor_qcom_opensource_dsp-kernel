@@ -523,6 +523,97 @@ TRACE_EVENT(fastrpc_dspsignal,
 		__get_str(buf), __entry->signal_id, __entry->state, __entry->timeout)
 );
 
+TRACE_EVENT(fastrpc_npu_sched,
+
+	TP_PROTO(const char *func, u64 handle, int app_id, void *fl,
+		 int state, u32 work_prio, u32 eff_prio, u32 ref_prio, int retval),
+
+	TP_ARGS(func, handle, app_id, fl, state, work_prio, eff_prio, ref_prio, retval),
+
+	TP_STRUCT__entry(
+		__string(func,		func)
+		__field(u64,		handle)
+		__field(int,		app_id)
+		__field(u64,		fl)
+		__field(int,		state)
+		__field(u32,		work_prio)
+		__field(u32,		eff_prio)
+		__field(u32,		ref_prio)
+		__field(int,		retval)
+	),
+
+	TP_fast_assign(
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0)
+		__assign_str(func);
+#else
+		__assign_str(func, func);
+#endif
+		__entry->handle    = handle;
+		__entry->app_id    = app_id;
+		__entry->fl        = (u64)(uintptr_t)fl;
+		__entry->state     = state;
+		__entry->work_prio = work_prio;
+		__entry->eff_prio  = eff_prio;
+		__entry->ref_prio  = ref_prio;
+		__entry->retval    = retval;
+	),
+
+	TP_printk("%s handle=0x%llx app_id=%d fl=0x%llx state=%d work_prio=%u eff_prio=%u ref_prio=%u retval=%d",
+		__get_str(func), __entry->handle, __entry->app_id, __entry->fl, __entry->state,
+		__entry->work_prio, __entry->eff_prio, __entry->ref_prio, __entry->retval)
+);
+
+TRACE_EVENT(fastrpc_npu_workinfo,
+
+	TP_PROTO(int domain, s32 id, s32 uid, u32 event, u32 reason, int retval),
+
+	TP_ARGS(domain, id, uid, event, reason, retval),
+
+	TP_STRUCT__entry(
+		__field(int,	domain)
+		__field(s32,	id)
+		__field(s32,	uid)
+		__field(u32,	event)
+		__field(u32,	reason)
+		__field(int,	retval)
+	),
+
+	TP_fast_assign(
+		__entry->domain = domain;
+		__entry->id     = id;
+		__entry->uid    = uid;
+		__entry->event  = event;
+		__entry->reason = reason;
+		__entry->retval = retval;
+	),
+
+	TP_printk("domain=%d id=%d uid=%d event=%u reason=%u retval=%d",
+		__entry->domain, __entry->id, __entry->uid,
+		__entry->event, __entry->reason, __entry->retval)
+);
+
+TRACE_EVENT(fastrpc_npu_prio_update,
+
+	TP_PROTO(int domain, u32 num_configs, int retval),
+
+	TP_ARGS(domain, num_configs, retval),
+
+	TP_STRUCT__entry(
+		__field(int,	domain)
+		__field(u32,	num_configs)
+		__field(int,	retval)
+	),
+
+	TP_fast_assign(
+		__entry->domain      = domain;
+		__entry->num_configs = num_configs;
+		__entry->retval      = retval;
+	),
+
+	TP_printk("domain=%d num_configs=%u retval=%d",
+		__entry->domain, __entry->num_configs, __entry->retval)
+);
+
 #endif
 
 /* This part must be outside protection */

@@ -2585,19 +2585,19 @@ static void fastrpc_wait_for_completion(struct fastrpc_invoke_ctx *ctx,
 			preempt_disable();
 			jj = 0;
 			wait_resp = false;
-			fastrpc_timeline_record(48, fl->tgid_app, timeline);
+			fastrpc_timeline_record(48, ctx->pid, timeline);
 			for (; jj < wakeTime && jj < wTimeout; jj++) {
 				wait_resp = try_wait_for_completion(&ctx->work);
 				if (wait_resp)
 					break;
 				udelay(1);
 			}
-			fastrpc_timeline_record(49, fl->tgid_app, timeline);
+			fastrpc_timeline_record(49, ctx->pid, timeline);
 			preempt_enable();
 			if (!wait_resp) {
-				fastrpc_timeline_record(50, fl->tgid_app, timeline);
+				fastrpc_timeline_record(50, ctx->pid, timeline);
 				*ptr_interrupted = fastrpc_wait_for_response(ctx, kernel);
-				fastrpc_timeline_record(51, fl->tgid_app, timeline);
+				fastrpc_timeline_record(51, ctx->pid, timeline);
 				if (*ptr_interrupted || ctx->is_work_done)
 					return;
 			}
@@ -2605,23 +2605,23 @@ static void fastrpc_wait_for_completion(struct fastrpc_invoke_ctx *ctx,
 		/* busy poll on memory for actual job done */
 		case EARLY_RESPONSE:
 			trace_fastrpc_msg("early_response: poll_begin");
-			fastrpc_timeline_record(24, fl->tgid_app, timeline);
+			fastrpc_timeline_record(24, ctx->pid, timeline);
 			err = poll_for_remote_response(ctx, FASTRPC_POLL_TIME);
 			/* Mark job done if poll on memory successful */
 			/* Wait for completion if poll on memory timeout */
 			if (!err) {
 				ctx->is_work_done = true;
-				fastrpc_timeline_record(44, fl->tgid_app, timeline);
+				fastrpc_timeline_record(44, ctx->pid, timeline);
 				return;
 			}
-			fastrpc_timeline_record(25, fl->tgid_app, timeline);
+			fastrpc_timeline_record(25, ctx->pid, timeline);
 			trace_fastrpc_msg("early_response: poll_timeout");
 			if (!ctx->is_work_done) {
 				if (ctx->rsp_flags == COMPLETE_SIGNAL)
-					fastrpc_timeline_record(26, fl->tgid_app, timeline);
+					fastrpc_timeline_record(26, ctx->pid, timeline);
 				*ptr_interrupted = fastrpc_wait_for_response(ctx, kernel);
 				if (ctx->rsp_flags == COMPLETE_SIGNAL)
-					fastrpc_timeline_record(39, fl->tgid_app, timeline);
+					fastrpc_timeline_record(39, ctx->pid, timeline);
 				if (*ptr_interrupted || ctx->is_work_done)
 					return;
 			}
@@ -2629,21 +2629,21 @@ static void fastrpc_wait_for_completion(struct fastrpc_invoke_ctx *ctx,
 		case COMPLETE_SIGNAL:
 		case NORMAL_RESPONSE:
 			if (ctx->rsp_flags == NORMAL_RESPONSE)
-				fastrpc_timeline_record(9, fl->tgid_app, timeline);
+				fastrpc_timeline_record(9, ctx->pid, timeline);
 			if (ctx->rsp_flags == COMPLETE_SIGNAL)
-				fastrpc_timeline_record(53, fl->tgid_app, timeline);
+				fastrpc_timeline_record(53, ctx->pid, timeline);
 			*ptr_interrupted = fastrpc_wait_for_response(ctx, kernel);
-			fastrpc_timeline_record(23, fl->tgid_app, timeline);
+			fastrpc_timeline_record(23, ctx->pid, timeline);
 			if (*ptr_interrupted || ctx->is_work_done) {
-				fastrpc_timeline_record(37, fl->tgid_app, timeline);
+				fastrpc_timeline_record(37, ctx->pid, timeline);
 				return;
 			}
 			break;
 		case POLL_MODE:
 			trace_fastrpc_msg("poll_mode: begin");
-			fastrpc_timeline_record(55, fl->tgid_app, timeline);
+			fastrpc_timeline_record(55, ctx->pid, timeline);
 			err = poll_for_remote_response(ctx, ctx->fl->poll_timeout);
-			fastrpc_timeline_record(56, fl->tgid_app, timeline);
+			fastrpc_timeline_record(56, ctx->pid, timeline);
 
 			/* If polling timed out, move to normal response state */
 			if (err) {
@@ -2730,9 +2730,9 @@ static int fastrpc_internal_invoke(struct fastrpc_user *fl,  u32 kernel,
 	}
 
 	trace_fastrpc_msg("context_alloc: begin");
-	fastrpc_timeline_record(3, fl->tgid_app, fl->fastrpc_timeline_obj);
+	fastrpc_timeline_record(3, current->pid, fl->fastrpc_timeline_obj);
 	ctx = fastrpc_context_alloc(fl, kernel, sc, invoke);
-	fastrpc_timeline_record(4, fl->tgid_app, fl->fastrpc_timeline_obj);
+	fastrpc_timeline_record(4, current->pid, fl->fastrpc_timeline_obj);
 	trace_fastrpc_msg("context_alloc: end");
 	if (IS_ERR(ctx))
 		return PTR_ERR(ctx);
@@ -2740,12 +2740,12 @@ static int fastrpc_internal_invoke(struct fastrpc_user *fl,  u32 kernel,
 	if (fl->profile)
 		perf_counter = (u64 *)ctx->perf + PERF_COUNT;
 	PERF(fl->profile, GET_COUNTER(perf_counter, PERF_GETARGS),
-	fastrpc_timeline_record(5, fl->tgid_app, fl->fastrpc_timeline_obj);
+	fastrpc_timeline_record(5, ctx->pid, fl->fastrpc_timeline_obj);
 	err = fastrpc_get_args(kernel, ctx);
+	fastrpc_timeline_record(6, ctx->pid, fl->fastrpc_timeline_obj);
 	if (err)
 		goto bail;
 	PERF_END);
-	fastrpc_timeline_record(6, fl->tgid_app, fl->fastrpc_timeline_obj);
 	trace_fastrpc_msg("get_args: end");
 
 	/*
@@ -2769,12 +2769,12 @@ static int fastrpc_internal_invoke(struct fastrpc_user *fl,  u32 kernel,
 	dma_wmb();
 	/* Send invoke buffer to remote dsp */
 	PERF(fl->profile, GET_COUNTER(perf_counter, PERF_LINK),
-	fastrpc_timeline_record(7, fl->tgid_app, fl->fastrpc_timeline_obj);
+	fastrpc_timeline_record(7, ctx->pid, fl->fastrpc_timeline_obj);
 	err = fastrpc_invoke_send(fl->sctx, priority, ctx, kernel, handle);
+	fastrpc_timeline_record(8, ctx->pid, fl->fastrpc_timeline_obj);
 	if (err)
 		goto bail;
 	PERF_END);
-	fastrpc_timeline_record(8, fl->tgid_app, fl->fastrpc_timeline_obj);
 	trace_fastrpc_msg("invoke_send: end");
 wait:
 	if (fl->poll_mode &&
@@ -2800,10 +2800,11 @@ wait:
 
 	/* make sure that all memory writes by DSP are seen by CPU */
 	dma_rmb();
-	fastrpc_timeline_record(40, fl->tgid_app, fl->fastrpc_timeline_obj);
 	/* populate all the output buffers with results */
 	PERF(fl->profile, GET_COUNTER(perf_counter, PERF_PUTARGS),
+	fastrpc_timeline_record(40, ctx->pid, fl->fastrpc_timeline_obj);
 	err = fastrpc_put_args(ctx, kernel);
+	fastrpc_timeline_record(41, ctx->pid, fl->fastrpc_timeline_obj);
 	if (err)
 		goto bail;
 	PERF_END);
@@ -2812,7 +2813,6 @@ wait:
 	err = ctx->retval;
 	if (err)
 		goto bail;
-	fastrpc_timeline_record(41, fl->tgid_app, fl->fastrpc_timeline_obj);
 
 bail:
 	if (ctx && interrupted == -ERESTARTSYS) {
@@ -8878,15 +8878,15 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int cmd,
 	switch (cmd) {
 	case FASTRPC_IOCTL_INVOKE:
 		trace_fastrpc_msg("invoke: begin");
-		fastrpc_timeline_record(2, fl->tgid_app, fl->fastrpc_timeline_obj);
+		fastrpc_timeline_record(2, current->pid, fl->fastrpc_timeline_obj);
 		err = fastrpc_invoke(fl, argp);
-		fastrpc_timeline_record(42, fl->tgid_app, fl->fastrpc_timeline_obj);
+		fastrpc_timeline_record(42, current->pid, fl->fastrpc_timeline_obj);
 		trace_fastrpc_msg("invoke: end");
 		break;
 	case FASTRPC_IOCTL_MULTIMODE_INVOKE:
-		fastrpc_timeline_record(2, fl->tgid_app, fl->fastrpc_timeline_obj);
+		fastrpc_timeline_record(2, current->pid, fl->fastrpc_timeline_obj);
 		err = fastrpc_multimode_invoke(fl, argp);
-		fastrpc_timeline_record(42, fl->tgid_app, fl->fastrpc_timeline_obj);
+		fastrpc_timeline_record(42, current->pid, fl->fastrpc_timeline_obj);
 		break;
 	case FASTRPC_IOCTL_INIT_ATTACH:
 		err = fastrpc_init_attach(fl, ROOT_PD);
@@ -10513,8 +10513,6 @@ void fastrpc_register_wakeup_source(struct device *dev,
 static void fastrpc_notify_user_ctx(struct fastrpc_invoke_ctx *ctx, int retval,
 		u32 rsp_flags, u32 early_wake_time)
 {
-	u32 tgid_app = ctx->fl->tgid_app;
-
 	if (ctx->cctx) {
 		if (!atomic_read(&ctx->cctx->teardown))
 			fastrpc_pm_awake(ctx->fl);
@@ -10529,19 +10527,19 @@ static void fastrpc_notify_user_ctx(struct fastrpc_invoke_ctx *ctx, int retval,
 		/* normal and complete response with return value */
 		ctx->is_work_done = true;
 		trace_fastrpc_msg("wakeup_task: begin");
-		fastrpc_timeline_record(38, tgid_app, ctx->fl->fastrpc_timeline_obj);
+		fastrpc_timeline_record(38, ctx->pid, ctx->fl->fastrpc_timeline_obj);
 		complete(&ctx->work);
 		trace_fastrpc_msg("wakeup_task: end");
 		break;
 	case USER_EARLY_SIGNAL:
-		fastrpc_timeline_record(52, tgid_app, ctx->fl->fastrpc_timeline_obj);
+		fastrpc_timeline_record(52, ctx->pid, ctx->fl->fastrpc_timeline_obj);
 		/* user hint of approximate time of completion */
 		ctx->early_wake_time = early_wake_time;
 		fallthrough;
 	case EARLY_RESPONSE:
 		/* rpc framework early response with return value */
 		trace_fastrpc_msg("wakeup_task: begin");
-		fastrpc_timeline_record(22, tgid_app, ctx->fl->fastrpc_timeline_obj);
+		fastrpc_timeline_record(22, ctx->pid, ctx->fl->fastrpc_timeline_obj);
 		complete(&ctx->work);
 		trace_fastrpc_msg("wakeup_task: end");
 		break;
@@ -10723,8 +10721,7 @@ static int fastrpc_handle_legacy_rsp(struct fastrpc_channel_ctx *cctx,
 			spin_unlock_irqrestore(&cctx->lock, flags);
 			return -EINVAL;
 	}
-	fastrpc_timeline_record(21, ctx->fl->tgid_app,
-		ctx->fl->fastrpc_timeline_obj);
+	fastrpc_timeline_record(21, ctx->pid, ctx->fl->fastrpc_timeline_obj);
 	fastrpc_notify_user_ctx(ctx, rsp.retval, rsp_flags, early_wake_time);
 
 	if (is_glink_wakeup && ctx->fl)

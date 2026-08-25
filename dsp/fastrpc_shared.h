@@ -71,6 +71,9 @@
 #define SMMU_2M 0x200000ULL
 #define SMMU_1G 0x40000000ULL
 
+#define FASTRPC_RELEASE_TIMEOUT_MS 500
+#define FASTRPC_RELEASE_OWNERS_CNT 2
+
 /*
  * Indicates whether FastRPC ring buffer support is available.
  *
@@ -1722,6 +1725,8 @@ struct fastrpc_user {
 	struct mutex pm_qos_mutex;
 	/* Compleation object for dma invocations by client driver*/
 	struct completion dma_invoke;
+	struct completion release_done;
+	atomic_t release_owners_cnt;
 	/* Completion objects and state for dspsignals */
 	struct fastrpc_dspsignal *signal_groups[FASTRPC_DSPSIGNAL_NUM_SIGNALS /FASTRPC_DSPSIGNAL_GROUP_SIZE];
 	struct dev_pm_qos_request *dev_pm_qos_req;

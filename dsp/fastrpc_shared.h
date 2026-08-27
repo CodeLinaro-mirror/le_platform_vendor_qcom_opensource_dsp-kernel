@@ -296,6 +296,12 @@ struct qna_discrete_alloc;
 #define FASTRPC_MAX_SG_PAGES_PER_BUF 16
 
 /*
+ * Exactly 3 of the 9 buffer types (init_mem/rootheap/dbglogbuf) can be SG,
+ * the other 6 are single-page.
+ */
+#define FASTRPC_NUM_SG_CAPABLE_BUFS 3
+
+/*
  * Num of pages shared with init attach 2 call
  * Page 1 : Preload buf
  */

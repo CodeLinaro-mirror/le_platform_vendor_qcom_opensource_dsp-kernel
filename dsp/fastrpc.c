@@ -8937,15 +8937,8 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int cmd,
 		__u32 rsvd;
 		__u32 reserved[16];
 
-		/*
-	 	 * TODO: Add check to ensure that NPU HAL service is the only process that is
-	 	 * allowed to make this ioctl call.
-	 	 * ioctl call from any other application needs to be rejected.
-	 	 * For now, add this rudimentary check to block most 3rd-party apps from making
-	 	 * this ioctl. This is NOT expected to block 3rd party-apps and is only a
-	 	 * temporary placeholder.
-	 	 */
-		if (fl->tgid_app >= THIRD_PARTY_APP_PID) {
+		// check if this is untrusted application
+		if (current->tgid != fl->tgid) {
 			err = -EPERM;
 			break;
 		}

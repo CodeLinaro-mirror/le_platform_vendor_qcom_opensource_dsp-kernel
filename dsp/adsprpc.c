@@ -2429,6 +2429,19 @@ static void fastrpc_context_list_dtor(struct fastrpc_file *fl)
 		if (ctxfree)
 			context_free(ctxfree);
 	} while (ctxfree);
+	do {
+		ctxfree = NULL;
+		spin_lock_irqsave(&fl->aqlock, irq_flags);
+		hlist_for_each_entry_safe(ictx, n, &clst->async_queue, asyncn) {
+			hlist_del_init(&ictx->asyncn);
+			atomic_sub(1, &fl->async_queue_job_count);
+			ctxfree = ictx;
+			break;
+		}
+		spin_unlock_irqrestore(&fl->aqlock, irq_flags);
+		if (ctxfree)
+			context_free(ctxfree);
+	} while (ctxfree);
 
 	spin_lock_irqsave(&fl->proc_state_notif.nqlock, irq_flags);
 	list_for_each_entry_safe(inotif, n1, &clst->notif_queue, notifn) {

@@ -7023,24 +7023,41 @@ static int fastrpc_multidomain_ctx_get_tgids(struct device *dev,
 	return err;
 }
 
-/* Returns true if two multidomain context DSP sets contain the same phy_ids */
+/* Returns true if phy_id is present in the multidomain context's DSP set */
+static bool fastrpc_domain_in_set(struct fastrpc_mdctx_info *set,
+	uint32_t phy_id)
+{
+	uint32_t i = 0;
+
+	for (i = 0; i < set->num_domains; i++) {
+		if (set->phy_ids[i] == phy_id)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Returns true if two multidomain contexts span the same set of DSPs.
+ *
+ * phy_ids holds one entry per (domain, session) pair, so a multisession
+ * context repeats the same phy_id once per session and num_domains carries
+ * the session count rather than the number of distinct DSPs. Compare the
+ * two contexts by containment in both directions: the forward pass rejects
+ * a DSP that b lacks, the reverse pass rejects a DSP that a lacks. Both
+ * passes are required - a single direction would report {nsp0} and
+ * {nsp0, nsp1} as equal.
+ */
 static bool fastrpc_domain_sets_equal(struct fastrpc_mdctx_info *a,
 	struct fastrpc_mdctx_info *b)
 {
-	uint32_t i = 0, j = 0;
-	bool found = false;
+	uint32_t i = 0;
 
-	if (a->num_domains != b->num_domains)
-		return false;
 	for (i = 0; i < a->num_domains; i++) {
-		found = false;
-		for (j = 0; j < b->num_domains; j++) {
-			if (a->phy_ids[i] == b->phy_ids[j]) {
-				found = true;
-				break;
-			}
-		}
-		if (!found)
+		if (!fastrpc_domain_in_set(b, a->phy_ids[i]))
+			return false;
+	}
+	for (i = 0; i < b->num_domains; i++) {
+		if (!fastrpc_domain_in_set(a, b->phy_ids[i]))
 			return false;
 	}
 	return true;

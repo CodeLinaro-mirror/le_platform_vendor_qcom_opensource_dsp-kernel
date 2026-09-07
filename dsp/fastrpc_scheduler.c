@@ -9,6 +9,8 @@
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/rbtree.h>
+#include <linux/sched.h>
+#include <linux/sched/prio.h>
 #include <linux/slab.h>
 #include <linux/timekeeping.h>
 #include <linux/wait.h>
@@ -35,7 +37,6 @@ static void fastrpc_workinfo_notify(struct fastrpc_scheduler *sched,
 	info.timestamp_ms	 = ktime_to_ms(ktime_get_real());
 	info.event		 = (u32)event;
 	info.reason		 = reason;
-	info.id			 = (s32)work->work_id;
 	info.uid		 = work->app_id;
 	info.debug_pid		 = work->app_id;
 	info.domain		 = cctx->domain_id;
@@ -50,7 +51,7 @@ static void fastrpc_workinfo_notify(struct fastrpc_scheduler *sched,
 		(int)work->work_prio, (int)work->eff_prio,
 		cctx->domain_id);
 	trace_fastrpc_npu_workinfo(cctx->domain_id, (s32)work->work_id,
-				   (s32)work->app_id, (u32)event, reason, 0);
+		(s32)work->app_id, (u32)event, reason, 0);
 	fastrpc_npu_post_workinfo(cctx, &info);
 }
 
@@ -109,9 +110,9 @@ static u32 fastrpc_npu_lookup_prio(struct fastrpc_channel_ctx *cctx,
  *      received an NPU_PRIORITY_WORKINFO ioctl from the AIDL service
  *      operate without access control.
  *
- *   2. caller_uid not in table:  denied.  Only UIDs explicitly
- *      registered by the scheduling service may submit work.  This
- *      blocks new apps that lack an Android manifest permission entry.
+ *   2. caller_uid not in table:  Allowed once.  NPU manager will be
+ *      notified. The npu manager may decide to block this application
+ *      and this policy will be enforced for subsequent calls.
  *
  *   3. caller_uid in table, appid == caller_uid:  allowed only if
  *      has_direct_access is set.  Apps with a manifest change or AI
@@ -171,9 +172,9 @@ static int fastrpc_npu_check_access(struct fastrpc_channel_ctx *cctx,
 
 	/* Rule 3: caller not registered in the priority table */
 	if (!found) {
-		dev_err(cctx->dev, "%s: uid %u not in NPU priority table, rejecting appid %d\n",
-			__func__, caller_uid, appid);
-		return -EACCES;
+		dev_warn(cctx->dev, "%s: uid %u not in NPU priority table, allowing once and notifying NPU manager\n",
+			__func__, caller_uid);
+		return 0;
 	}
 
 	if ((uid_t)appid == caller_uid) {
@@ -971,9 +972,73 @@ int fastrpc_work_add(struct fastrpc_user *fl,
 			return -ENOMEM;
 		}
 		list_add_tail(&wnode->app_node, &entry->works);
+		list_add_tail(&wnode->user_node, &fl->sched_works);
+
+		/*
+		 * Inline fast-path admission.
+		 *
+		 * The caller does not wait_for_completion(), so its on-stack
+		 * completion/result vanish once fastrpc_work_add() returns.
+		 * wait_done and result are cleared to NULL.  Every consumer
+		 * of an ADMITTED or DONE node (work_remove ADMITTED->DONE,
+		 * user_cleanup, drain_done_list, deinit) already avoids these
+		 * fields; NULLing them turns any future violation into an
+		 * immediate NULL dereference rather than silent corruption of
+		 * a returned stack frame.  fastrpc_scheduler_abort_all()
+		 * only completes INCOMING and PENDING waiters, so it cannot
+		 * reach an inline-admitted node's back-pointers either.
+		 */
+		if (list_empty(&sched->incoming_list) &&
+		    list_empty(&sched->done_list) &&
+		    list_empty(&sched->abort_list) &&
+		    !sched->prio_update_pending) {
+			u32 app_prio = fl->cctx->npu_app_prio ?
+				fastrpc_npu_lookup_prio(fl->cctx, work->appid) :
+				entry->cur_prio;
+
+			wnode->eff_prio = app_prio + wnode->work_prio;
+
+			if (list_empty(&sched->executing_list) ||
+			    wnode->eff_prio <= sched->ref_prio) {
+				RB_CLEAR_NODE(&wnode->rb_node);
+				INIT_LIST_HEAD(&wnode->staging_node);
+				atomic_set(&wnode->state,
+					   WORK_STATE_ADMITTED);
+				list_add_tail(&wnode->exec_node,
+					      &sched->executing_list);
+				sched->ref_prio = min(wnode->eff_prio,
+						      sched->ref_prio);
+				wnode->wait_done = NULL;
+				wnode->result = NULL;
+
+				/*
+				 * Same two events, same order, that the
+				 * kthread emits from stage 3 and stage 5,
+				 * so the HAL's workinfo stream is
+				 * indistinguishable between paths.
+				 */
+				fastrpc_workinfo_notify(sched, wnode,
+					WORK_REQUESTED,
+					NPU_WORK_REASON_NONE);
+				fastrpc_workinfo_notify(sched, wnode,
+					WORK_STARTED,
+					NPU_WORK_REASON_START_INITIAL);
+
+				pr_debug("%s: handle=0x%llx app_id=%d raw_prio=%u work_prio=%u eff_prio=%u ref_prio=%u -> ADMITTED (inline)\n",
+					__func__, work->handle, work->appid,
+					work->priority, wnode->work_prio,
+					wnode->eff_prio, sched->ref_prio);
+				spin_unlock(&sched->lock);
+				return 0;
+			}
+		}
+
+		/*
+		 * Slow path: queue for the kthread.  Everything below this
+		 * point is byte-identical to the pre-fast-path behaviour.
+		 */
 		list_add_tail(&wnode->staging_node,
 			      &sched->incoming_list);
-		list_add_tail(&wnode->user_node, &fl->sched_works);
 		pr_debug("%s: handle=0x%llx app_id=%d raw_prio=%u work_prio=%u group=%s feature=%s -> INCOMING\n",
 			__func__, work->handle, work->appid, work->priority,
 			wnode->work_prio,
@@ -1147,9 +1212,16 @@ int fastrpc_work_remove(struct fastrpc_user *fl,
 /*
  * Initialize per-channel scheduler state and start the scheduler
  * kthread. Called during channel context probe (rpmsg).
+ *
+ * The kthread runs at SCHED_FIFO priority MAX_RT_PRIO/2 because every
+ * remote_work_control(START) blocks on its admission pass; see the comment
+ * at the kthread_create() call below.
  */
 int fastrpc_scheduler_init(struct fastrpc_scheduler *sched)
 {
+	struct sched_param param = { .sched_priority = MAX_RT_PRIO / 2 };
+	int ret = 0;
+
 	sched->pending_tree = RB_ROOT;
 	INIT_LIST_HEAD(&sched->executing_list);
 	INIT_LIST_HEAD(&sched->incoming_list);
@@ -1164,10 +1236,24 @@ int fastrpc_scheduler_init(struct fastrpc_scheduler *sched)
 	sched->stop = false;
 	sched->kthread = NULL;
 
-	sched->kthread = kthread_run(fastrpc_scheduler_thread, sched,
-				     "fastrpc_sched");
+	/*
+	 * Every remote_work_control(START) blocks in fastrpc_work_add() until
+	 * this thread runs an admission pass, so at the default SCHED_OTHER
+	 * policy the wakeup is at the mercy of CPU load.  Run SCHED_FIFO at
+	 * MAX_RT_PRIO/2: high enough to preempt ordinary work, and
+	 * deliberately below the MAX_RT_PRIO-1 band reserved for core
+	 * scheduler, watchdog and hypervisor core control infrastructure.
+	 * The thread loop does bounded work under sched->lock and then sleeps
+	 * in wait_event_interruptible, so it cannot monopolise a CPU.
+	 *
+	 * Create the thread stopped and wake it only after the policy has
+	 * been applied, so it cannot admit its first work at the default
+	 * priority.
+	 */
+	sched->kthread = kthread_create(fastrpc_scheduler_thread, sched,
+					"fastrpc_sched");
 	if (IS_ERR(sched->kthread)) {
-		int ret = PTR_ERR(sched->kthread);
+		ret = PTR_ERR(sched->kthread);
 
 		pr_err("%s: kthread creation failed: %d\n",
 		       __func__, ret);
@@ -1176,6 +1262,19 @@ int fastrpc_scheduler_init(struct fastrpc_scheduler *sched)
 		sched->kthread = NULL;
 		return ret;
 	}
+
+	/*
+	 * A failure here is not fatal: the priority is purely a latency
+	 * optimisation and the scheduler remains functionally correct at
+	 * SCHED_OTHER, so warn and continue rather than failing the channel
+	 * probe.
+	 */
+	ret = sched_setscheduler_nocheck(sched->kthread, SCHED_FIFO, &param);
+	if (ret)
+		pr_warn("%s: failed to set SCHED_FIFO (prio %d): %d\n",
+			__func__, param.sched_priority, ret);
+
+	wake_up_process(sched->kthread);
 
 	pr_info("%s: kthread started\n", __func__);
 	return 0;

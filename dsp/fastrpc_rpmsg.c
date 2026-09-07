@@ -427,6 +427,7 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	 * undefined behaviour on non-NSP channels.
 	 */
 	sema_init(&data->npu_workinfo_sem, 0);
+	atomic_set(&data->npu_workinfo_notif_seq, 0);
 #if FRPC_RING_BUFFER_ENABLED
 	init_waitqueue_head(&data->log.wq);
 #endif
@@ -677,6 +678,7 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	cctx->npu_workinfo_head = NULL;
 	cctx->npu_workinfo_tail = NULL;
 	cctx->npu_workinfo_queue_len = 0;
+	atomic_set(&cctx->npu_workinfo_notif_seq, 0);
 	spin_unlock_irqrestore(&cctx->lock, flags);
 
 	/* Free every remaining node and its dynamically allocated fields. */

@@ -13,6 +13,8 @@ load(
 
 def define_modules(target, variant):
     kernel_build_variant = "{}_{}".format(target, variant)
+    if target=="mahua":
+        kernel_build_variant = "{}_{}".format("glymur", variant)
 
     kernel_build = select({
         "//build/qcom_build_extensions:qtisocrepo_true": "//soc-repo:{}_base_kernel".format(kernel_build_variant),

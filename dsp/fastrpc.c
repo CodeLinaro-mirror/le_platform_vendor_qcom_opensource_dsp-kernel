@@ -91,11 +91,11 @@ struct fastrpc_common {
 	 */
 	bool debug_mode_enable;
 
-	/* TGID of process currently offloading to discrete card */
-	int discrete_owner_tgid;
+	/* TGID of process currently offloading to each discrete card */
+	int discrete_owner_tgid[MAX_FW_CARD_ID + 1];
 
-	/* Active remote sessions of owner process on discrete card */
-	u32 discrete_proc_count;
+	/* Active remote sessions of owner process on each discrete card */
+	u32 discrete_proc_count[MAX_FW_CARD_ID + 1];
 
 #ifdef CONFIG_DEBUG_FS
 	struct dentry *debugfs_root;
@@ -116,7 +116,7 @@ static void fastrpc_user_release(struct kref *ref);
 /*
  * fastrpc_claim_discrete_card() - Claim ownership of the discrete card.
  * At any given time, only a single process may offload work to any domain
- * on the discrete card.
+ * on a given discrete card.
  * @fl: fastrpc user creating a process on the discrete card.
  *
  * Returns 0 if the card is unclaimed or already owned by current process.
@@ -127,24 +127,25 @@ static int fastrpc_claim_discrete_card(struct fastrpc_user *fl)
 	int err = 0;
 	unsigned long flags = 0;
 	int owner_tgid = 0;
+	u32 card_id = fl->cctx->domain->card;
 
 	spin_lock_irqsave(&g_frpc.glock, flags);
-	if (g_frpc.discrete_proc_count > 0 &&
-		g_frpc.discrete_owner_tgid != fl->tgid_app) {
+	if (g_frpc.discrete_proc_count[card_id] > 0 &&
+		g_frpc.discrete_owner_tgid[card_id] != fl->tgid_app) {
 		err = -EBUSY;
-		owner_tgid = g_frpc.discrete_owner_tgid;
+		owner_tgid = g_frpc.discrete_owner_tgid[card_id];
 		goto bail;
 	}
-	g_frpc.discrete_owner_tgid = fl->tgid_app;
-	g_frpc.discrete_proc_count++;
+	g_frpc.discrete_owner_tgid[card_id] = fl->tgid_app;
+	g_frpc.discrete_proc_count[card_id]++;
 	fl->claimed_discrete = true;
         fl->claimed_discrete_card_id = card_id;
 bail:
 	spin_unlock_irqrestore(&g_frpc.glock, flags);
 	if (err)
 		dev_err(fl->cctx->dev,
-			"Error %d: tgid %d rejected, discrete card currently owned by tgid %d",
-			err, fl->tgid_app, owner_tgid);
+			"Error %d: tgid %d rejected, discrete card %u currently owned by tgid %d",
+			err, fl->tgid_app, card_id, owner_tgid);
 	return err;
 }
 
@@ -158,7 +159,7 @@ bail:
 static void fastrpc_release_discrete_card(struct fastrpc_user *fl)
 {
 	unsigned long flags = 0;
-        u32 card_id = fl->claimed_discrete_card_id;
+	u32 card_id = fl->cctx->domain->card;
 
 	spin_lock_irqsave(&g_frpc.glock, flags);
 	if (fl->claimed_discrete) {
@@ -166,8 +167,8 @@ static void fastrpc_release_discrete_card(struct fastrpc_user *fl)
 		 * When the last remote session of this process on discrete is
 		 * cleaned up, release ownership of discrete card.
 		 */
-		if (--g_frpc.discrete_proc_count == 0)
-			g_frpc.discrete_owner_tgid = 0;
+		if (--g_frpc.discrete_proc_count[card_id] == 0)
+			g_frpc.discrete_owner_tgid[card_id] = 0;
 		fl->claimed_discrete = false;
 	}
 	spin_unlock_irqrestore(&g_frpc.glock, flags);

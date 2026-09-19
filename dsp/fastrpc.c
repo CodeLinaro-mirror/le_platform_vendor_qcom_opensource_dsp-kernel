@@ -139,7 +139,7 @@ static int fastrpc_claim_discrete_card(struct fastrpc_user *fl)
 	g_frpc.discrete_owner_tgid[card_id] = fl->tgid_app;
 	g_frpc.discrete_proc_count[card_id]++;
 	fl->claimed_discrete = true;
-        fl->claimed_discrete_card_id = card_id;
+	fl->claimed_discrete_card_id = card_id;
 bail:
 	spin_unlock_irqrestore(&g_frpc.glock, flags);
 	if (err)
@@ -159,7 +159,7 @@ bail:
 static void fastrpc_release_discrete_card(struct fastrpc_user *fl)
 {
 	unsigned long flags = 0;
-	u32 card_id = fl->cctx->domain->card;
+	u32 card_id = fl->claimed_discrete_card_id;
 
 	spin_lock_irqsave(&g_frpc.glock, flags);
 	if (fl->claimed_discrete) {

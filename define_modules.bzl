@@ -12,7 +12,7 @@ load(
     "kernel_unstripped_modules_archive",
 )
 
-def define_modules(target, variant, build_loader):
+def define_modules(target, variant, build_loader, enable_qna = "no"):
     kernel_build_variant = "{}_{}".format(target, variant)
     data = [
         ":{}_frpc-adsprpc".format(kernel_build_variant),
@@ -42,13 +42,24 @@ def define_modules(target, variant, build_loader):
         "//build/qcom_build_extensions:qtisocrepo_false": ["//msm-kernel:all_headers"],
     })
 
+    # Discrete NSP targets link against the QNA scatter-gather memory
+    # manager. Callers opt in per target/variant via enable_qna.
+    qna_deps = []
+    qna_defines = []
+    if enable_qna == "yes":
+        qna_deps = [
+            "//vendor/qcom/opensource/qna-kernel:qna_mem_mgr_headers",
+            "//vendor/qcom/opensource/qna-kernel:{}_qna-controller".format(kernel_build_variant),
+        ]
+        qna_defines = ["CONFIG_FASTRPC_QNA=1"]
+
     # Path to dsp folder from soc-repo/include/trace directory
     trace_include_path = "../../../{}/dsp".format(native.package_name())
 
     ddk_module(
         name = "{}_frpc-adsprpc".format(kernel_build_variant),
         kernel_build = kernel_build,
-        deps = ddk_deps,
+        deps = ddk_deps + qna_deps,
         srcs = [
             "dsp/fastrpc.c",
             "dsp/fastrpc_rpmsg.c",
@@ -61,7 +72,7 @@ def define_modules(target, variant, build_loader):
             "dsp/fastrpc_timeline_shared.h",
             "dsp/fastrpc_timeline.h",
         ],
-        local_defines = ["DSP_TRACE_INCLUDE_PATH={}".format(trace_include_path)],
+        local_defines = ["DSP_TRACE_INCLUDE_PATH={}".format(trace_include_path)]+ qna_defines,
         out = "frpc-adsprpc.ko",
         hdrs = [
             "include/uapi/misc/fastrpc.h",

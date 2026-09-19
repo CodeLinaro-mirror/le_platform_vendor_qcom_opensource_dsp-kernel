@@ -479,6 +479,232 @@ static void fastrpc_map_put(struct fastrpc_map *map)
 		kref_put(&map->refcount, fastrpc_free_map);
 }
 
+#ifdef CONFIG_FASTRPC_QNA
+/*
+ * fastrpc_qna_discrete_alloc_put - Drop the dma_buf ref taken by
+ * QNA_MEM_LOOKUP (or QNA_MEM_ALLOC) for a discrete allocation.
+ */
+static void fastrpc_qna_discrete_alloc_put(struct qna_discrete_alloc *alloc)
+{
+	struct qna_mem_put_params fp = {0};
+	struct qna_mem_req_payload req = {0};
+
+	fp.alloc    = alloc;
+	req.req_id  = QNA_MEM_PUT;
+	req.params  = &fp;
+	req.size    = sizeof(fp);
+
+	qna_mem_request(&req);
+}
+
+/*
+ * fastrpc_qna_discrete_alloc_lookup - Look up a QNA discrete allocation by fd.
+ *
+ * Queries the QNA memory manager for a discrete allocation backing the
+ * given file descriptor. On success, *alloc is set to the allocation
+ * descriptor; on -ENOENT (fd is not a discrete allocation) *alloc is
+ * set to NULL and 0 is returned so the caller can fall through to the
+ * regular SMMU path.
+ *
+ * @fd:    file descriptor to look up
+ * @alloc: out-param set to the allocation descriptor, or NULL
+ *
+ * Returns 0 on success and if the fd is not a discrete allocation,
+ * negative errno on failure.
+ */
+static int fastrpc_qna_discrete_alloc_lookup(int fd,
+	struct qna_discrete_alloc **alloc)
+{
+	struct qna_mem_lookup_params lp = {0};
+	struct qna_mem_req_payload qreq = {0};
+	int err = 0;
+
+	lp.fd = fd;
+	qreq.req_id = QNA_MEM_LOOKUP;
+	qreq.params = &lp;
+	qreq.size   = sizeof(lp);
+
+	*alloc = NULL;
+	err = qna_mem_request(&qreq);
+	if (err == -ENOENT)
+		return 0;
+	if (err)
+		return err;
+	*alloc = lp.alloc;
+	return 0;
+}
+
+/*
+ * Find the fastrpc_map corresponding to discrete fd
+ * in the discrete_maps list.
+ *
+ * Args:
+ * @fl: pointer to fastrpc_user object
+ * @alloc: pointer to qna_discrete_alloc object
+ * @fd: file descriptor to find the discrete map entry
+ */
+static struct fastrpc_map *fastrpc_find_discrete_fd_map(
+	struct fastrpc_user *fl, struct qna_discrete_alloc *alloc, int fd,
+	bool map_ref)
+{
+	struct fastrpc_map *map = NULL;
+
+	if (!fl || !alloc)
+		return NULL;
+
+	/* Check for discrete fd map for the given fd */
+	spin_lock(&fl->lock);
+	list_for_each_entry(map, &fl->discrete_maps, node) {
+		if (map->fd == fd && map->buf == alloc->db) {
+			if (map_ref && !kref_get_unless_zero(&map->refcount))
+				break;
+			spin_unlock(&fl->lock);
+			return map;
+		}
+	}
+	spin_unlock(&fl->lock);
+	return NULL;
+}
+
+/*
+ * Create a new discrete fd map entry and add it to the
+ * discrete_maps list of the user session.
+ *
+ * Args:
+ * @fl: pointer to fastrpc_user object
+ * @fd: file descriptor to create map for
+ * @alloc: pointer to qna_discrete_alloc object
+ * @discrete_map: pointer to return created map entry
+ *
+ * Return: 0 on success, negative errno on failure
+ */
+static int fastrpc_discrete_map_create(struct fastrpc_user *fl, int fd, int flags,
+	struct qna_discrete_alloc *alloc, struct fastrpc_map **discrete_map)
+{
+	struct fastrpc_map *map = NULL, *existing = NULL;
+	struct device *dev = fl ? fl->cctx->dev : NULL;
+	int i = 0;
+
+	if (!fl || !alloc || !discrete_map)
+		return -EINVAL;
+
+	if (!alloc->blocks)
+		return -EINVAL;
+
+	if (!alloc->num_blocks)
+		return -EINVAL;
+
+	if (IS_EXTENDED_MAP_FLAG(flags)) {
+		for (i = 0; i < alloc->num_blocks; i++) {
+			if (alloc->blocks[i].size % FASTRPC_MEM_ALIGN_1M != 0 ||
+			    alloc->blocks[i].size < FASTRPC_MEM_ALIGN_1M) {
+				dev_err(dev, "Error %d: %s: extended flag set but block[%d] size %llu not 1MB aligned or smaller than 1MB\n",
+					-ENOTSUPP, __func__, i, alloc->blocks[i].size);
+				return -ENOTSUPP;
+			}
+		}
+	}
+
+	/* Allocate memory for the new discrete map entry */
+	map = kzalloc(sizeof(*map), GFP_KERNEL);
+	if (!map)
+		return -ENOMEM;
+
+	map->sg_pages = kmalloc_array(alloc->num_blocks,
+				      sizeof(*map->sg_pages), GFP_KERNEL);
+	if (!map->sg_pages) {
+		kfree(map);
+		return -ENOMEM;
+	}
+	map->num_sg_pages = (int)alloc->num_blocks;
+	for (i = 0; i < alloc->num_blocks; i++) {
+		map->sg_pages[i].addr = alloc->blocks[i].addr;
+		map->sg_pages[i].size = alloc->blocks[i].size;
+	}
+
+	INIT_LIST_HEAD(&map->node);
+	map->fl = fl;
+	map->fd = fd;
+	map->size = alloc->total_size;
+	map->len = alloc->total_size;
+	atomic_set(&map->state, FD_MAP_DEFAULT);
+	map->buf = alloc->db;
+	map->discrete_alloc = alloc;
+	kref_init(&map->refcount);
+
+	/*
+	 * Atomically check-and-add under fl->lock to prevent two threads
+	 * from creating duplicate entries for the same fd.
+	 */
+	spin_lock(&fl->lock);
+	list_for_each_entry(existing, &fl->discrete_maps, node) {
+		if (existing->fd == fd && existing->buf == alloc->db) {
+			if (kref_get_unless_zero(&existing->refcount)) {
+				spin_unlock(&fl->lock);
+				/* Map entry already exists, discard pre-allocated map. */
+				kfree(map->sg_pages);
+				kfree(map);
+				*discrete_map = existing;
+				return 0;
+			}
+			/* Entry found */
+			break;
+		}
+	}
+	list_add_tail(&map->node, &fl->discrete_maps);
+	spin_unlock(&fl->lock);
+
+	*discrete_map = map;
+	return 0;
+}
+
+/*
+ * Delete and free a specific discrete fd map entry
+ *
+ * Args:
+ * @fl: pointer to fastrpc_user object
+ * @tmap: the specific map entry to remove and free
+ */
+static void fastrpc_discrete_map_free(struct fastrpc_user *fl,
+	struct fastrpc_map *tmap)
+{
+	if (!fl || !tmap)
+		return;
+
+	spin_lock(&fl->lock);
+	list_del(&tmap->node);
+	spin_unlock(&fl->lock);
+	kfree(tmap->sg_pages);
+	kfree(tmap);
+}
+
+/**
+ * Helper function for releasing a discrete map structure.
+ */
+static void fastrpc_discrete_map_kref_release(struct kref *ref)
+{
+	struct fastrpc_map *map = NULL;
+	struct fastrpc_user *fl = NULL;
+
+	map = container_of(ref, struct fastrpc_map, refcount);
+	if (map) {
+		fl = map->fl;
+		if (!map->map_err && map->discrete_alloc)
+			fastrpc_qna_discrete_alloc_put(map->discrete_alloc);
+		fastrpc_discrete_map_free(fl, map);
+	}
+}
+
+/**
+ * Function to decrement discrete map's refcount.
+ */
+static void fastrpc_discrete_map_put(struct fastrpc_map *map)
+{
+	if (map)
+		kref_put(&map->refcount, fastrpc_discrete_map_kref_release);
+}
+#endif /* CONFIG_FASTRPC_QNA */
+
 static int fastrpc_map_get(struct fastrpc_map *map)
 {
 	if (!map)
@@ -2924,7 +3150,9 @@ bail:
 	return err;
 }
 
-static int fastrpc_mem_map_to_dsp(struct fastrpc_user *fl, int fd, int offset,
+static int fastrpc_mem_map_to_dsp(struct fastrpc_user *fl,
+				struct fastrpc_map *map,
+				int fd, int offset,
 				u32 flags, u64 va, u64 phys,
 				size_t size, uintptr_t *raddr)
 {
@@ -2932,7 +3160,7 @@ static int fastrpc_mem_map_to_dsp(struct fastrpc_user *fl, int fd, int offset,
 	struct fastrpc_enhanced_invoke ioctl;
 	struct fastrpc_mem_map_req_msg req_msg = { 0 };
 	struct fastrpc_mmap_rsp_msg rsp_msg = { 0 };
-	struct fastrpc_phy_page pages = { 0 };
+	struct fastrpc_phy_page page = { 0 };
 	struct device *dev = fl->sctx->smmucb[DEFAULT_SMMU_IDX].dev;
 	int err = 0;
 
@@ -2946,20 +3174,27 @@ static int fastrpc_mem_map_to_dsp(struct fastrpc_user *fl, int fd, int offset,
 	req_msg.offset = offset;
 	req_msg.vaddrin = va;
 	req_msg.flags = flags;
-	req_msg.num = sizeof(pages);
 	req_msg.data_len = 0;
 
 	args[0].ptr = (u64) (uintptr_t) &req_msg;
 	args[0].length = sizeof(req_msg);
 
-	pages.addr = phys;
-	pages.size = size;
-
-	args[1].ptr = (u64) (uintptr_t) &pages;
-	args[1].length = sizeof(pages);
-
-	args[2].ptr = (u64) (uintptr_t) &pages;
-	args[2].length = 0;
+	/* Use sg_pages array if present (discrete multi-block), else single page */
+	if (map && map->sg_pages && map->num_sg_pages > 0) {
+		req_msg.num = map->num_sg_pages * sizeof(struct fastrpc_phy_page);
+		args[1].ptr = (u64)(uintptr_t)map->sg_pages;
+		args[1].length = map->num_sg_pages * sizeof(struct fastrpc_phy_page);
+		args[2].ptr = (u64)(uintptr_t)map->sg_pages;
+		args[2].length = 0;
+	} else {
+		page.addr = phys;
+		page.size = size;
+		req_msg.num = sizeof(page);
+		args[1].ptr = (u64) (uintptr_t) &page;
+		args[1].length = sizeof(page);
+		args[2].ptr = (u64) (uintptr_t) &page;
+		args[2].length = 0;
+	}
 
 	args[3].ptr = (u64) (uintptr_t) &rsp_msg;
 	args[3].length = sizeof(rsp_msg);
@@ -3001,7 +3236,7 @@ static int fastrpc_create_persistent_headers(struct fastrpc_user *fl)
 		return err;
 
 	virtb = (u64) (uintptr_t)(pers_hdr_buf->virt);
-	err = fastrpc_mem_map_to_dsp(fl, -1, 0,
+	err = fastrpc_mem_map_to_dsp(fl, NULL, -1, 0,
 				ADSP_MMAP_PERSIST_HDR, 0, (u64) (uintptr_t)(pers_hdr_buf->phys),
 				pers_hdr_buf->size, &pers_hdr_buf->raddr);
 	if (err)
@@ -3361,6 +3596,25 @@ static void print_map_info(struct seq_file *s_file, struct fastrpc_map *map)
 	seq_printf(s_file,"%s %2s 0x%x\n", "flags", ":", map->flags);
 }
 
+#ifdef CONFIG_FASTRPC_QNA
+static void print_discrete_map_info(struct seq_file *s_file, struct fastrpc_map *map)
+{
+	int i;
+
+	seq_printf(s_file, "%s %4s %d\n",     "fd",          ":", map->fd);
+	seq_printf(s_file, "%s %2s 0x%llx\n", "size",        ":", map->size);
+	seq_printf(s_file, "%s %3s 0x%llx\n", "len",         ":", map->len);
+	seq_printf(s_file, "%s %2s 0x%llx\n", "raddr",       ":", map->raddr);
+	seq_printf(s_file, "%s %4s %d\n",     "state",       ":", atomic_read(&map->state));
+	seq_printf(s_file, "%s %2s %d\n",     "map_err",     ":", map->map_err);
+	seq_printf(s_file, "%s %2s %d\n",     "refcount",    ":", kref_read(&map->refcount));
+	seq_printf(s_file, "%s %2s %d\n",     "num_sg_pages",":", map->num_sg_pages);
+	for (i = 0; i < map->num_sg_pages; i++)
+		seq_printf(s_file, "  sg_pages[%d] addr 0x%llx size 0x%llx\n",
+			i, map->sg_pages[i].addr, map->sg_pages[i].size);
+}
+#endif
+
 static void print_session_info(struct seq_file *s_file, struct fastrpc_user *fl)
 {
 	seq_printf(s_file,"%s %2s %s\n", "process_name", ":", fl->name);
@@ -3528,6 +3782,13 @@ static int fastrpc_debugfs_show(struct seq_file *s_file, void *data)
 			if (map)
 				print_map_info(s_file, map);
 		}
+#ifdef CONFIG_FASTRPC_QNA
+		seq_printf(s_file,"\n=============== Discrete maps ===============\n");
+		list_for_each_entry(map, &fl->discrete_maps, node) {
+			if (map)
+				print_discrete_map_info(s_file, map);
+		}
+#endif
 		seq_printf(s_file,"\n=============== Kernel maps ===============\n");
 		list_for_each_entry(buf, &fl->mmaps, node) {
 			if (buf)
@@ -4764,6 +5025,16 @@ void fastrpc_free_user(struct fastrpc_user *fl)
 			map->attr = FASTRPC_MAP_ATTR_DEFAULT;
 		__fastrpc_free_map(map);
 	}
+
+	list_for_each_entry_safe(map, m, &fl->discrete_maps, node) {
+		list_del(&map->node);
+#ifdef CONFIG_FASTRPC_QNA
+		fastrpc_qna_discrete_alloc_put(map->discrete_alloc);
+#endif
+		kfree(map->sg_pages);
+		kfree(map);
+	}
+
 	mutex_unlock(&fl->map_mutex);
 
 	fastrpc_buf_list_free(fl, &fl->mmaps, false);
@@ -5117,6 +5388,7 @@ static int fastrpc_user_obj_create(struct file *filp,
 	INIT_LIST_HEAD(&fl->pending);
 	INIT_LIST_HEAD(&fl->interrupted);
 	INIT_LIST_HEAD(&fl->maps);
+	INIT_LIST_HEAD(&fl->discrete_maps);
 	INIT_LIST_HEAD(&fl->mmaps);
 	INIT_LIST_HEAD(&fl->user);
 	INIT_LIST_HEAD(&fl->active_user_ssr);
@@ -8889,6 +9161,59 @@ err_invoke:
 	return err;
 }
 
+/*
+ * fastrpc_qna_lookup - Look up a discrete allocation for an fd.
+ *
+ * Sets *is_discrete=true and *alloc to the found allocation when
+ * CONFIG_FASTRPC_QNA is enabled and the fd resolves to a discrete
+ * allocation.  Otherwise sets *is_discrete=false and returns 0, so
+ * callers never need #ifdef guards around "if (!is_discrete)" checks.
+ *
+ * Returns 0 on success (including "not a discrete fd"), negative errno
+ * on a hard lookup failure.
+ */
+#ifdef CONFIG_FASTRPC_QNA
+static int fastrpc_qna_lookup(int fd, struct qna_discrete_alloc **alloc,
+			      bool *is_discrete)
+{
+	int err;
+
+	err = fastrpc_qna_discrete_alloc_lookup(fd, alloc);
+	if (err)
+		return err;
+	*is_discrete = (*alloc != NULL);
+	return 0;
+}
+#else
+/*
+ * Stub definitions for CONFIG_FASTRPC_QNA=n builds.
+ *
+ * All call sites in this file invoke these functions unconditionally,
+ * with no #ifdef guards at the call site.  Providing no-op /
+ * error-returning stubs here keeps the rest of the code free of
+ * scattered conditionals and lets the compiler inline and
+ * dead-code-eliminate every stub in non-QNA builds at zero cost.
+ */
+static int fastrpc_qna_lookup(int fd, void **alloc, bool *is_discrete)
+{
+	*alloc = NULL;
+	*is_discrete = false;
+	return 0;
+}
+
+static inline void fastrpc_qna_discrete_alloc_put(void *alloc) {}
+
+static inline struct fastrpc_map *fastrpc_find_discrete_fd_map(
+	struct fastrpc_user *fl, void *alloc, int fd, bool map_ref)
+{ return NULL; }
+
+static inline void fastrpc_discrete_map_put(struct fastrpc_map *map) {}
+
+static inline int fastrpc_discrete_map_create(struct fastrpc_user *fl,
+	int fd, int flags, void *alloc, struct fastrpc_map **map)
+{ return -ENOSYS; }
+#endif
+
 static int fastrpc_req_mem_unmap_impl(struct fastrpc_user *fl, struct fastrpc_mem_unmap *req)
 {
 	struct fastrpc_invoke_args args[1] = { [0] = { 0 } };
@@ -8897,29 +9222,81 @@ static int fastrpc_req_mem_unmap_impl(struct fastrpc_user *fl, struct fastrpc_me
 	struct fastrpc_mem_unmap_req_msg req_msg = { 0 };
 	int err = -EINVAL;
 	struct device *dev = fl->sctx->smmucb[DEFAULT_SMMU_IDX].dev;
+#ifdef CONFIG_FASTRPC_QNA
+	struct qna_discrete_alloc *alloc = NULL;
+#else
+	void *alloc = NULL;
+#endif
+	bool is_discrete = false;
 
-	spin_lock(&fl->lock);
-	list_for_each_entry_safe(iter, m, &fl->maps, node) {
-		if ((req->fd < 0 || iter->fd == req->fd) && (iter->raddr == req->vaddr)) {
-			/*
-			 * Check if DSP mapping is complete, then move the state to
-			 * unmap in progress only if there is no other ongoing unmap.
-			 */
-			if (atomic_cmpxchg(&iter->state, FD_DSP_MAP_COMPLETE,
-				FD_DSP_UNMAP_IN_PROGRESS) != FD_DSP_MAP_COMPLETE)
-				err = -EALREADY;
-			else
-				map = iter;
-			break;
+	/*
+	 * Check if fd for unmap points to a discrete memory allocation.
+	 * fastrpc_qna_lookup() sets is_discrete=true only when QNA is
+	 * enabled and the fd resolves to a discrete allocation; otherwise
+	 * it is a no-op that returns 0.
+	 *
+	 * -EBADF/-ENOENT mean no discrete allocation was found for this fd
+	 * (e.g. fd < 0, or a genuine integrated fd) - not a real error, so
+	 * fall through silently treating this as a non-discrete (integrated)
+	 * unmap, so legacy callers passing fd < 0 still get looked up by
+	 * vaddr in fl->maps below. Any other failure is a real error and is
+	 * propagated to the caller.
+	 */
+	err = fastrpc_qna_lookup(req->fd, &alloc, &is_discrete);
+	if (err) {
+		if (err == -EBADF || err == -ENOENT) {
+			is_discrete = false;
+			alloc = NULL;
+			err = 0;
+		} else {
+			dev_err(dev, "Error %d: %s: fastrpc_qna_lookup failed for fd %d\n",
+				err, __func__, req->fd);
+			return err;
 		}
 	}
 
-	spin_unlock(&fl->lock);
+	if (is_discrete)
+		map = fastrpc_find_discrete_fd_map(fl, alloc, req->fd, true);
 
+	spin_lock(&fl->lock);
+	if (!is_discrete) {
+		list_for_each_entry_safe(iter, m, &fl->maps, node) {
+			if ((req->fd < 0 || iter->fd == req->fd) && (iter->raddr == req->vaddr)) {
+				map = iter;
+				break;
+			}
+		}
+	}
 	if (!map) {
-		dev_err(dev, "map not in list\n");
+		spin_unlock(&fl->lock);
+		if (is_discrete) {
+			err = -ENOENT;
+			dev_err(dev, "Error %d: %s: discrete memory unmap failed, no active mapping found for fd %d\n",
+				err, __func__, req->fd);
+			fastrpc_qna_discrete_alloc_put(alloc);
+		} else {
+			err = -EINVAL;
+			dev_err(dev, "Error %d: %s: map not found for fd %d\n",
+				err, __func__, req->fd);
+		}
 		return err;
 	}
+	/*
+	 * Check if DSP mapping is complete, then move the state to
+	 * unmap in progress only if there is no other ongoing unmap.
+	 */
+	if (atomic_cmpxchg(&map->state, FD_DSP_MAP_COMPLETE,
+		FD_DSP_UNMAP_IN_PROGRESS) != FD_DSP_MAP_COMPLETE) {
+		err = -EALREADY;
+		spin_unlock(&fl->lock);
+		if (is_discrete) {
+			/* Drop the lookup ref taken by fastrpc_find_discrete_fd_map. */
+			fastrpc_discrete_map_put(map);
+			fastrpc_qna_discrete_alloc_put(alloc);
+		}
+		return err;
+	}
+	spin_unlock(&fl->lock);
 
 	req_msg.pgid = fl->tgid_frpc;
 	req_msg.len = map->len;
@@ -8935,15 +9312,20 @@ static int fastrpc_req_mem_unmap_impl(struct fastrpc_user *fl, struct fastrpc_me
 
 	err = fastrpc_internal_invoke(fl, KERNEL_MSG_WITH_ZERO_PID, &ioctl);
 	if (err) {
-		dev_err(dev, "Unmap on DSP failed for fd:%d, addr:0x%09llx\n",  map->fd, map->raddr);
+		dev_err(dev, "Unmap on DSP failed for fd:%d, addr:0x%09llx\n", map->fd, map->raddr);
 		/* Revert the map state to map complete */
 		atomic_set(&map->state, FD_DSP_MAP_COMPLETE);
+		if (is_discrete) {
+			/* Drop the lookup ref taken by fastrpc_find_discrete_fd_map. */
+			fastrpc_discrete_map_put(map);
+			fastrpc_qna_discrete_alloc_put(alloc);
+		}
 		return err;
 	}
 	/* Set the map state to default on successful unmapping */
 	atomic_set(&map->state, FD_MAP_DEFAULT);
-	mutex_lock(&fl->map_mutex);
 
+	mutex_lock(&fl->map_mutex);
 	/*
 	 * If the mapping was created with IOVA retention on unmap, allow
 	 * clearing that flag so the unmap also releases the IOVA region.
@@ -8958,7 +9340,26 @@ static int fastrpc_req_mem_unmap_impl(struct fastrpc_user *fl, struct fastrpc_me
 	 * failure on multiple unmap requests of same FD.
 	 */
 	map->raddr = 0;
-	fastrpc_map_put(map);
+
+	/*
+	 * If the mapping was created for a discrete allocation, then
+	 * release the discrete allocation reference and remove the map
+	 * from the list.  Otherwise, just remove the map from the list.
+	 */
+	if (is_discrete) {
+		/*
+		 * Two refs to drop:
+		 *   1. The lookup ref taken by fastrpc_find_discrete_fd_map.
+		 *   2. The ownership ref (kref_init) representing the map's slot in
+		 *      fl->discrete_maps, this second put removes it from the list
+		 *      and frees the map once refcount reaches zero.
+		 */
+		fastrpc_discrete_map_put(map); /* lookup ref */
+		fastrpc_discrete_map_put(map); /* ownership ref */
+		fastrpc_qna_discrete_alloc_put(alloc);
+	} else {
+		fastrpc_map_put(map);
+	}
 	mutex_unlock(&fl->map_mutex);
 	return 0;
 }
@@ -8984,7 +9385,13 @@ static int fastrpc_req_mem_map(struct fastrpc_user *fl, char __user *argp)
 	struct fastrpc_mem_map req = {0};
 	struct device *dev = NULL;
 	struct fastrpc_map *map = NULL;
-	int err;
+#ifdef CONFIG_FASTRPC_QNA
+	struct qna_discrete_alloc *alloc = NULL;
+#else
+	void *alloc = NULL;
+#endif
+	bool is_discrete = false;
+	int err = 0;
 
 	if (atomic_read(&fl->state) != DSP_CREATE_COMPLETE) {
 		dev_err(fl->cctx->dev,
@@ -8994,6 +9401,7 @@ static int fastrpc_req_mem_map(struct fastrpc_user *fl, char __user *argp)
 	}
 	if (copy_from_user(&req, argp, sizeof(req)))
 		return -EFAULT;
+
 	/*
 	 * Prevent mapping backward compatible DMA handles here, as they are
 	 * already mapped in the remote call.
@@ -9001,14 +9409,39 @@ static int fastrpc_req_mem_map(struct fastrpc_user *fl, char __user *argp)
 	if (req.flags == FASTRPC_MAP_LEGACY_DMA_HANDLE)
 		return -EINVAL;
 	dev = fl->sctx->smmucb[DEFAULT_SMMU_IDX].dev;
-	/* create SMMU mapping */
+
+	/*
+	 * Check if fd to map points to a discrete memory allocation.
+	 * fastrpc_qna_lookup() sets is_discrete=true only when QNA is
+	 * enabled and the fd resolves to a discrete allocation; otherwise
+	 * it is a no-op that returns 0.
+	 */
+	err = fastrpc_qna_lookup(req.fd, &alloc, &is_discrete);
+	if (err)
+		return err;
+
 	mutex_lock(&fl->map_mutex);
-	err = fastrpc_map_create(fl, req.fd, req.vaddrin, NULL, req.length, req.attrs, req.flags, &map, true);
+	if (is_discrete) {
+		err = fastrpc_discrete_map_create(fl, req.fd, req.flags, alloc, &map);
+	} else {
+		/* create SMMU mapping */
+		err = fastrpc_map_create(fl, req.fd, req.vaddrin, NULL, req.length, req.attrs, req.flags, &map, true);
+	}
 	mutex_unlock(&fl->map_mutex);
 	if (err) {
-		dev_err(dev, "failed to map buffer, fd = %d\n", req.fd);
+		if (is_discrete) {
+#ifdef CONFIG_FASTRPC_QNA
+			dev_err(dev, "Error %d: %s: failed to create discrete memory map, fd %d, flags 0x%x, allocation size 0x%llx\n",
+				err, __func__, req.fd, req.flags, alloc->total_size);
+#endif
+			fastrpc_qna_discrete_alloc_put(alloc);
+		} else {
+			dev_err(dev, "Error %d: %s: failed to map buffer, fd %d\n",
+				err, __func__, req.fd);
+		}
 		return err;
 	}
+
 	/*
 	 * Update the map state to in progress only if there is no ongoing or
 	 * completed DSP mapping.
@@ -9016,11 +9449,16 @@ static int fastrpc_req_mem_map(struct fastrpc_user *fl, char __user *argp)
 	if (atomic_cmpxchg(&map->state, FD_MAP_DEFAULT, FD_DSP_MAP_IN_PROGRESS)
 		!= FD_MAP_DEFAULT) {
 		err = -EALREADY;
+		dev_err(dev, "Error %d: %s: map rejected for fd %d, map state is %d (expected %d)\n",
+			err, __func__, req.fd, atomic_read(&map->state), FD_MAP_DEFAULT);
 		goto err_invoke;
 	}
+
+	map->map_err = 0;
 	map->va = (void *) (uintptr_t) req.vaddrin;
+
 	/* map to dsp, get virtual adrress for the user*/
-	err = fastrpc_mem_map_to_dsp(fl, map->fd, req.offset,
+	err = fastrpc_mem_map_to_dsp(fl, map, map->fd, req.offset,
 					req.flags, req.vaddrin, map->phys,
 					map->size, (uintptr_t *)&req.vaddrout);
 	if (err) {
@@ -9031,7 +9469,10 @@ static int fastrpc_req_mem_map(struct fastrpc_user *fl, char __user *argp)
 	}
 
 	/* update the buffer to be able to deallocate the memory on the DSP */
+	mutex_lock(&fl->map_mutex);
 	map->raddr = req.vaddrout;
+	mutex_unlock(&fl->map_mutex);
+
 	/* Set the map state to complete on successful mapping */
 	atomic_set(&map->state, FD_DSP_MAP_COMPLETE);
 	if (copy_to_user((void __user *)argp, &req, sizeof(req)))
@@ -9046,7 +9487,19 @@ static int fastrpc_req_mem_map(struct fastrpc_user *fl, char __user *argp)
 	return 0;
 err_invoke:
 	mutex_lock(&fl->map_mutex);
-	fastrpc_map_put(map);
+	/* Cleanup if discrete fd map fails */
+	if (is_discrete) {
+		if (err != -EALREADY)
+			map->map_err = err;
+		fastrpc_discrete_map_put(map);
+		/*
+		 * On error, kref_release skips alloc cleanup (map_err set),
+		 * so the caller must free alloc here.
+		 */
+		fastrpc_qna_discrete_alloc_put(alloc);
+	} else {
+		fastrpc_map_put(map);
+	}
 	mutex_unlock(&fl->map_mutex);
 
 	return err;
@@ -9320,7 +9773,7 @@ static long fastrpc_dev_map_dma(struct fastrpc_device *dev,
 	}
 	/* Map DMA buffer on DSP*/
 
-	err = fastrpc_mem_map_to_dsp(fl, -1, 0, map->flags, 0, map->phys, map->size, &raddr);
+	err = fastrpc_mem_map_to_dsp(fl, map, -1, 0, map->flags, 0, map->phys, map->size, &raddr);
 	if (err) {
 		pr_err("%s : failed to map buffer on DSP ", __func__);
 		/* Revert the map state to map default */

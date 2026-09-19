@@ -17,6 +17,7 @@
 
 struct task_struct;
 struct fastrpc_user;
+struct fastrpc_domain;
 
 /*
  * Work lifecycle states, transitioned atomically via atomic_cmpxchg.
@@ -121,7 +122,8 @@ struct fastrpc_ioctl_remote_work;
 
 #if IS_ENABLED(CONFIG_QCOM_FASTRPC_TRUSTED)
 
-static inline int fastrpc_scheduler_init(struct fastrpc_scheduler *sched)
+static inline int fastrpc_scheduler_init(struct fastrpc_scheduler *sched,
+					 struct fastrpc_domain *domain)
 { return 0; }
 
 static inline void fastrpc_scheduler_abort_all(struct fastrpc_scheduler *sched)
@@ -157,7 +159,8 @@ static inline bool fastrpc_scheduler_handle_is_executing(struct fastrpc_schedule
 
 #else
 
-int fastrpc_scheduler_init(struct fastrpc_scheduler *sched);
+int fastrpc_scheduler_init(struct fastrpc_scheduler *sched,
+			   struct fastrpc_domain *domain);
 void fastrpc_scheduler_abort_all(struct fastrpc_scheduler *sched);
 void fastrpc_scheduler_deinit(struct fastrpc_scheduler *sched);
 void fastrpc_scheduler_notify_prio_update(struct fastrpc_scheduler *sched);

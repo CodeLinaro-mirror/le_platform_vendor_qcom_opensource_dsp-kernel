@@ -39,6 +39,7 @@
 #include <linux/ring_buffer.h>
 #endif
 #include <linux/version.h>
+#include <linux/pci.h>
 #define CREATE_TRACE_POINTS
 #include "fastrpc_trace.h"
 #include "fastrpc_timeline.h"
@@ -73,8 +74,8 @@ struct fastrpc_common {
 	 */
 	DECLARE_HASHTABLE(fastrpc_domains_table, DOMAINS_TABLE_SIZE);
 
-	/* Global counter for number of dsp's of each type that booted up */
-	int dsp_counter[FASTRPC_MAX_DSP_TYPE];
+	/* Global counter for number of dsp's of each type that booted up, per card */
+	int dsp_counter[MAX_FW_CARD_ID + 1][FASTRPC_MAX_DSP_TYPE];
 
 	/* global list of multidomain context ids */
 	struct idr mdctx_idr;
@@ -89,6 +90,12 @@ struct fastrpc_common {
 	 * only meaningful on debug builds.
 	 */
 	bool debug_mode_enable;
+
+	/* TGID of process currently offloading to each discrete card */
+	int discrete_owner_tgid[MAX_FW_CARD_ID + 1];
+
+	/* Active remote sessions of owner process on each discrete card */
+	u32 discrete_proc_count[MAX_FW_CARD_ID + 1];
 
 #ifdef CONFIG_DEBUG_FS
 	struct dentry *debugfs_root;
@@ -105,6 +112,67 @@ bool fastrpc_debug_mode_enabled(void)
 }
 
 static void fastrpc_user_release(struct kref *ref);
+
+/*
+ * fastrpc_claim_discrete_card() - Claim ownership of the discrete card.
+ * At any given time, only a single process may offload work to any domain
+ * on a given discrete card.
+ * @fl: fastrpc user creating a process on the discrete card.
+ *
+ * Returns 0 if the card is unclaimed or already owned by current process.
+ * Returns -EBUSY if a different application owns the card.
+ */
+static int fastrpc_claim_discrete_card(struct fastrpc_user *fl)
+{
+	int err = 0;
+	unsigned long flags = 0;
+	int owner_tgid = 0;
+	u32 card_id = fl->cctx->domain->card;
+
+	spin_lock_irqsave(&g_frpc.glock, flags);
+	if (g_frpc.discrete_proc_count[card_id] > 0 &&
+		g_frpc.discrete_owner_tgid[card_id] != fl->tgid_app) {
+		err = -EBUSY;
+		owner_tgid = g_frpc.discrete_owner_tgid[card_id];
+		goto bail;
+	}
+	g_frpc.discrete_owner_tgid[card_id] = fl->tgid_app;
+	g_frpc.discrete_proc_count[card_id]++;
+	fl->claimed_discrete = true;
+	fl->claimed_discrete_card_id = card_id;
+bail:
+	spin_unlock_irqrestore(&g_frpc.glock, flags);
+	if (err)
+		dev_err(fl->cctx->dev,
+			"Error %d: tgid %d rejected, discrete card %u currently owned by tgid %d",
+			err, fl->tgid_app, card_id, owner_tgid);
+	return err;
+}
+
+/*
+ * fastrpc_release_discrete_card() - Release this process's claim on the discrete card.
+ * @fl: fastrpc user whose process is being torn down.
+ *
+ * No-op if fl never claimed the card. Frees the card for other applications
+ * when the owner's last process is released.
+ */
+static void fastrpc_release_discrete_card(struct fastrpc_user *fl)
+{
+	unsigned long flags = 0;
+	u32 card_id = fl->claimed_discrete_card_id;
+
+	spin_lock_irqsave(&g_frpc.glock, flags);
+	if (fl->claimed_discrete) {
+		/*
+		 * When the last remote session of this process on discrete is
+		 * cleaned up, release ownership of discrete card.
+		 */
+		if (--g_frpc.discrete_proc_count[card_id] == 0)
+			g_frpc.discrete_owner_tgid[card_id] = 0;
+		fl->claimed_discrete = false;
+	}
+	spin_unlock_irqrestore(&g_frpc.glock, flags);
+}
 
 int fastrpc_file_get(struct fastrpc_user *fl)
 {
@@ -411,6 +479,232 @@ static void fastrpc_map_put(struct fastrpc_map *map)
 	if (map)
 		kref_put(&map->refcount, fastrpc_free_map);
 }
+
+#ifdef CONFIG_FASTRPC_QNA
+/*
+ * fastrpc_qna_discrete_alloc_put - Drop the dma_buf ref taken by
+ * QNA_MEM_LOOKUP (or QNA_MEM_ALLOC) for a discrete allocation.
+ */
+static void fastrpc_qna_discrete_alloc_put(struct qna_discrete_alloc *alloc)
+{
+	struct qna_mem_put_params fp = {0};
+	struct qna_mem_req_payload req = {0};
+
+	fp.alloc    = alloc;
+	req.req_id  = QNA_MEM_PUT;
+	req.params  = &fp;
+	req.size    = sizeof(fp);
+
+	qna_mem_request(&req);
+}
+
+/*
+ * fastrpc_qna_discrete_alloc_lookup - Look up a QNA discrete allocation by fd.
+ *
+ * Queries the QNA memory manager for a discrete allocation backing the
+ * given file descriptor. On success, *alloc is set to the allocation
+ * descriptor; on -ENOENT (fd is not a discrete allocation) *alloc is
+ * set to NULL and 0 is returned so the caller can fall through to the
+ * regular SMMU path.
+ *
+ * @fd:    file descriptor to look up
+ * @alloc: out-param set to the allocation descriptor, or NULL
+ *
+ * Returns 0 on success and if the fd is not a discrete allocation,
+ * negative errno on failure.
+ */
+static int fastrpc_qna_discrete_alloc_lookup(int fd,
+	struct qna_discrete_alloc **alloc)
+{
+	struct qna_mem_lookup_params lp = {0};
+	struct qna_mem_req_payload qreq = {0};
+	int err = 0;
+
+	lp.fd = fd;
+	qreq.req_id = QNA_MEM_LOOKUP;
+	qreq.params = &lp;
+	qreq.size   = sizeof(lp);
+
+	*alloc = NULL;
+	err = qna_mem_request(&qreq);
+	if (err == -ENOENT)
+		return 0;
+	if (err)
+		return err;
+	*alloc = lp.alloc;
+	return 0;
+}
+
+/*
+ * Find the fastrpc_map corresponding to discrete fd
+ * in the discrete_maps list.
+ *
+ * Args:
+ * @fl: pointer to fastrpc_user object
+ * @alloc: pointer to qna_discrete_alloc object
+ * @fd: file descriptor to find the discrete map entry
+ */
+static struct fastrpc_map *fastrpc_find_discrete_fd_map(
+	struct fastrpc_user *fl, struct qna_discrete_alloc *alloc, int fd,
+	bool map_ref)
+{
+	struct fastrpc_map *map = NULL;
+
+	if (!fl || !alloc)
+		return NULL;
+
+	/* Check for discrete fd map for the given fd */
+	spin_lock(&fl->lock);
+	list_for_each_entry(map, &fl->discrete_maps, node) {
+		if (map->fd == fd && map->buf == alloc->db) {
+			if (map_ref && !kref_get_unless_zero(&map->refcount))
+				break;
+			spin_unlock(&fl->lock);
+			return map;
+		}
+	}
+	spin_unlock(&fl->lock);
+	return NULL;
+}
+
+/*
+ * Create a new discrete fd map entry and add it to the
+ * discrete_maps list of the user session.
+ *
+ * Args:
+ * @fl: pointer to fastrpc_user object
+ * @fd: file descriptor to create map for
+ * @alloc: pointer to qna_discrete_alloc object
+ * @discrete_map: pointer to return created map entry
+ *
+ * Return: 0 on success, negative errno on failure
+ */
+static int fastrpc_discrete_map_create(struct fastrpc_user *fl, int fd, int flags,
+	struct qna_discrete_alloc *alloc, struct fastrpc_map **discrete_map)
+{
+	struct fastrpc_map *map = NULL, *existing = NULL;
+	struct device *dev = fl ? fl->cctx->dev : NULL;
+	int i = 0;
+
+	if (!fl || !alloc || !discrete_map)
+		return -EINVAL;
+
+	if (!alloc->blocks)
+		return -EINVAL;
+
+	if (!alloc->num_blocks)
+		return -EINVAL;
+
+	if (IS_EXTENDED_MAP_FLAG(flags)) {
+		for (i = 0; i < alloc->num_blocks; i++) {
+			if (alloc->blocks[i].size % FASTRPC_MEM_ALIGN_1M != 0 ||
+			    alloc->blocks[i].size < FASTRPC_MEM_ALIGN_1M) {
+				dev_err(dev, "Error %d: %s: extended flag set but block[%d] size %llu not 1MB aligned or smaller than 1MB\n",
+					-ENOTSUPP, __func__, i, alloc->blocks[i].size);
+				return -ENOTSUPP;
+			}
+		}
+	}
+
+	/* Allocate memory for the new discrete map entry */
+	map = kzalloc(sizeof(*map), GFP_KERNEL);
+	if (!map)
+		return -ENOMEM;
+
+	map->sg_pages = kmalloc_array(alloc->num_blocks,
+				      sizeof(*map->sg_pages), GFP_KERNEL);
+	if (!map->sg_pages) {
+		kfree(map);
+		return -ENOMEM;
+	}
+	map->num_sg_pages = (int)alloc->num_blocks;
+	for (i = 0; i < alloc->num_blocks; i++) {
+		map->sg_pages[i].addr = alloc->blocks[i].addr;
+		map->sg_pages[i].size = alloc->blocks[i].size;
+	}
+
+	INIT_LIST_HEAD(&map->node);
+	map->fl = fl;
+	map->fd = fd;
+	map->size = alloc->total_size;
+	map->len = alloc->total_size;
+	atomic_set(&map->state, FD_MAP_DEFAULT);
+	map->buf = alloc->db;
+	map->discrete_alloc = alloc;
+	kref_init(&map->refcount);
+
+	/*
+	 * Atomically check-and-add under fl->lock to prevent two threads
+	 * from creating duplicate entries for the same fd.
+	 */
+	spin_lock(&fl->lock);
+	list_for_each_entry(existing, &fl->discrete_maps, node) {
+		if (existing->fd == fd && existing->buf == alloc->db) {
+			if (kref_get_unless_zero(&existing->refcount)) {
+				spin_unlock(&fl->lock);
+				/* Map entry already exists, discard pre-allocated map. */
+				kfree(map->sg_pages);
+				kfree(map);
+				*discrete_map = existing;
+				return 0;
+			}
+			/* Entry found */
+			break;
+		}
+	}
+	list_add_tail(&map->node, &fl->discrete_maps);
+	spin_unlock(&fl->lock);
+
+	*discrete_map = map;
+	return 0;
+}
+
+/*
+ * Delete and free a specific discrete fd map entry
+ *
+ * Args:
+ * @fl: pointer to fastrpc_user object
+ * @tmap: the specific map entry to remove and free
+ */
+static void fastrpc_discrete_map_free(struct fastrpc_user *fl,
+	struct fastrpc_map *tmap)
+{
+	if (!fl || !tmap)
+		return;
+
+	spin_lock(&fl->lock);
+	list_del(&tmap->node);
+	spin_unlock(&fl->lock);
+	kfree(tmap->sg_pages);
+	kfree(tmap);
+}
+
+/**
+ * Helper function for releasing a discrete map structure.
+ */
+static void fastrpc_discrete_map_kref_release(struct kref *ref)
+{
+	struct fastrpc_map *map = NULL;
+	struct fastrpc_user *fl = NULL;
+
+	map = container_of(ref, struct fastrpc_map, refcount);
+	if (map) {
+		fl = map->fl;
+		if (!map->map_err && map->discrete_alloc)
+			fastrpc_qna_discrete_alloc_put(map->discrete_alloc);
+		fastrpc_discrete_map_free(fl, map);
+	}
+}
+
+/**
+ * Function to decrement discrete map's refcount.
+ */
+static void fastrpc_discrete_map_put(struct fastrpc_map *map)
+{
+	if (map)
+		kref_put(&map->refcount, fastrpc_discrete_map_kref_release);
+}
+#endif /* CONFIG_FASTRPC_QNA */
 
 static int fastrpc_map_get(struct fastrpc_map *map)
 {
@@ -1364,7 +1658,11 @@ static struct fastrpc_pool_ctx *fastrpc_session_alloc(
 	 * the process and it has been allocated already, then reuse that
 	 * session.
 	 */
-	if (fl->sctx && !secure && fl->sctx->pd_type == pd_type)
+	if (fl->sctx && !secure &&
+	    ((fl->sctx->pd_type == pd_type) ||
+	    (fl->sctx->pd_type == NS_CHANNEL_SHARED &&
+	    (pd_type == USER_UNSIGNEDPD_POOL || pd_type == USERPD ||
+	    pd_type == ROOT_PD))))
 		return fl->sctx;
 
 	spin_lock_irqsave(&cctx->lock, flags);
@@ -1388,14 +1686,23 @@ static struct fastrpc_pool_ctx *fastrpc_session_alloc(
 		 * 5. If pd_type is configured, then process pd_type needs to match with
 		 *    session pd_type, else pd_type check is ignored
 		 */
+		bool use_session = false;
 		isess = &cctx->session[i];
 
-		if ((isess->usecount == 0 || isess->smmucount > 1) &&
-			isess->smmucb[DEFAULT_SMMU_IDX].valid &&
-			isess->secure == secure &&
-			((isess->pd_type == EXT_MAP_PD_TYPE && isess->sharedcb) ||
-			(isess->sharedcb == sharedcb)) &&
-			(pd_type == DEFAULT_UNUSED || isess->pd_type == pd_type || secure)) {
+		if (isess->smmucb[DEFAULT_SMMU_IDX].valid && isess->secure == secure) {
+			if ((isess->usecount == 0 || isess->smmucount > 1) &&
+			    ((isess->pd_type == EXT_MAP_PD_TYPE && isess->sharedcb) ||
+			    (isess->sharedcb == sharedcb)) &&
+			    (pd_type == DEFAULT_UNUSED || isess->pd_type == pd_type ||
+			    secure))
+				use_session = true;
+			else if (isess->pd_type == NS_CHANNEL_SHARED &&
+			    (pd_type == USER_UNSIGNEDPD_POOL || pd_type == USERPD ||
+			     pd_type == ROOT_PD || pd_type == EXT_MAP_PD_TYPE))
+				use_session = true;
+		}
+
+		if (use_session) {
 			session = isess;
 			/*
 			 * Increment number of apps using session.
@@ -2585,19 +2892,19 @@ static void fastrpc_wait_for_completion(struct fastrpc_invoke_ctx *ctx,
 			preempt_disable();
 			jj = 0;
 			wait_resp = false;
-			fastrpc_timeline_record(48, fl->tgid_app, timeline);
+			fastrpc_timeline_record(48, ctx->pid, timeline);
 			for (; jj < wakeTime && jj < wTimeout; jj++) {
 				wait_resp = try_wait_for_completion(&ctx->work);
 				if (wait_resp)
 					break;
 				udelay(1);
 			}
-			fastrpc_timeline_record(49, fl->tgid_app, timeline);
+			fastrpc_timeline_record(49, ctx->pid, timeline);
 			preempt_enable();
 			if (!wait_resp) {
-				fastrpc_timeline_record(50, fl->tgid_app, timeline);
+				fastrpc_timeline_record(50, ctx->pid, timeline);
 				*ptr_interrupted = fastrpc_wait_for_response(ctx, kernel);
-				fastrpc_timeline_record(51, fl->tgid_app, timeline);
+				fastrpc_timeline_record(51, ctx->pid, timeline);
 				if (*ptr_interrupted || ctx->is_work_done)
 					return;
 			}
@@ -2605,23 +2912,23 @@ static void fastrpc_wait_for_completion(struct fastrpc_invoke_ctx *ctx,
 		/* busy poll on memory for actual job done */
 		case EARLY_RESPONSE:
 			trace_fastrpc_msg("early_response: poll_begin");
-			fastrpc_timeline_record(24, fl->tgid_app, timeline);
+			fastrpc_timeline_record(24, ctx->pid, timeline);
 			err = poll_for_remote_response(ctx, FASTRPC_POLL_TIME);
 			/* Mark job done if poll on memory successful */
 			/* Wait for completion if poll on memory timeout */
 			if (!err) {
 				ctx->is_work_done = true;
-				fastrpc_timeline_record(44, fl->tgid_app, timeline);
+				fastrpc_timeline_record(44, ctx->pid, timeline);
 				return;
 			}
-			fastrpc_timeline_record(25, fl->tgid_app, timeline);
+			fastrpc_timeline_record(25, ctx->pid, timeline);
 			trace_fastrpc_msg("early_response: poll_timeout");
 			if (!ctx->is_work_done) {
 				if (ctx->rsp_flags == COMPLETE_SIGNAL)
-					fastrpc_timeline_record(26, fl->tgid_app, timeline);
+					fastrpc_timeline_record(26, ctx->pid, timeline);
 				*ptr_interrupted = fastrpc_wait_for_response(ctx, kernel);
 				if (ctx->rsp_flags == COMPLETE_SIGNAL)
-					fastrpc_timeline_record(39, fl->tgid_app, timeline);
+					fastrpc_timeline_record(39, ctx->pid, timeline);
 				if (*ptr_interrupted || ctx->is_work_done)
 					return;
 			}
@@ -2629,21 +2936,21 @@ static void fastrpc_wait_for_completion(struct fastrpc_invoke_ctx *ctx,
 		case COMPLETE_SIGNAL:
 		case NORMAL_RESPONSE:
 			if (ctx->rsp_flags == NORMAL_RESPONSE)
-				fastrpc_timeline_record(9, fl->tgid_app, timeline);
+				fastrpc_timeline_record(9, ctx->pid, timeline);
 			if (ctx->rsp_flags == COMPLETE_SIGNAL)
-				fastrpc_timeline_record(53, fl->tgid_app, timeline);
+				fastrpc_timeline_record(53, ctx->pid, timeline);
 			*ptr_interrupted = fastrpc_wait_for_response(ctx, kernel);
-			fastrpc_timeline_record(23, fl->tgid_app, timeline);
+			fastrpc_timeline_record(23, ctx->pid, timeline);
 			if (*ptr_interrupted || ctx->is_work_done) {
-				fastrpc_timeline_record(37, fl->tgid_app, timeline);
+				fastrpc_timeline_record(37, ctx->pid, timeline);
 				return;
 			}
 			break;
 		case POLL_MODE:
 			trace_fastrpc_msg("poll_mode: begin");
-			fastrpc_timeline_record(55, fl->tgid_app, timeline);
+			fastrpc_timeline_record(55, ctx->pid, timeline);
 			err = poll_for_remote_response(ctx, ctx->fl->poll_timeout);
-			fastrpc_timeline_record(56, fl->tgid_app, timeline);
+			fastrpc_timeline_record(56, ctx->pid, timeline);
 
 			/* If polling timed out, move to normal response state */
 			if (err) {
@@ -2730,9 +3037,9 @@ static int fastrpc_internal_invoke(struct fastrpc_user *fl,  u32 kernel,
 	}
 
 	trace_fastrpc_msg("context_alloc: begin");
-	fastrpc_timeline_record(3, fl->tgid_app, fl->fastrpc_timeline_obj);
+	fastrpc_timeline_record(3, current->pid, fl->fastrpc_timeline_obj);
 	ctx = fastrpc_context_alloc(fl, kernel, sc, invoke);
-	fastrpc_timeline_record(4, fl->tgid_app, fl->fastrpc_timeline_obj);
+	fastrpc_timeline_record(4, current->pid, fl->fastrpc_timeline_obj);
 	trace_fastrpc_msg("context_alloc: end");
 	if (IS_ERR(ctx))
 		return PTR_ERR(ctx);
@@ -2740,12 +3047,12 @@ static int fastrpc_internal_invoke(struct fastrpc_user *fl,  u32 kernel,
 	if (fl->profile)
 		perf_counter = (u64 *)ctx->perf + PERF_COUNT;
 	PERF(fl->profile, GET_COUNTER(perf_counter, PERF_GETARGS),
-	fastrpc_timeline_record(5, fl->tgid_app, fl->fastrpc_timeline_obj);
+	fastrpc_timeline_record(5, ctx->pid, fl->fastrpc_timeline_obj);
 	err = fastrpc_get_args(kernel, ctx);
+	fastrpc_timeline_record(6, ctx->pid, fl->fastrpc_timeline_obj);
 	if (err)
 		goto bail;
 	PERF_END);
-	fastrpc_timeline_record(6, fl->tgid_app, fl->fastrpc_timeline_obj);
 	trace_fastrpc_msg("get_args: end");
 
 	/*
@@ -2769,12 +3076,12 @@ static int fastrpc_internal_invoke(struct fastrpc_user *fl,  u32 kernel,
 	dma_wmb();
 	/* Send invoke buffer to remote dsp */
 	PERF(fl->profile, GET_COUNTER(perf_counter, PERF_LINK),
-	fastrpc_timeline_record(7, fl->tgid_app, fl->fastrpc_timeline_obj);
+	fastrpc_timeline_record(7, ctx->pid, fl->fastrpc_timeline_obj);
 	err = fastrpc_invoke_send(fl->sctx, priority, ctx, kernel, handle);
+	fastrpc_timeline_record(8, ctx->pid, fl->fastrpc_timeline_obj);
 	if (err)
 		goto bail;
 	PERF_END);
-	fastrpc_timeline_record(8, fl->tgid_app, fl->fastrpc_timeline_obj);
 	trace_fastrpc_msg("invoke_send: end");
 wait:
 	if (fl->poll_mode &&
@@ -2800,10 +3107,11 @@ wait:
 
 	/* make sure that all memory writes by DSP are seen by CPU */
 	dma_rmb();
-	fastrpc_timeline_record(40, fl->tgid_app, fl->fastrpc_timeline_obj);
 	/* populate all the output buffers with results */
 	PERF(fl->profile, GET_COUNTER(perf_counter, PERF_PUTARGS),
+	fastrpc_timeline_record(40, ctx->pid, fl->fastrpc_timeline_obj);
 	err = fastrpc_put_args(ctx, kernel);
+	fastrpc_timeline_record(41, ctx->pid, fl->fastrpc_timeline_obj);
 	if (err)
 		goto bail;
 	PERF_END);
@@ -2812,7 +3120,6 @@ wait:
 	err = ctx->retval;
 	if (err)
 		goto bail;
-	fastrpc_timeline_record(41, fl->tgid_app, fl->fastrpc_timeline_obj);
 
 bail:
 	if (ctx && interrupted == -ERESTARTSYS) {
@@ -2844,7 +3151,9 @@ bail:
 	return err;
 }
 
-static int fastrpc_mem_map_to_dsp(struct fastrpc_user *fl, int fd, int offset,
+static int fastrpc_mem_map_to_dsp(struct fastrpc_user *fl,
+				struct fastrpc_map *map,
+				int fd, int offset,
 				u32 flags, u64 va, u64 phys,
 				size_t size, uintptr_t *raddr)
 {
@@ -2852,7 +3161,7 @@ static int fastrpc_mem_map_to_dsp(struct fastrpc_user *fl, int fd, int offset,
 	struct fastrpc_enhanced_invoke ioctl;
 	struct fastrpc_mem_map_req_msg req_msg = { 0 };
 	struct fastrpc_mmap_rsp_msg rsp_msg = { 0 };
-	struct fastrpc_phy_page pages = { 0 };
+	struct fastrpc_phy_page page = { 0 };
 	struct device *dev = fl->sctx->smmucb[DEFAULT_SMMU_IDX].dev;
 	int err = 0;
 
@@ -2866,20 +3175,27 @@ static int fastrpc_mem_map_to_dsp(struct fastrpc_user *fl, int fd, int offset,
 	req_msg.offset = offset;
 	req_msg.vaddrin = va;
 	req_msg.flags = flags;
-	req_msg.num = sizeof(pages);
 	req_msg.data_len = 0;
 
 	args[0].ptr = (u64) (uintptr_t) &req_msg;
 	args[0].length = sizeof(req_msg);
 
-	pages.addr = phys;
-	pages.size = size;
-
-	args[1].ptr = (u64) (uintptr_t) &pages;
-	args[1].length = sizeof(pages);
-
-	args[2].ptr = (u64) (uintptr_t) &pages;
-	args[2].length = 0;
+	/* Use sg_pages array if present (discrete multi-block), else single page */
+	if (map && map->sg_pages && map->num_sg_pages > 0) {
+		req_msg.num = map->num_sg_pages * sizeof(struct fastrpc_phy_page);
+		args[1].ptr = (u64)(uintptr_t)map->sg_pages;
+		args[1].length = map->num_sg_pages * sizeof(struct fastrpc_phy_page);
+		args[2].ptr = (u64)(uintptr_t)map->sg_pages;
+		args[2].length = 0;
+	} else {
+		page.addr = phys;
+		page.size = size;
+		req_msg.num = sizeof(page);
+		args[1].ptr = (u64) (uintptr_t) &page;
+		args[1].length = sizeof(page);
+		args[2].ptr = (u64) (uintptr_t) &page;
+		args[2].length = 0;
+	}
 
 	args[3].ptr = (u64) (uintptr_t) &rsp_msg;
 	args[3].length = sizeof(rsp_msg);
@@ -2921,7 +3237,7 @@ static int fastrpc_create_persistent_headers(struct fastrpc_user *fl)
 		return err;
 
 	virtb = (u64) (uintptr_t)(pers_hdr_buf->virt);
-	err = fastrpc_mem_map_to_dsp(fl, -1, 0,
+	err = fastrpc_mem_map_to_dsp(fl, NULL, -1, 0,
 				ADSP_MMAP_PERSIST_HDR, 0, (u64) (uintptr_t)(pers_hdr_buf->phys),
 				pers_hdr_buf->size, &pers_hdr_buf->raddr);
 	if (err)
@@ -3200,6 +3516,21 @@ static void print_buf_info(struct seq_file *s_file, struct fastrpc_buf *buf)
 	seq_printf(s_file,"\n %s %s %d", "in_use", ":", buf->in_use);
 }
 
+#ifdef CONFIG_FASTRPC_QNA
+/* Print a discrete (scatter-gather) QNA allocation in debugfs. */
+static void print_sg_alloc_info(struct seq_file *s_file,
+		struct qna_discrete_alloc *sg)
+{
+	u64 ii;
+
+	seq_printf(s_file,"\n %s %2s 0x%llx", "total_size", ":", sg->total_size);
+	seq_printf(s_file,"\n %s %2s %llu", "num_blocks", ":", sg->num_blocks);
+	for (ii = 0; ii < sg->num_blocks; ii++)
+		seq_printf(s_file,"\n   block[%llu] addr 0x%llx size 0x%llx",
+			ii, sg->blocks[ii].addr, sg->blocks[ii].size);
+}
+#endif
+
 static void print_ictx_info(struct seq_file *s_file, struct fastrpc_invoke_ctx *ictx)
 {
 	seq_printf(s_file,"\n %s %7s %d", "nscalars", ":", ictx->nscalars);
@@ -3280,6 +3611,25 @@ static void print_map_info(struct seq_file *s_file, struct fastrpc_map *map)
 	seq_printf(s_file,"%s %2s 0x%x\n", "attr", ":", map->attr);
 	seq_printf(s_file,"%s %2s 0x%x\n", "flags", ":", map->flags);
 }
+
+#ifdef CONFIG_FASTRPC_QNA
+static void print_discrete_map_info(struct seq_file *s_file, struct fastrpc_map *map)
+{
+	int i;
+
+	seq_printf(s_file, "%s %4s %d\n",     "fd",          ":", map->fd);
+	seq_printf(s_file, "%s %2s 0x%llx\n", "size",        ":", map->size);
+	seq_printf(s_file, "%s %3s 0x%llx\n", "len",         ":", map->len);
+	seq_printf(s_file, "%s %2s 0x%llx\n", "raddr",       ":", map->raddr);
+	seq_printf(s_file, "%s %4s %d\n",     "state",       ":", atomic_read(&map->state));
+	seq_printf(s_file, "%s %2s %d\n",     "map_err",     ":", map->map_err);
+	seq_printf(s_file, "%s %2s %d\n",     "refcount",    ":", kref_read(&map->refcount));
+	seq_printf(s_file, "%s %2s %d\n",     "num_sg_pages",":", map->num_sg_pages);
+	for (i = 0; i < map->num_sg_pages; i++)
+		seq_printf(s_file, "  sg_pages[%d] addr 0x%llx size 0x%llx\n",
+			i, map->sg_pages[i].addr, map->sg_pages[i].size);
+}
+#endif
 
 static void print_session_info(struct seq_file *s_file, struct fastrpc_user *fl)
 {
@@ -3417,6 +3767,12 @@ static int fastrpc_debugfs_show(struct seq_file *s_file, void *data)
 			buf = fl->init_mem;
 			print_buf_info(s_file, buf);
 		}
+#ifdef CONFIG_FASTRPC_QNA
+		if (fl->init_mem_sg) {
+			seq_printf(s_file,"\n=============== Init Mem (discrete SG) ===============\n");
+			print_sg_alloc_info(s_file, fl->init_mem_sg);
+		}
+#endif
 		if (fl->pers_hdr_buf) {
 			seq_printf(s_file,"\n=============== Persistent Header Buf ===============\n");
 			buf = fl->pers_hdr_buf;
@@ -3448,6 +3804,13 @@ static int fastrpc_debugfs_show(struct seq_file *s_file, void *data)
 			if (map)
 				print_map_info(s_file, map);
 		}
+#ifdef CONFIG_FASTRPC_QNA
+		seq_printf(s_file,"\n=============== Discrete maps ===============\n");
+		list_for_each_entry(map, &fl->discrete_maps, node) {
+			if (map)
+				print_discrete_map_info(s_file, map);
+		}
+#endif
 		seq_printf(s_file,"\n=============== Kernel maps ===============\n");
 		list_for_each_entry(buf, &fl->mmaps, node) {
 			if (buf)
@@ -3518,6 +3881,288 @@ return 0;
 }
 #endif
 
+/* Returns true for discrete DSPs. */
+static bool fastrpc_is_discrete_dsp(struct fastrpc_user *fl)
+{
+	return fl && fl->cctx && fl->cctx->domain &&
+		fl->cctx->domain->card != SOC_CARD_ID;
+}
+
+#ifdef CONFIG_FASTRPC_QNA
+/*
+ * fastrpc_discrete_free_sg - release a QNA SG allocation.
+ *
+ * @sg: pointer to the caller's SG handle; cleared to NULL on return.
+ *
+ * Issues a QNA_MEM_PUT to the QNA memory manager for the allocation
+ * previously obtained via fastrpc_qna_alloc().
+ */
+static void fastrpc_discrete_free_sg(struct qna_discrete_alloc **sg)
+{
+	struct qna_mem_put_params put_params;
+	struct qna_mem_req_payload req;
+
+	if (!sg || !*sg)
+		return;
+
+	put_params = (struct qna_mem_put_params){ .alloc = *sg };
+	req = (struct qna_mem_req_payload){
+		.req_id = QNA_MEM_PUT,
+		.params = &put_params,
+		.size   = sizeof(put_params),
+	};
+	qna_mem_request(&req);
+	*sg = NULL;
+}
+
+/*
+ * fastrpc_qna_alloc - allocate a QNA SG buffer for a channel.
+ *
+ * @cctx:  channel context requesting the allocation
+ * @size:  size in bytes to allocate
+ * @label: short tag used in error logs to identify the caller
+ * @sg:    out-param; on success receives the SG allocation handle
+ *
+ * Issues a QNA_MEM_ALLOC to the QNA memory manager on the channel's
+ * domain. Fails if the resulting allocation is too scattered to fit
+ * within FASTRPC_MAX_SG_PAGES_PER_BUF blocks.
+ *
+ * Returns 0 on success, negative errno on failure.
+ */
+static int fastrpc_qna_alloc(struct fastrpc_channel_ctx *cctx,
+	u64 size, const char *label, u64 flags, struct qna_discrete_alloc **sg)
+{
+	struct qna_discrete_alloc *alloc;
+	unsigned int domain_id = (unsigned int)cctx->domain->instance_id;
+	int err;
+	struct qna_mem_alloc_params alloc_params = {
+		.size        = size,
+		.flags       = flags,
+		.type        = FASTRPC_DISCRETE_GLOBAL_MEM,
+		.domains     = &domain_id,
+		.num_domains = 1,
+		.card_no     = cctx->domain->card,
+	};
+	struct qna_mem_req_payload req = {
+		.req_id = QNA_MEM_ALLOC,
+		.params = &alloc_params,
+		.size   = sizeof(alloc_params),
+	};
+
+	err = qna_mem_request(&req);
+	if (err) {
+		dev_err(cctx->dev, "Error %d: %s: QNA alloc failed for %s size %llu\n",
+			err, __func__, label, size);
+		return err;
+	}
+	alloc = alloc_params.alloc;
+	if (!alloc || !alloc->blocks || !alloc->num_blocks) {
+		dev_err(cctx->dev, "Error: %s: invalid QNA alloc for %s size %llu\n",
+			__func__, label, size);
+		if (alloc)
+			fastrpc_discrete_free_sg(&alloc);
+		return -EINVAL;
+	}
+
+	if (alloc->num_blocks > FASTRPC_MAX_SG_PAGES_PER_BUF) {
+		dev_err(cctx->dev, "Error: %s: %s SG has %llu blocks, exceeds cap %u\n",
+			__func__, label, alloc->num_blocks, FASTRPC_MAX_SG_PAGES_PER_BUF);
+		fastrpc_discrete_free_sg(&alloc);
+		return -E2BIG;
+	}
+	*sg = alloc;
+	return 0;
+}
+
+/*
+ * fastrpc_discrete_alloc_rootheap - allocate a rootheap with SG donation.
+ *
+ * @fl:   fastrpc user object for the spawn
+ * @size: size in bytes to allocate
+ *
+ * Adds the donation to cctx->discrete_rootheap_bufs and publishes
+ * it on fl->rootheap_sg as a borrow pointer for this spawn.
+ *
+ * Returns 0 on success, negative errno on failure.
+ */
+static int fastrpc_discrete_alloc_rootheap(struct fastrpc_user *fl, u64 size)
+{
+	struct fastrpc_channel_ctx *cctx = fl->cctx;
+	struct fastrpc_rootheap_sg_node *node = NULL;
+	unsigned long flags;
+	int err;
+
+	node = kzalloc(sizeof(*node), GFP_KERNEL);
+	if (!node)
+		return -ENOMEM;
+
+	INIT_LIST_HEAD(&node->node);
+	err = fastrpc_qna_alloc(cctx, size, "rootheap",
+		QNA_MEM_FLAG_CHANNEL_SCOPED, &node->alloc);
+	if (err) {
+		kfree(node);
+		return err;
+	}
+
+	/* Track the donation on the channel and publish it for this spawn. */
+	spin_lock_irqsave(&cctx->lock, flags);
+	list_add_tail(&node->node, &cctx->discrete_rootheap_bufs.list);
+	cctx->discrete_rootheap_bufs.num++;
+	spin_unlock_irqrestore(&cctx->lock, flags);
+
+	fl->rootheap_sg = node->alloc;
+	return 0;
+}
+
+/*
+ * fastrpc_discrete_drop_rootheap - remove and free every rootheap SG node from
+ * the dedicated discrete SG list (cctx->discrete_rootheap_bufs).
+ *
+ * @cctx: channel context owning the rootheap SG list
+ *
+ * Called on channel teardown to release all channel-scoped rootheap donations.
+ */
+static void fastrpc_discrete_drop_rootheap(struct fastrpc_channel_ctx *cctx)
+{
+	struct fastrpc_rootheap_sg_node *n, *found;
+	unsigned long flags;
+
+	if (!cctx)
+		return;
+
+	do {
+		found = NULL;
+		spin_lock_irqsave(&cctx->lock, flags);
+		list_for_each_entry(n, &cctx->discrete_rootheap_bufs.list, node) {
+			list_del(&n->node);
+			cctx->discrete_rootheap_bufs.num--;
+			found = n;
+			break;
+		}
+		spin_unlock_irqrestore(&cctx->lock, flags);
+
+		if (found) {
+			fastrpc_discrete_free_sg(&found->alloc);
+			kfree(found);
+		}
+	} while (found);
+}
+
+/*
+ * fastrpc_build_init_create_sgl - flatten per-role SG buffers for spawn.
+ *
+ * @fl:              fastrpc user object being spawned
+ * @pages:           per-role page table
+ * @pageslen:        number of role slots in @pages
+ * @flat_pages:      out-array; receives the concatenated SG page list
+ * @flat_pages_cap:  capacity of @flat_pages (entries)
+ * @flat_pages_len:  out-param; total number of entries written to @flat_pages
+ * @buffer_types:    out-array; role index for each contributing buffer
+ * @pages_per_buf:   out-array; page count contributed by each buffer
+ * @buffers_cap:     capacity of @buffer_types and @pages_per_buf
+ * @num_buffers:     out-param; number of buffers described in the output arrays
+ *
+ * Walks the per-role SG allocations (init_mem, rootheap, dbglogbuf, ...) and
+ * flattens them into the parallel @flat_pages / @buffer_types / @pages_per_buf
+ * arrays consumed by RMID_INIT_CREATE_ATTR_SGL.
+ *
+ * Returns 0 on success, negative errno on failure.
+ */
+static int fastrpc_build_init_create_sgl(struct fastrpc_user *fl,
+	struct fastrpc_phy_page *pages, u32 pageslen,
+	struct fastrpc_phy_page *flat_pages, u32 flat_pages_cap, u32 *flat_pages_len,
+	u32 *buffer_types, u32 *pages_per_buf, u32 buffers_cap, u32 *num_buffers)
+{
+	struct qna_discrete_alloc *init_mem_sg = NULL, *sg = NULL;
+	u32 buffer_count = 0, total_pages = 0, ii = 0, jj = 0;
+
+	if (!fl || !flat_pages || !flat_pages_len || !buffer_types ||
+		!pages_per_buf || !num_buffers)
+		return -EINVAL;
+
+	/* init_mem is always the first buffer  (NUM_PAGES_WITH_INIT_MEM_BUF-1). */
+	init_mem_sg = fl->init_mem_sg;
+	if (!init_mem_sg || !init_mem_sg->blocks || !init_mem_sg->num_blocks)
+		return -EINVAL;
+
+	if (total_pages + init_mem_sg->num_blocks > flat_pages_cap)
+		return -E2BIG;
+
+	/* Append init_mem SG blocks and record its role/page-count. */
+	buffer_types[buffer_count] = NUM_PAGES_WITH_INIT_MEM_BUF - 1;
+	pages_per_buf[buffer_count] = init_mem_sg->num_blocks;
+	buffer_count++;
+	for (ii = 0; ii < init_mem_sg->num_blocks; ++ii) {
+		flat_pages[total_pages].addr = init_mem_sg->blocks[ii].addr;
+		flat_pages[total_pages].size = init_mem_sg->blocks[ii].size;
+		total_pages++;
+	}
+
+	/* Walk remaining role slots; skip init_mem slot (already handled above). */
+	for (ii = 0; ii < pageslen; ++ii) {
+		if (ii == NUM_PAGES_WITH_INIT_MEM_BUF - 1)
+			continue;
+
+		/* Skip empty slots unless they are SG-backed (rootheap or dbglogbuf). */
+		if ((!pages[ii].addr || !pages[ii].size) &&
+			!(ii == NUM_PAGES_WITH_ROOTHEAP_BUF - 1 && fl->rootheap_sg) &&
+			!(ii == NUM_PAGES_WITH_MAP_DEBUG_BUF - 1 && fl->dbglogbuf_sg))
+			continue;
+
+		if ((ii == NUM_PAGES_WITH_ROOTHEAP_BUF - 1 && fl->rootheap_sg) ||
+			(ii == NUM_PAGES_WITH_MAP_DEBUG_BUF - 1 && fl->dbglogbuf_sg)) {
+			/* Multi-block SG buffer: flatten all its blocks. */
+			sg = (ii == NUM_PAGES_WITH_ROOTHEAP_BUF - 1) ? fl->rootheap_sg :
+				fl->dbglogbuf_sg;
+			if (buffer_count >= buffers_cap ||
+				total_pages + sg->num_blocks > flat_pages_cap)
+				return -E2BIG;
+			buffer_types[buffer_count] = ii;
+			pages_per_buf[buffer_count] = sg->num_blocks;
+			for (jj = 0; jj < sg->num_blocks; jj++) {
+				flat_pages[total_pages].addr = sg->blocks[jj].addr;
+				flat_pages[total_pages].size = sg->blocks[jj].size;
+				total_pages++;
+			}
+		} else {
+			/* Single contiguous page: copy it directly. */
+			if (buffer_count >= buffers_cap ||
+				total_pages + 1 > flat_pages_cap)
+				return -E2BIG;
+			buffer_types[buffer_count] = ii;
+			pages_per_buf[buffer_count] = 1;
+			flat_pages[total_pages] = pages[ii];
+			total_pages++;
+		}
+		buffer_count++;
+	}
+
+	*flat_pages_len = total_pages;
+	*num_buffers = buffer_count;
+	return 0;
+}
+#else /* !CONFIG_FASTRPC_QNA */
+/* Integrated targets: no QNA memory manager. */
+static void fastrpc_discrete_free_sg (struct qna_discrete_alloc **sg) {}
+static void fastrpc_discrete_drop_rootheap(struct fastrpc_channel_ctx *cctx) {}
+static inline int fastrpc_qna_alloc (struct fastrpc_channel_ctx *cctx,
+	u64 size, const char *label, u64 flags, struct qna_discrete_alloc **sg)
+{
+	return -ENODEV;
+}
+static inline int fastrpc_discrete_alloc_rootheap(struct fastrpc_user *fl, u64 size)
+{
+	return -ENODEV;
+}
+static inline int fastrpc_build_init_create_sgl(struct fastrpc_user *fl,
+	struct fastrpc_phy_page *pages, u32 pageslen,
+	struct fastrpc_phy_page *flat_pages, u32 flat_pages_cap, u32 *flat_pages_len,
+	u32 *buffer_types, u32 *pages_per_buf, u32 buffers_cap, u32 *num_buffers)
+{
+	return -ENODEV;
+}
+#endif /* CONFIG_FASTRPC_QNA */
+
 static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 					      char __user *argp)
 {
@@ -3542,6 +4187,11 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 
 	if (!fl->is_secure_dev) {
 		dev_err(fl->cctx->dev, "untrusted app trying to attach to privileged DSP PD\n");
+		return -EACCES;
+	}
+
+	if (FASTRPC_DOMAIN_IS_DISCRETE(fl->cctx->domain)) {
+		dev_err(fl->cctx->dev, "static process creation not supported on discrete DSP\n");
 		return -EACCES;
 	}
 
@@ -3721,7 +4371,8 @@ static int fastrpc_get_root_session(struct fastrpc_channel_ctx *cctx,
 	spin_lock_irqsave(&cctx->lock, flags);
 	for (i = 0; i < cctx->sesscount; i++) {
 		s = &cctx->session[i];
-		if (s->pd_type == ROOT_PD && s->smmucb[DEFAULT_SMMU_IDX].valid) {
+		if ((s->pd_type == ROOT_PD || s->pd_type == NS_CHANNEL_SHARED) &&
+		    s->smmucb[DEFAULT_SMMU_IDX].valid) {
 			*sess = s;
 			err = 0;
 			break;
@@ -3849,15 +4500,16 @@ bail:
 
 /*
  * Allocate buffer for growing rootheap on DSP
- * @arg1: channel context.
+ * @arg1: fastrpc user object.
  * @arg2: page array to be sent with process spawn msg
  * @arg3: number of pages
  *
  * Returns 0 on success
  */
-static int fastrpc_alloc_rootheap_buf(struct fastrpc_channel_ctx *cctx,
+static int fastrpc_alloc_rootheap_buf(struct fastrpc_user *fl,
 	struct fastrpc_phy_page *pages, u32 *pageslen)
 {
+	struct fastrpc_channel_ctx *cctx = fl->cctx;
 	struct fastrpc_buf *buf = NULL;
 	int err = 0;
 	unsigned long flags = 0;
@@ -3867,30 +4519,41 @@ static int fastrpc_alloc_rootheap_buf(struct fastrpc_channel_ctx *cctx,
 	const unsigned int NUM_ROOTHEAP_BUFS =
 		(cctx->rootheap_buf_count != 0) ? cctx->rootheap_buf_count :
 		FASTRPC_DEFAULT_ROOTHEAP_BUF_COUNT;
+	bool is_discrete = fastrpc_is_discrete_dsp(fl);
+	unsigned int donated_rootheap_bufs =
+		is_discrete ? cctx->discrete_rootheap_bufs.num : cctx->rootheap_bufs.num;
 
 	/* Allocate buffer only if DSP supports growing of rootheap */
 	if (!cctx->dsp_attributes[ROOTPD_RPC_HEAP_SUPPORT] ||
-		cctx->rootheap_bufs.num >= NUM_ROOTHEAP_BUFS ||
+		donated_rootheap_bufs >= NUM_ROOTHEAP_BUFS ||
 		g_frpc.is_trusted_vm)
 		return err;
 
-	/* Allocate buffer from context bank / session reserved for rootPD */
-	err = fastrpc_alloc_root_session_buf(cctx, &buf,
-						ROOTHEAP_BUF_SIZE,
-						ROOTHEAP_BUF);
-	if (err)
-		goto bail;
+	if (is_discrete) {
+		err = fastrpc_discrete_alloc_rootheap(fl, ROOTHEAP_BUF_SIZE);
+		if (err)
+			goto bail;
+		*pageslen = NUM_PAGES_WITH_ROOTHEAP_BUF;
+	} else {
+		/* Allocate buffer from context bank / session reserved for rootPD */
+		err = fastrpc_alloc_root_session_buf(cctx, &buf,
+							ROOTHEAP_BUF_SIZE,
+							ROOTHEAP_BUF);
+		if (err)
+			goto bail;
 
-	/* Update paramaters of process-spawn with buffer info */
-	*pageslen = NUM_PAGES_WITH_ROOTHEAP_BUF;
-	pages[NUM_PAGES_WITH_ROOTHEAP_BUF - 1].addr = buf->phys;
-	pages[NUM_PAGES_WITH_ROOTHEAP_BUF - 1].size = buf->size;
+		/* Update paramaters of process-spawn with buffer info */
+		*pageslen = NUM_PAGES_WITH_ROOTHEAP_BUF;
+		pages[NUM_PAGES_WITH_ROOTHEAP_BUF - 1].addr = buf->phys;
+		pages[NUM_PAGES_WITH_ROOTHEAP_BUF - 1].size = buf->size;
 
-	/* Add buf to channel's rootheap buf-list and increment count */
-	spin_lock_irqsave(&cctx->lock, flags);
-	list_add_tail(&buf->node, &cctx->rootheap_bufs.list);
-	cctx->rootheap_bufs.num++;
-	spin_unlock_irqrestore(&cctx->lock, flags);
+		/* Add buf to channel's rootheap buf-list and increment count */
+		spin_lock_irqsave(&cctx->lock, flags);
+		list_add_tail(&buf->node, &cctx->rootheap_bufs.list);
+		cctx->rootheap_bufs.num++;
+		spin_unlock_irqrestore(&cctx->lock, flags);
+
+	}
 bail:
 	return err;
 }
@@ -4233,10 +4896,21 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	struct fastrpc_invoke_args args[FASTRPC_CREATE_PROCESS_NARGS] = {0};
 	struct fastrpc_enhanced_invoke ioctl;
 	struct fastrpc_phy_page pages[NUM_PAGES_WITH_PERF_TIMLINE_DSP_K_SHAREDBUF] = {0};
+	struct fastrpc_phy_page flat_pages[(NUM_PAGES_WITH_PERF_TIMLINE_DSP_K_SHAREDBUF - 3) +
+		3 * FASTRPC_MAX_SG_PAGES_PER_BUF] = {0};
 	struct fastrpc_map *configmap = NULL;
 	struct fastrpc_buf *imem = NULL;
 	struct fastrpc_pool_ctx *sctx = NULL;
 	struct fastrpc_timeline *timeline = NULL;
+	struct fastrpc_process_create_args inbuf = {0};
+	struct fastrpc_process_create_sgl_args inbuf_sgl = {0};
+	u32 buffer_types[NUM_PAGES_WITH_PERF_TIMLINE_DSP_K_SHAREDBUF] = {0};
+	u32 pages_per_buf[NUM_PAGES_WITH_PERF_TIMLINE_DSP_K_SHAREDBUF] = {0};
+	u32 flat_pages_len = 0;
+	u32 num_buffers = 0;
+	u32 pageslen = 1;
+
+	bool discrete_spawn = false;
 	int memlen;
 	int err = 0, timeline_err = 0;
 	int user_fd = fl->config.user_fd, user_size = fl->config.user_size;
@@ -4249,15 +4923,6 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	 */
 	u32 pd = 0, compute = 0, tg = 0, mem_thread = 0, threads = 0;
 	u64 compute_size = 0, thread_size = 0, proc_res_size = 0;
-
-	struct {
-		int pgid;
-		u32 namelen;
-		u32 filelen;
-		u32 pageslen;
-		u32 attrs;
-		u32 siglen;
-	} inbuf;
 
 	if (copy_from_user(&init, argp, sizeof(init)))
 		return -EFAULT;
@@ -4293,6 +4958,23 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 		} else {
 			snprintf(fl->name, sizeof(fl->name), "%s-%d", current->comm, fl->tgid_app);
 		}
+	}
+	/*
+	 * Untrusted (HAL-proxied) processes are rejected on discrete domain.
+	 * Only one application may own the card at a time.
+	 */
+	if (FASTRPC_DOMAIN_IS_DISCRETE(fl->cctx->domain)) {
+		if (fl->untrusted_process) {
+			err = -EACCES;
+			dev_err(fl->cctx->dev,
+				"Error %d: untrusted process cannot offload to discrete DSP (card %u, domain %u, %s)",
+				err, fl->cctx->domain->card, fl->cctx->domain->id, fl->cctx->domain->name);
+			goto err_out;
+		}
+
+		err = fastrpc_claim_discrete_card(fl);
+		if (err)
+			goto err_out;
 	}
 
 	/* Get the uid of the current process */
@@ -4335,13 +5017,6 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	/* In case of privileged process update attributes */
 	fastrpc_check_privileged_process(fl, &init);
 
-	inbuf.pgid = fl->tgid_frpc;
-	inbuf.namelen = strlen(fl->name) + 1;
-	inbuf.filelen = init.filelen;
-	inbuf.pageslen = 1;
-	inbuf.attrs = init.attrs;
-	inbuf.siglen = init.siglen;
-
 	/*
 	 * Default value at fastrpc_device_open is set as DEFAULT_UNUSED.
 	 * If pd_type is not configured by the process in fastrpc_set_session_info,
@@ -4359,41 +5034,59 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 		mutex_unlock(&fl->map_mutex);
 		if (err)
 			goto err_out;
-		inbuf.pageslen = NUM_PAGES_WITH_SHARED_BUF;
+		pageslen = NUM_PAGES_WITH_SHARED_BUF;
 		pages[NUM_PAGES_WITH_SHARED_BUF - 1].addr = configmap->phys;
 		pages[NUM_PAGES_WITH_SHARED_BUF - 1].size = configmap->size;
 	}
 
 	/* Process spawn should not fail if unable to alloc rootheap buffer */
-	fastrpc_alloc_rootheap_buf(fl->cctx, pages, &inbuf.pageslen);
+	fastrpc_alloc_rootheap_buf(fl, pages, &pageslen);
 
 	/* Process spawn should not fail if unable to pack root buffer */
-	fastrpc_pack_root_sharedpage(fl, pages, &inbuf.pageslen);
+	fastrpc_pack_root_sharedpage(fl, pages, &pageslen);
 
 	memlen = INIT_MEMLEN_MAX;
 
-	err = fastrpc_smmu_buf_alloc(fl, memlen, INITMEM_BUF, &imem);
+	discrete_spawn = fastrpc_is_discrete_dsp(fl);
+
+	if (discrete_spawn)
+		err = fastrpc_qna_alloc(fl->cctx, memlen, "init_mem", 0,
+			&fl->init_mem_sg);
+	else
+		err = fastrpc_smmu_buf_alloc(fl, memlen, INITMEM_BUF, &imem);
 	if (err)
-		goto err_alloc;
+		goto err_cleanup;
+	if (imem) {
+		fl->init_mem = imem;
+		pages[0].addr = fl->init_mem->phys;
+		pages[0].size = fl->init_mem->size;
+	}
 
 	/*
 	 * If dbglogbuf is supported on DSP, allocate 1MB buffer and send it to DSP
 	 * Process spawn should not fail if unable to alloc debug log buffer
 	 */
 	if (dsp_attributes[DBGLOGBUF_SUPPORT]) {
-		err = fastrpc_smmu_buf_alloc(fl, DBGLOGBUF_SIZE,
-				MAP_DEBUG_BUF, &fl->dbglogbuf);
-		if (err) {
-			if (fl->dbglogbuf) {
-				fastrpc_buf_free(fl->dbglogbuf, false);
-				fl->dbglogbuf = NULL;
-			}
-			dev_err(fl->cctx->dev, "Error %d: %s: Failed to allocate dbglogbuf buffer size %d\n",
-				err, __func__, DBGLOGBUF_SIZE);
+		if (discrete_spawn) {
+			err = fastrpc_qna_alloc(fl->cctx, DBGLOGBUF_SIZE, "dbglogbuf", 0,
+				&fl->dbglogbuf_sg);
+			if (!err)
+				pageslen = NUM_PAGES_WITH_MAP_DEBUG_BUF;
 		} else {
-			pages[NUM_PAGES_WITH_MAP_DEBUG_BUF-1].addr = fl->dbglogbuf->phys;
-			pages[NUM_PAGES_WITH_MAP_DEBUG_BUF-1].size = fl->dbglogbuf->size;
-			inbuf.pageslen = NUM_PAGES_WITH_MAP_DEBUG_BUF;
+			err = fastrpc_smmu_buf_alloc(fl, DBGLOGBUF_SIZE,
+					MAP_DEBUG_BUF, &fl->dbglogbuf);
+			if (err) {
+				if (fl->dbglogbuf) {
+					fastrpc_buf_free(fl->dbglogbuf, false);
+					fl->dbglogbuf = NULL;
+				}
+				dev_err(fl->cctx->dev, "Error %d: %s: Failed to allocate dbglogbuf buffer size %d\n",
+					err, __func__, DBGLOGBUF_SIZE);
+			} else {
+				pages[NUM_PAGES_WITH_MAP_DEBUG_BUF-1].addr = fl->dbglogbuf->phys;
+				pages[NUM_PAGES_WITH_MAP_DEBUG_BUF-1].size = fl->dbglogbuf->size;
+				pageslen = NUM_PAGES_WITH_MAP_DEBUG_BUF;
+			}
 		}
 	}
 
@@ -4426,7 +5119,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 				"Error: %s: Overflow in compute_size: compute=%u tg=%u\n",
 				__func__, compute, tg);
 			err = -EINVAL;
-			goto err_alloc;
+			goto err_cleanup;
 		}
 		compute_size = (u64)compute * (u64)tg;
 
@@ -4435,7 +5128,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 				"Error: %s: Overflow in thread_size: mem_thread=%u threads=%u\n",
 				__func__, mem_thread, threads);
 			err = -EINVAL;
-			goto err_alloc;
+			goto err_cleanup;
 		}
 		thread_size = (u64)mem_thread * (u64)threads;
 
@@ -4444,7 +5137,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 				"Error: %s: Overflow in pd + compute_size: pd=%u compute_size=%llu\n",
 				__func__, pd, compute_size);
 			err = -EINVAL;
-			goto err_alloc;
+			goto err_cleanup;
 		}
 		proc_res_size = (u64)pd + compute_size;
 
@@ -4453,7 +5146,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 				"Error: %s: Overflow in proc_res_size + thread_size: proc_res_size=%llu thread_size=%llu\n",
 				__func__, proc_res_size, thread_size);
 			err = -EINVAL;
-			goto err_alloc;
+			goto err_cleanup;
 		}
 		proc_res_size += thread_size;
 
@@ -4467,17 +5160,17 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 			dev_err(fl->cctx->dev,
 				"Error %d: %s: Failed to allocate process resources buffer size %llu\n",
 				err, __func__, proc_res_size);
-			goto err_alloc;
+			goto err_cleanup;
 		} else {
 			pages[NUM_PAGES_WITH_DSP_RTOS_MEM_DONATION - 1].addr =
 				fl->proc_res_buf->phys;
 			pages[NUM_PAGES_WITH_DSP_RTOS_MEM_DONATION - 1].size =
 				fl->proc_res_buf->size;
-			inbuf.pageslen = NUM_PAGES_WITH_DSP_RTOS_MEM_DONATION;
+			pageslen = NUM_PAGES_WITH_DSP_RTOS_MEM_DONATION;
 		}
 	}
 
-	err = fastrpc_preload_mem_alloc(fl->cctx, pages, &inbuf.pageslen, NUM_PAGES_WITH_PRELOAD_BUF);
+	err = fastrpc_preload_mem_alloc(fl->cctx, pages, &pageslen, NUM_PAGES_WITH_PRELOAD_BUF);
 	if(err)
 		dev_err(fl->cctx->dev, "Error %d: %s: Failed to allocate preload buffer\n",
 				err, __func__);
@@ -4490,46 +5183,94 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 			pr_err("%s: Failed to allocate timeline buffer(err 0x%x)\n",
 				__func__, timeline_err);
 		else
-			inbuf.pageslen = NUM_PAGES_WITH_PERF_TIMLINE_DSP_K_SHAREDBUF;
+			pageslen = NUM_PAGES_WITH_PERF_TIMLINE_DSP_K_SHAREDBUF;
 	}
 
-	fl->init_mem = imem;
-	args[0].ptr = (u64)(uintptr_t)&inbuf;
-	args[0].length = sizeof(inbuf);
-	args[0].fd = -1;
-
-	args[1].ptr = (u64)(uintptr_t)fl->name;
-	args[1].length = inbuf.namelen;
-	args[1].fd = -1;
-
-	args[2].ptr = file ? (u64)(uintptr_t)file : init.file;
-	args[2].length = inbuf.filelen;
-	args[2].fd = init.filefd;
-
-	pages[0].addr = imem->phys;
-	pages[0].size = imem->size;
-
-	args[3].ptr = (u64)(uintptr_t) pages;
-	args[3].length = inbuf.pageslen * sizeof(*pages);
-	args[3].fd = -1;
-
-	args[4].ptr = (u64)(uintptr_t)&inbuf.attrs;
-	args[4].length = sizeof(inbuf.attrs);
-	args[4].fd = -1;
-
-	args[5].ptr = (u64)(uintptr_t) &inbuf.siglen;
-	args[5].length = sizeof(inbuf.siglen);
-	args[5].fd = -1;
-
 	ioctl.inv.handle = FASTRPC_INIT_HANDLE;
-	ioctl.inv.sc = FASTRPC_SCALARS(FASTRPC_RMID_INIT_CREATE, 4, 0);
-	if (init.attrs)
-		ioctl.inv.sc = FASTRPC_SCALARS(FASTRPC_RMID_INIT_CREATE_ATTR, 4, 0);
-	ioctl.inv.args = (__u64)args;
+	if (discrete_spawn) {
+		inbuf_sgl.pgid = fl->tgid_frpc;
+		inbuf_sgl.namelen = strlen(fl->name) + 1;
+		inbuf_sgl.filelen = init.filelen;
+		inbuf_sgl.attrs = init.attrs;
+		inbuf_sgl.siglen = init.siglen;
 
+		err = fastrpc_build_init_create_sgl(fl, pages, pageslen,
+			flat_pages, ARRAY_SIZE(flat_pages), &flat_pages_len,
+			buffer_types, pages_per_buf, ARRAY_SIZE(buffer_types),
+			&num_buffers);
+		if (err)
+			goto err_cleanup;
+
+		inbuf_sgl.buf_types_len = num_buffers;
+		inbuf_sgl.pages_per_buf_len = num_buffers;
+		inbuf_sgl.flat_pages_len = flat_pages_len;
+
+		args[0].ptr = (u64)(uintptr_t)&inbuf_sgl;
+		args[0].length = sizeof(inbuf_sgl);
+		args[0].fd = -1;
+
+		args[1].ptr = (u64)(uintptr_t)fl->name;
+		args[1].length = inbuf_sgl.namelen;
+		args[1].fd = -1;
+
+		args[2].ptr = file ? (u64)(uintptr_t)file : init.file;
+		args[2].length = inbuf_sgl.filelen;
+		args[2].fd = init.filefd;
+
+		args[3].ptr = (u64)(uintptr_t)buffer_types;
+		args[3].length = num_buffers * sizeof(*buffer_types);
+		args[3].fd = -1;
+
+		args[4].ptr = (u64)(uintptr_t)pages_per_buf;
+		args[4].length = num_buffers * sizeof(*pages_per_buf);
+		args[4].fd = -1;
+
+		args[5].ptr = (u64)(uintptr_t)flat_pages;
+		args[5].length = flat_pages_len * sizeof(*flat_pages);
+		args[5].fd = -1;
+
+		ioctl.inv.sc = FASTRPC_SCALARS(FASTRPC_RMID_INIT_CREATE_ATTR_SGL, 6, 0);
+	} else {
+		/* Integrated (non-SGL) path: build the flat create message here. */
+		inbuf.pgid = fl->tgid_frpc;
+		inbuf.namelen = strlen(fl->name) + 1;
+		inbuf.filelen = init.filelen;
+		inbuf.pageslen = pageslen;
+		inbuf.attrs = init.attrs;
+		inbuf.siglen = init.siglen;
+
+		args[0].ptr = (u64)(uintptr_t)&inbuf;
+		args[0].length = sizeof(inbuf);
+		args[0].fd = -1;
+
+		args[1].ptr = (u64)(uintptr_t)fl->name;
+		args[1].length = inbuf.namelen;
+		args[1].fd = -1;
+
+		args[2].ptr = file ? (u64)(uintptr_t)file : init.file;
+		args[2].length = inbuf.filelen;
+		args[2].fd = init.filefd;
+
+		args[3].ptr = (u64)(uintptr_t) pages;
+		args[3].length = inbuf.pageslen * sizeof(*pages);
+		args[3].fd = -1;
+
+		args[4].ptr = (u64)(uintptr_t)&inbuf.attrs;
+		args[4].length = sizeof(inbuf.attrs);
+		args[4].fd = -1;
+
+		args[5].ptr = (u64)(uintptr_t) &inbuf.siglen;
+		args[5].length = sizeof(inbuf.siglen);
+		args[5].fd = -1;
+
+		ioctl.inv.sc = FASTRPC_SCALARS(FASTRPC_RMID_INIT_CREATE, 4, 0);
+		if (init.attrs)
+			ioctl.inv.sc = FASTRPC_SCALARS(FASTRPC_RMID_INIT_CREATE_ATTR, 4, 0);
+	}
+	ioctl.inv.args = (__u64)args;
 	err = fastrpc_internal_invoke(fl, KERNEL_MSG_WITH_ZERO_PID, &ioctl);
 	if (err)
-		goto err_invoke;
+		goto err_cleanup;
 
 	timeline_err = fastrpc_update_timeline_version(timeline);
 	if (!timeline_err)
@@ -4553,13 +5294,20 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 
 	return 0;
 
-err_invoke:
-	spin_lock(&fl->lock);
-	fl->init_mem = NULL;
-	spin_unlock(&fl->lock);
-	fastrpc_buf_free(imem, false);
+err_cleanup:
+	/* Free all allocations made during process spawn setup. */
+	if (fl->init_mem) {
+		fastrpc_buf_free(fl->init_mem, false);
+		fl->init_mem = NULL;
+	}
+	fastrpc_discrete_free_sg(&fl->init_mem_sg);
+	/*
+	 * rootheap_sg is a borrow pointer into the channel-owned
+	 * discrete_rootheap_bufs list; the donation is channel-scoped and
+	 * freed at channel teardown. Just clear the borrow pointer.
+	 */
+	fl->rootheap_sg = NULL;
 	kvfree(timeline);
-err_alloc:
 	if (fl->proc_init_sharedbuf) {
 		fastrpc_buf_free(fl->proc_init_sharedbuf, false);
 		fl->proc_init_sharedbuf = NULL;
@@ -4573,11 +5321,13 @@ err_alloc:
 		fastrpc_buf_free(fl->dbglogbuf, false);
 		fl->dbglogbuf = NULL;
 	}
+	fastrpc_discrete_free_sg(&fl->dbglogbuf_sg);
 	if (fl->proc_res_buf) {
 		fastrpc_buf_free(fl->proc_res_buf, false);
 		fl->proc_res_buf = NULL;
 	}
 err_out:
+	fastrpc_release_discrete_card(fl);
 	kfree(file);
 	/* Reset the process state to its default in case of an error. */
 	atomic_set(&fl->state, DEFAULT_PROC_STATE);
@@ -4651,6 +5401,13 @@ void fastrpc_free_user(struct fastrpc_user *fl)
 		fastrpc_buf_free(fl->init_mem, false);
 		fl->init_mem = NULL;
 	}
+	fastrpc_discrete_free_sg(&fl->init_mem_sg);
+	/*
+	 * rootheap_sg is a borrow pointer into the channel-owned
+	 * discrete_rootheap_bufs list. Successful spawns let channel teardown
+	 * free the node; just clear the borrow pointer here.
+	 */
+	fl->rootheap_sg = NULL;
 
 	mutex_lock(&fl->map_mutex);
 	// During process tear down free the map, even if refcount is non-zero
@@ -4660,6 +5417,16 @@ void fastrpc_free_user(struct fastrpc_user *fl)
 			map->attr = FASTRPC_MAP_ATTR_DEFAULT;
 		__fastrpc_free_map(map);
 	}
+
+	list_for_each_entry_safe(map, m, &fl->discrete_maps, node) {
+		list_del(&map->node);
+#ifdef CONFIG_FASTRPC_QNA
+		fastrpc_qna_discrete_alloc_put(map->discrete_alloc);
+#endif
+		kfree(map->sg_pages);
+		kfree(map);
+	}
+
 	mutex_unlock(&fl->map_mutex);
 
 	fastrpc_buf_list_free(fl, &fl->mmaps, false);
@@ -4673,6 +5440,7 @@ void fastrpc_free_user(struct fastrpc_user *fl)
 		fastrpc_buf_free(fl->dbglogbuf, false);
 		fl->dbglogbuf = NULL;
 	}
+	fastrpc_discrete_free_sg(&fl->dbglogbuf_sg);
 
 	if (fl->proc_res_buf) {
 		fastrpc_buf_free(fl->proc_res_buf, false);
@@ -4800,6 +5568,7 @@ static int fastrpc_user_obj_free(struct fastrpc_user *user,
 		atomic_set(&fl->spd->is_attached, 0);
 
 	err = fastrpc_release_current_dsp_process(fl);
+	fastrpc_release_discrete_card(fl);
 
 	/*
 	 * Handle GLINK timeout during PD kill.
@@ -5012,6 +5781,7 @@ static int fastrpc_user_obj_create(struct file *filp,
 	INIT_LIST_HEAD(&fl->pending);
 	INIT_LIST_HEAD(&fl->interrupted);
 	INIT_LIST_HEAD(&fl->maps);
+	INIT_LIST_HEAD(&fl->discrete_maps);
 	INIT_LIST_HEAD(&fl->mmaps);
 	INIT_LIST_HEAD(&fl->user);
 	INIT_LIST_HEAD(&fl->active_user_ssr);
@@ -5335,6 +6105,10 @@ static int fastrpc_init_attach(struct fastrpc_user *fl, int pd)
 		return err;
 
 	if (pd == SENSORS_STATICPD) {
+		if (FASTRPC_DOMAIN_IS_DISCRETE(fl->cctx->domain)) {
+			dev_err(fl->cctx->dev, "sensors PD not supported on discrete DSP\n");
+			return -EACCES;
+		}
 		if (fl->cctx->domain->type == FASTRPC_LPASS)
 			fl->servloc_name = SENSORS_PDR_ADSP_SERVICE_LOCATION_CLIENT_NAME;
 		else if (fl->cctx->domain->type == FASTRPC_SDSP)
@@ -6249,6 +7023,86 @@ static int fastrpc_multidomain_ctx_get_tgids(struct device *dev,
 	return err;
 }
 
+/* Returns true if two multidomain context DSP sets contain the same phy_ids */
+static bool fastrpc_domain_sets_equal(struct fastrpc_mdctx_info *a,
+	struct fastrpc_mdctx_info *b)
+{
+	uint32_t i = 0, j = 0;
+	bool found = false;
+
+	if (a->num_domains != b->num_domains)
+		return false;
+	for (i = 0; i < a->num_domains; i++) {
+		found = false;
+		for (j = 0; j < b->num_domains; j++) {
+			if (a->phy_ids[i] == b->phy_ids[j]) {
+				found = true;
+				break;
+			}
+		}
+		if (!found)
+			return false;
+	}
+	return true;
+}
+
+/* Returns true if two multidomain context DSP sets share at least one phy_id */
+static bool fastrpc_domain_sets_intersect(struct fastrpc_mdctx_info *a,
+	struct fastrpc_mdctx_info *b)
+{
+	uint32_t i = 0, j = 0;
+
+	for (i = 0; i < a->num_domains; i++) {
+		for (j = 0; j < b->num_domains; j++) {
+			if (a->phy_ids[i] == b->phy_ids[j])
+				return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * Ensure all domains in a multi-domain context share the same class:
+ * either all integrated or all discrete. The first domain sets the class;
+ * every later domain must match it.
+ */
+static int fastrpc_check_domain_class(struct fastrpc_domain *domain,
+	bool *class_set, bool *is_discrete)
+{
+	bool this_discrete = FASTRPC_DOMAIN_IS_DISCRETE(domain);
+
+	if (!*class_set) {
+		*is_discrete = this_discrete;
+		*class_set = true;
+	} else if (this_discrete != *is_discrete) {
+		return -EINVAL;
+	}
+	return 0;
+}
+
+/*
+ * fastrpc_discrete_combination_available() - Check if a discrete multi-domain
+ * context can be created without conflicting with an existing combination.
+ * @cand: candidate context, not yet inserted into the idr.
+ *
+ * Caller must hold g_frpc.gmut. Returns true if no conflict exists.
+ */
+static bool fastrpc_discrete_combination_available(struct fastrpc_mdctx_info *cand)
+{
+	struct fastrpc_mdctx_info *other = NULL;
+	int id = 0;
+
+	idr_for_each_entry(&g_frpc.mdctx_idr, other, id) {
+		if (!other->is_discrete)
+			continue;
+		if (fastrpc_domain_sets_equal(other, cand))
+			continue;                 /* identical combination: allowed */
+		if (fastrpc_domain_sets_intersect(other, cand))
+			return false;             /* partial overlap: conflict */
+	}
+	return true;
+}
+
 /* Helper function to initialize multidomain context object */
 static int fastrpc_multidomain_ctx_obj_init(struct fastrpc_user *fl,
 	struct fastrpc_ioctl_mdctx_manage *ctxm,
@@ -6266,6 +7120,7 @@ static int fastrpc_multidomain_ctx_obj_init(struct fastrpc_user *fl,
 	struct fastrpc_mdctx_info *mdctx = NULL;
 	struct fastrpc_domain *domain = NULL;
 	uint32_t logical_domain_id = 0;
+	bool class_set = false, is_discrete = false;
 
 	/* Validate that reserved fields are all zero */
 	for (ii = 0; ii < FASTRPC_MDCTX_IOCTL_RSVD; ii++) {
@@ -6370,9 +7225,20 @@ static int fastrpc_multidomain_ctx_obj_init(struct fastrpc_user *fl,
 				err, __func__, logical_domain_id);
 			goto bail;
 		}
+
+		err = fastrpc_check_domain_class(domain, &class_set, &is_discrete);
+		if (err) {
+			dev_err(dev,
+				"Error %d: cannot mix integrated and discrete DSPs in one multi-domain context",
+				err);
+			goto bail;
+		}
+
 		instance_ids[ii] = domain->instance_id;
 		phy_ids[ii] = domain->phy_id;
 	}
+
+	mdctx->is_discrete = is_discrete;
 
 	/* Allocate tgids array to send to dsp */
 	size = sizeof(*tgids_frpc) * num_domains;
@@ -6591,6 +7457,15 @@ static int fastrpc_multidomain_ctx_setup(struct fastrpc_user *fl,
 
 	/* Generate kernel context id */
 	mutex_lock(gmut);
+
+	if (mdctx->is_discrete &&
+		!fastrpc_discrete_combination_available(mdctx)) {
+		err = -EBUSY;
+		dev_err(dev, "Error %d: DSP already bound to a different multi-core combination",
+			err);
+		goto bail;
+	}
+
 	err = idr_alloc_cyclic(mdctx_idr, mdctx, 1,
 				FASTRPC_CTX_MAX, GFP_ATOMIC);
 
@@ -8679,6 +9554,59 @@ err_invoke:
 	return err;
 }
 
+/*
+ * fastrpc_qna_lookup - Look up a discrete allocation for an fd.
+ *
+ * Sets *is_discrete=true and *alloc to the found allocation when
+ * CONFIG_FASTRPC_QNA is enabled and the fd resolves to a discrete
+ * allocation.  Otherwise sets *is_discrete=false and returns 0, so
+ * callers never need #ifdef guards around "if (!is_discrete)" checks.
+ *
+ * Returns 0 on success (including "not a discrete fd"), negative errno
+ * on a hard lookup failure.
+ */
+#ifdef CONFIG_FASTRPC_QNA
+static int fastrpc_qna_lookup(int fd, struct qna_discrete_alloc **alloc,
+			      bool *is_discrete)
+{
+	int err;
+
+	err = fastrpc_qna_discrete_alloc_lookup(fd, alloc);
+	if (err)
+		return err;
+	*is_discrete = (*alloc != NULL);
+	return 0;
+}
+#else
+/*
+ * Stub definitions for CONFIG_FASTRPC_QNA=n builds.
+ *
+ * All call sites in this file invoke these functions unconditionally,
+ * with no #ifdef guards at the call site.  Providing no-op /
+ * error-returning stubs here keeps the rest of the code free of
+ * scattered conditionals and lets the compiler inline and
+ * dead-code-eliminate every stub in non-QNA builds at zero cost.
+ */
+static int fastrpc_qna_lookup(int fd, void **alloc, bool *is_discrete)
+{
+	*alloc = NULL;
+	*is_discrete = false;
+	return 0;
+}
+
+static inline void fastrpc_qna_discrete_alloc_put(void *alloc) {}
+
+static inline struct fastrpc_map *fastrpc_find_discrete_fd_map(
+	struct fastrpc_user *fl, void *alloc, int fd, bool map_ref)
+{ return NULL; }
+
+static inline void fastrpc_discrete_map_put(struct fastrpc_map *map) {}
+
+static inline int fastrpc_discrete_map_create(struct fastrpc_user *fl,
+	int fd, int flags, void *alloc, struct fastrpc_map **map)
+{ return -ENOSYS; }
+#endif
+
 static int fastrpc_req_mem_unmap_impl(struct fastrpc_user *fl, struct fastrpc_mem_unmap *req)
 {
 	struct fastrpc_invoke_args args[1] = { [0] = { 0 } };
@@ -8687,29 +9615,81 @@ static int fastrpc_req_mem_unmap_impl(struct fastrpc_user *fl, struct fastrpc_me
 	struct fastrpc_mem_unmap_req_msg req_msg = { 0 };
 	int err = -EINVAL;
 	struct device *dev = fl->sctx->smmucb[DEFAULT_SMMU_IDX].dev;
+#ifdef CONFIG_FASTRPC_QNA
+	struct qna_discrete_alloc *alloc = NULL;
+#else
+	void *alloc = NULL;
+#endif
+	bool is_discrete = false;
 
-	spin_lock(&fl->lock);
-	list_for_each_entry_safe(iter, m, &fl->maps, node) {
-		if ((req->fd < 0 || iter->fd == req->fd) && (iter->raddr == req->vaddr)) {
-			/*
-			 * Check if DSP mapping is complete, then move the state to
-			 * unmap in progress only if there is no other ongoing unmap.
-			 */
-			if (atomic_cmpxchg(&iter->state, FD_DSP_MAP_COMPLETE,
-				FD_DSP_UNMAP_IN_PROGRESS) != FD_DSP_MAP_COMPLETE)
-				err = -EALREADY;
-			else
-				map = iter;
-			break;
+	/*
+	 * Check if fd for unmap points to a discrete memory allocation.
+	 * fastrpc_qna_lookup() sets is_discrete=true only when QNA is
+	 * enabled and the fd resolves to a discrete allocation; otherwise
+	 * it is a no-op that returns 0.
+	 *
+	 * -EBADF/-ENOENT mean no discrete allocation was found for this fd
+	 * (e.g. fd < 0, or a genuine integrated fd) - not a real error, so
+	 * fall through silently treating this as a non-discrete (integrated)
+	 * unmap, so legacy callers passing fd < 0 still get looked up by
+	 * vaddr in fl->maps below. Any other failure is a real error and is
+	 * propagated to the caller.
+	 */
+	err = fastrpc_qna_lookup(req->fd, &alloc, &is_discrete);
+	if (err) {
+		if (err == -EBADF || err == -ENOENT) {
+			is_discrete = false;
+			alloc = NULL;
+			err = 0;
+		} else {
+			dev_err(dev, "Error %d: %s: fastrpc_qna_lookup failed for fd %d\n",
+				err, __func__, req->fd);
+			return err;
 		}
 	}
 
-	spin_unlock(&fl->lock);
+	if (is_discrete)
+		map = fastrpc_find_discrete_fd_map(fl, alloc, req->fd, true);
 
+	spin_lock(&fl->lock);
+	if (!is_discrete) {
+		list_for_each_entry_safe(iter, m, &fl->maps, node) {
+			if ((req->fd < 0 || iter->fd == req->fd) && (iter->raddr == req->vaddr)) {
+				map = iter;
+				break;
+			}
+		}
+	}
 	if (!map) {
-		dev_err(dev, "map not in list\n");
+		spin_unlock(&fl->lock);
+		if (is_discrete) {
+			err = -ENOENT;
+			dev_err(dev, "Error %d: %s: discrete memory unmap failed, no active mapping found for fd %d\n",
+				err, __func__, req->fd);
+			fastrpc_qna_discrete_alloc_put(alloc);
+		} else {
+			err = -EINVAL;
+			dev_err(dev, "Error %d: %s: map not found for fd %d\n",
+				err, __func__, req->fd);
+		}
 		return err;
 	}
+	/*
+	 * Check if DSP mapping is complete, then move the state to
+	 * unmap in progress only if there is no other ongoing unmap.
+	 */
+	if (atomic_cmpxchg(&map->state, FD_DSP_MAP_COMPLETE,
+		FD_DSP_UNMAP_IN_PROGRESS) != FD_DSP_MAP_COMPLETE) {
+		err = -EALREADY;
+		spin_unlock(&fl->lock);
+		if (is_discrete) {
+			/* Drop the lookup ref taken by fastrpc_find_discrete_fd_map. */
+			fastrpc_discrete_map_put(map);
+			fastrpc_qna_discrete_alloc_put(alloc);
+		}
+		return err;
+	}
+	spin_unlock(&fl->lock);
 
 	req_msg.pgid = fl->tgid_frpc;
 	req_msg.len = map->len;
@@ -8725,15 +9705,20 @@ static int fastrpc_req_mem_unmap_impl(struct fastrpc_user *fl, struct fastrpc_me
 
 	err = fastrpc_internal_invoke(fl, KERNEL_MSG_WITH_ZERO_PID, &ioctl);
 	if (err) {
-		dev_err(dev, "Unmap on DSP failed for fd:%d, addr:0x%09llx\n",  map->fd, map->raddr);
+		dev_err(dev, "Unmap on DSP failed for fd:%d, addr:0x%09llx\n", map->fd, map->raddr);
 		/* Revert the map state to map complete */
 		atomic_set(&map->state, FD_DSP_MAP_COMPLETE);
+		if (is_discrete) {
+			/* Drop the lookup ref taken by fastrpc_find_discrete_fd_map. */
+			fastrpc_discrete_map_put(map);
+			fastrpc_qna_discrete_alloc_put(alloc);
+		}
 		return err;
 	}
 	/* Set the map state to default on successful unmapping */
 	atomic_set(&map->state, FD_MAP_DEFAULT);
-	mutex_lock(&fl->map_mutex);
 
+	mutex_lock(&fl->map_mutex);
 	/*
 	 * If the mapping was created with IOVA retention on unmap, allow
 	 * clearing that flag so the unmap also releases the IOVA region.
@@ -8748,7 +9733,26 @@ static int fastrpc_req_mem_unmap_impl(struct fastrpc_user *fl, struct fastrpc_me
 	 * failure on multiple unmap requests of same FD.
 	 */
 	map->raddr = 0;
-	fastrpc_map_put(map);
+
+	/*
+	 * If the mapping was created for a discrete allocation, then
+	 * release the discrete allocation reference and remove the map
+	 * from the list.  Otherwise, just remove the map from the list.
+	 */
+	if (is_discrete) {
+		/*
+		 * Two refs to drop:
+		 *   1. The lookup ref taken by fastrpc_find_discrete_fd_map.
+		 *   2. The ownership ref (kref_init) representing the map's slot in
+		 *      fl->discrete_maps, this second put removes it from the list
+		 *      and frees the map once refcount reaches zero.
+		 */
+		fastrpc_discrete_map_put(map); /* lookup ref */
+		fastrpc_discrete_map_put(map); /* ownership ref */
+		fastrpc_qna_discrete_alloc_put(alloc);
+	} else {
+		fastrpc_map_put(map);
+	}
 	mutex_unlock(&fl->map_mutex);
 	return 0;
 }
@@ -8774,7 +9778,13 @@ static int fastrpc_req_mem_map(struct fastrpc_user *fl, char __user *argp)
 	struct fastrpc_mem_map req = {0};
 	struct device *dev = NULL;
 	struct fastrpc_map *map = NULL;
-	int err;
+#ifdef CONFIG_FASTRPC_QNA
+	struct qna_discrete_alloc *alloc = NULL;
+#else
+	void *alloc = NULL;
+#endif
+	bool is_discrete = false;
+	int err = 0;
 
 	if (atomic_read(&fl->state) != DSP_CREATE_COMPLETE) {
 		dev_err(fl->cctx->dev,
@@ -8784,6 +9794,7 @@ static int fastrpc_req_mem_map(struct fastrpc_user *fl, char __user *argp)
 	}
 	if (copy_from_user(&req, argp, sizeof(req)))
 		return -EFAULT;
+
 	/*
 	 * Prevent mapping backward compatible DMA handles here, as they are
 	 * already mapped in the remote call.
@@ -8791,14 +9802,39 @@ static int fastrpc_req_mem_map(struct fastrpc_user *fl, char __user *argp)
 	if (req.flags == FASTRPC_MAP_LEGACY_DMA_HANDLE)
 		return -EINVAL;
 	dev = fl->sctx->smmucb[DEFAULT_SMMU_IDX].dev;
-	/* create SMMU mapping */
+
+	/*
+	 * Check if fd to map points to a discrete memory allocation.
+	 * fastrpc_qna_lookup() sets is_discrete=true only when QNA is
+	 * enabled and the fd resolves to a discrete allocation; otherwise
+	 * it is a no-op that returns 0.
+	 */
+	err = fastrpc_qna_lookup(req.fd, &alloc, &is_discrete);
+	if (err)
+		return err;
+
 	mutex_lock(&fl->map_mutex);
-	err = fastrpc_map_create(fl, req.fd, req.vaddrin, NULL, req.length, req.attrs, req.flags, &map, true);
+	if (is_discrete) {
+		err = fastrpc_discrete_map_create(fl, req.fd, req.flags, alloc, &map);
+	} else {
+		/* create SMMU mapping */
+		err = fastrpc_map_create(fl, req.fd, req.vaddrin, NULL, req.length, req.attrs, req.flags, &map, true);
+	}
 	mutex_unlock(&fl->map_mutex);
 	if (err) {
-		dev_err(dev, "failed to map buffer, fd = %d\n", req.fd);
+		if (is_discrete) {
+#ifdef CONFIG_FASTRPC_QNA
+			dev_err(dev, "Error %d: %s: failed to create discrete memory map, fd %d, flags 0x%x, allocation size 0x%llx\n",
+				err, __func__, req.fd, req.flags, alloc->total_size);
+#endif
+			fastrpc_qna_discrete_alloc_put(alloc);
+		} else {
+			dev_err(dev, "Error %d: %s: failed to map buffer, fd %d\n",
+				err, __func__, req.fd);
+		}
 		return err;
 	}
+
 	/*
 	 * Update the map state to in progress only if there is no ongoing or
 	 * completed DSP mapping.
@@ -8806,11 +9842,16 @@ static int fastrpc_req_mem_map(struct fastrpc_user *fl, char __user *argp)
 	if (atomic_cmpxchg(&map->state, FD_MAP_DEFAULT, FD_DSP_MAP_IN_PROGRESS)
 		!= FD_MAP_DEFAULT) {
 		err = -EALREADY;
+		dev_err(dev, "Error %d: %s: map rejected for fd %d, map state is %d (expected %d)\n",
+			err, __func__, req.fd, atomic_read(&map->state), FD_MAP_DEFAULT);
 		goto err_invoke;
 	}
+
+	map->map_err = 0;
 	map->va = (void *) (uintptr_t) req.vaddrin;
+
 	/* map to dsp, get virtual adrress for the user*/
-	err = fastrpc_mem_map_to_dsp(fl, map->fd, req.offset,
+	err = fastrpc_mem_map_to_dsp(fl, map, map->fd, req.offset,
 					req.flags, req.vaddrin, map->phys,
 					map->size, (uintptr_t *)&req.vaddrout);
 	if (err) {
@@ -8821,7 +9862,10 @@ static int fastrpc_req_mem_map(struct fastrpc_user *fl, char __user *argp)
 	}
 
 	/* update the buffer to be able to deallocate the memory on the DSP */
+	mutex_lock(&fl->map_mutex);
 	map->raddr = req.vaddrout;
+	mutex_unlock(&fl->map_mutex);
+
 	/* Set the map state to complete on successful mapping */
 	atomic_set(&map->state, FD_DSP_MAP_COMPLETE);
 	if (copy_to_user((void __user *)argp, &req, sizeof(req)))
@@ -8836,7 +9880,19 @@ static int fastrpc_req_mem_map(struct fastrpc_user *fl, char __user *argp)
 	return 0;
 err_invoke:
 	mutex_lock(&fl->map_mutex);
-	fastrpc_map_put(map);
+	/* Cleanup if discrete fd map fails */
+	if (is_discrete) {
+		if (err != -EALREADY)
+			map->map_err = err;
+		fastrpc_discrete_map_put(map);
+		/*
+		 * On error, kref_release skips alloc cleanup (map_err set),
+		 * so the caller must free alloc here.
+		 */
+		fastrpc_qna_discrete_alloc_put(alloc);
+	} else {
+		fastrpc_map_put(map);
+	}
 	mutex_unlock(&fl->map_mutex);
 
 	return err;
@@ -8878,15 +9934,15 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int cmd,
 	switch (cmd) {
 	case FASTRPC_IOCTL_INVOKE:
 		trace_fastrpc_msg("invoke: begin");
-		fastrpc_timeline_record(2, fl->tgid_app, fl->fastrpc_timeline_obj);
+		fastrpc_timeline_record(2, current->pid, fl->fastrpc_timeline_obj);
 		err = fastrpc_invoke(fl, argp);
-		fastrpc_timeline_record(42, fl->tgid_app, fl->fastrpc_timeline_obj);
+		fastrpc_timeline_record(42, current->pid, fl->fastrpc_timeline_obj);
 		trace_fastrpc_msg("invoke: end");
 		break;
 	case FASTRPC_IOCTL_MULTIMODE_INVOKE:
-		fastrpc_timeline_record(2, fl->tgid_app, fl->fastrpc_timeline_obj);
+		fastrpc_timeline_record(2, current->pid, fl->fastrpc_timeline_obj);
 		err = fastrpc_multimode_invoke(fl, argp);
-		fastrpc_timeline_record(42, fl->tgid_app, fl->fastrpc_timeline_obj);
+		fastrpc_timeline_record(42, current->pid, fl->fastrpc_timeline_obj);
 		break;
 	case FASTRPC_IOCTL_INIT_ATTACH:
 		err = fastrpc_init_attach(fl, ROOT_PD);
@@ -8937,15 +9993,8 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int cmd,
 		__u32 rsvd;
 		__u32 reserved[16];
 
-		/*
-	 	 * TODO: Add check to ensure that NPU HAL service is the only process that is
-	 	 * allowed to make this ioctl call.
-	 	 * ioctl call from any other application needs to be rejected.
-	 	 * For now, add this rudimentary check to block most 3rd-party apps from making
-	 	 * this ioctl. This is NOT expected to block 3rd party-apps and is only a
-	 	 * temporary placeholder.
-	 	 */
-		if (fl->tgid_app >= THIRD_PARTY_APP_PID) {
+		// check if this is untrusted application
+		if (current->tgid != fl->tgid) {
 			err = -EPERM;
 			break;
 		}
@@ -9117,7 +10166,7 @@ static long fastrpc_dev_map_dma(struct fastrpc_device *dev,
 	}
 	/* Map DMA buffer on DSP*/
 
-	err = fastrpc_mem_map_to_dsp(fl, -1, 0, map->flags, 0, map->phys, map->size, &raddr);
+	err = fastrpc_mem_map_to_dsp(fl, map, -1, 0, map->flags, 0, map->phys, map->size, &raddr);
 	if (err) {
 		pr_err("%s : failed to map buffer on DSP ", __func__);
 		/* Revert the map state to map default */
@@ -10058,7 +11107,7 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 {
 	struct fastrpc_channel_ctx *cctx;
 	struct fastrpc_pool_ctx *sess = NULL;
-	struct device *dev = &pdev->dev;
+	struct device *dev = &pdev->dev, *shared_cb_dev = NULL;
 	int i, sessions = 0;
 	unsigned long flags;
 	u32 pd_type = DEFAULT_UNUSED, smmuidx = DEFAULT_SMMU_IDX;
@@ -10071,6 +11120,7 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 	u64 smmu_alloc_range64[2] = {0};
 	struct sg_table sgt;
 	struct fastrpc_smmu *smmucb = NULL;
+	struct device_node *shared_cb_dev_node = NULL;
 #ifdef CONFIG_DEBUG_FS
 	struct dentry *debugfs_root = g_frpc.debugfs_root;
 	struct dentry *debugfs_global_file = NULL;
@@ -10092,11 +11142,69 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 		cctx->pd_type = true;
 	}
 
+	/*
+	 * NS_CHANNEL_SHARED context banks do not own an SMMU
+	 * device of their own. Instead, they borrow the SMMU
+	 * device of an external PCI endpoint (e.g. a co-located
+	 * accelerator) so that DMA mappings created by fastrpc
+	 * are visible to that device.
+	 *
+	 * Resolve the shared device in two steps:
+	 *   1. of_parse_phandle() looks up the "qcom,shared_cb_dev"
+	 *      phandle in DT and returns the referenced device_node
+	 *      (with a refcount that must be released via
+	 *      of_node_put()).
+	 *   2. bus_find_device_by_of_node() walks the PCI bus to
+	 *      locate the struct device bound to that node, taking
+	 *      an additional reference on the device.
+	 */
+	if (pd_type == NS_CHANNEL_SHARED) {
+		shared_cb_dev_node = of_parse_phandle(dev->of_node,
+					"qcom,shared_cb_dev", 0);
+		if (!shared_cb_dev_node) {
+			err = -EINVAL;
+			dev_err(&pdev->dev, "missing qcom,shared_cb_dev property\n");
+			goto bail;
+		}
+		shared_cb_dev = bus_find_device_by_of_node(&pci_bus_type,
+			shared_cb_dev_node);
+		if (!shared_cb_dev) {
+			err = -EINVAL;
+			dev_err(&pdev->dev, "can't find shared cb device\n");
+			goto bail;
+		}
+	}
+
 	spin_lock_irqsave(&cctx->lock, flags);
 	if (cctx->sesscount >= FASTRPC_MAX_SESSIONS) {
 		dev_err(&pdev->dev, "too many sessions\n");
 		spin_unlock_irqrestore(&cctx->lock, flags);
-		return -ENOSPC;
+		err = -ENOSPC;
+		goto bail;
+	}
+
+	/*
+	 * Enforce NS_CHANNEL_SHARED exclusivity:
+	 * - A NS_CHANNEL_SHARED CB cannot be added to a
+	 *   channel that already has any CB registered.
+	 * - A non-NS_CHANNEL_SHARED CB cannot be added to
+	 *   a channel that has a NS_CHANNEL_SHARED CB.
+	 */
+	if (pd_type == NS_CHANNEL_SHARED && cctx->sesscount > 0) {
+		err = -EINVAL;
+		dev_err(&pdev->dev,
+			"NS_CHANNEL_SHARED: channel already has a CB\n");
+		spin_unlock_irqrestore(&cctx->lock, flags);
+		goto bail;
+	}
+	for (i = 0; i < cctx->sesscount; i++) {
+		if (cctx->session[i].pd_type == NS_CHANNEL_SHARED) {
+			err = -EINVAL;
+			dev_err(&pdev->dev,
+				"cannot add CB to NS_CHANNEL_SHARED channel\n");
+			spin_unlock_irqrestore(&cctx->lock, flags);
+			goto bail;
+		}
 	}
 
 	/* Find any existing session for pooling CBs with same PD type */
@@ -10121,16 +11229,37 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 	if (sess->smmucount == 0) {
 		sess->usecount = 0;
 		sess->pd_type = pd_type;
+		if (pd_type == NS_CHANNEL_SHARED) {
+			cctx->smmucb_pool = true;
+			sess->sharedcb = true;
+		}
 	}
 	/* Read secure flag for each context bank, even if part of CB pool */
 	sess->secure = of_property_read_bool(dev->of_node,
 						"qcom,secure-context-bank");
 
+	/*
+	 * NS_CHANNEL_SHARED context banks borrow an external SMMU
+	 * device and therefore cannot be configured as secure.
+	 * Reject such mis-configuration early to avoid undefined
+	 * behavior at runtime.
+	 */
+	if (pd_type == NS_CHANNEL_SHARED && sess->secure) {
+		err = -EINVAL;
+		dev_err(&pdev->dev,
+			"NS_CHANNEL_SHARED CB cannot be secure\n");
+		spin_unlock_irqrestore(&cctx->lock, flags);
+		goto bail;
+	}
+
 	/* Populate SMMU CB info at next available free SMMU index */
 	smmuidx = sess->smmucount++;
 	smmucb = &sess->smmucb[smmuidx];
 	smmucb->valid = true;
-	smmucb->dev = dev;
+	if (pd_type == NS_CHANNEL_SHARED)
+		smmucb->dev = shared_cb_dev;
+	else
+		smmucb->dev = dev;
 	smmucb->sess = sess;
 	smmucb->pa_bits = DSP_DEFAULT_BUS_WIDTH;
 	mutex_init(&smmucb->map_mutex);
@@ -10269,25 +11398,27 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "fastrpc_cb_probe qrtr-gen-pool end\n");
 	}
 
-	/* Mask determines range of addresses returned by smmu driver */
-	rc = dma_set_mask(dev, DMA_BIT_MASK(smmucb->pa_bits));
-	if (rc) {
-		dev_err(dev, "32-bit DMA enable failed\n");
-		return rc;
-	}
-	/* Set larger segment size to allow smmu to map > 4GB */
-	dma_set_max_seg_size(dev, DMA_BIT_MASK(32));
+	if (pd_type != NS_CHANNEL_SHARED) {
+		/* Mask determines range of addresses returned by smmu driver */
+		rc = dma_set_mask(dev, DMA_BIT_MASK(smmucb->pa_bits));
+		if (rc) {
+			dev_err(dev, "32-bit DMA enable failed\n");
+			return rc;
+		}
+		/* Set larger segment size to allow smmu to map > 4GB */
+		dma_set_max_seg_size(dev, DMA_BIT_MASK(32));
 
-	/*
-	 * Set the DMA mask for the SMMU parent device to 64-bit,
-	 * allowing the device to access the full range of DDR memory.
-	 * This is necessary for devices that need to perform DMA operations,
-	 * on high memory addresses beyond the 32-bit limit.
-	 */
-	rc = dma_set_mask(dev->parent, DMA_BIT_MASK(64));
-	if (rc) {
-		dev_err(dev, "64-bit parent SMMU dev DMA enable failed\n");
-		return rc;
+		/*
+		 * Set the DMA mask for the SMMU parent device to 64-bit,
+		 * allowing the device to access the full range of DDR memory.
+		 * This is necessary for devices that need to perform DMA operations,
+		 * on high memory addresses beyond the 32-bit limit.
+		 */
+		rc = dma_set_mask(dev->parent, DMA_BIT_MASK(64));
+		if (rc) {
+			dev_err(dev, "64-bit parent SMMU dev DMA enable failed\n");
+			return rc;
+		}
 	}
 
 #ifdef CONFIG_DEBUG_FS
@@ -10304,6 +11435,15 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 #endif
 
 bail:
+	/*
+	 * On success, keep the additional reference to shared_cb_dev;
+	 * it is released when the context bank is cleaned up in
+	 * fastrpc_cb_remove(). On error, drop it here.
+	 */
+	if (err && shared_cb_dev)
+		put_device(shared_cb_dev);
+	if (shared_cb_dev_node)
+		of_node_put(shared_cb_dev_node);
 	if (!err)
 		dev_info(dev, "Successfully added %s", dev->kobj.name);
 	return err;
@@ -10316,6 +11456,11 @@ iommu_map_bail:
 			IOVA_TO_PHYSADDR(buf->phys, smmucb->sid_pos));
 dma_alloc_bail:
 	kfree(buf);
+	if (shared_cb_dev)
+		put_device(shared_cb_dev);
+	if (shared_cb_dev_node)
+		of_node_put(shared_cb_dev_node);
+
 	return err;
 }
 
@@ -10359,8 +11504,9 @@ static int fastrpc_cb_remove(struct platform_device *pdev)
 	unsigned long flags;
 	int i = 0, j = 0;
 
-	if (sess->pd_type == ROOT_PD) {
+	if (sess->pd_type == ROOT_PD || sess->pd_type == NS_CHANNEL_SHARED) {
 		fastrpc_rootheap_buf_list_free(cctx);
+		fastrpc_discrete_drop_rootheap(cctx);
 		fastrpc_preload_mem_free(cctx);
 	}
 
@@ -10374,6 +11520,13 @@ static int fastrpc_cb_remove(struct platform_device *pdev)
 			mutex_lock(&ismmucb->map_mutex);
 			if (ismmucb->frpc_genpool)
 				fastrpc_genpool_free(ismmucb);
+			/*
+			 * Release the reference taken on the shared cb
+			 * device during fastrpc_cb_probe().
+			 */
+			if (sess->pd_type == NS_CHANNEL_SHARED &&
+					ismmucb->dev)
+				put_device(ismmucb->dev);
 			ismmucb->dev = NULL;
 			mutex_unlock(&ismmucb->map_mutex);
 			spin_lock_irqsave(&cctx->lock, flags);
@@ -10513,8 +11666,6 @@ void fastrpc_register_wakeup_source(struct device *dev,
 static void fastrpc_notify_user_ctx(struct fastrpc_invoke_ctx *ctx, int retval,
 		u32 rsp_flags, u32 early_wake_time)
 {
-	u32 tgid_app = ctx->fl->tgid_app;
-
 	if (ctx->cctx) {
 		if (!atomic_read(&ctx->cctx->teardown))
 			fastrpc_pm_awake(ctx->fl);
@@ -10529,19 +11680,19 @@ static void fastrpc_notify_user_ctx(struct fastrpc_invoke_ctx *ctx, int retval,
 		/* normal and complete response with return value */
 		ctx->is_work_done = true;
 		trace_fastrpc_msg("wakeup_task: begin");
-		fastrpc_timeline_record(38, tgid_app, ctx->fl->fastrpc_timeline_obj);
+		fastrpc_timeline_record(38, ctx->pid, ctx->fl->fastrpc_timeline_obj);
 		complete(&ctx->work);
 		trace_fastrpc_msg("wakeup_task: end");
 		break;
 	case USER_EARLY_SIGNAL:
-		fastrpc_timeline_record(52, tgid_app, ctx->fl->fastrpc_timeline_obj);
+		fastrpc_timeline_record(52, ctx->pid, ctx->fl->fastrpc_timeline_obj);
 		/* user hint of approximate time of completion */
 		ctx->early_wake_time = early_wake_time;
 		fallthrough;
 	case EARLY_RESPONSE:
 		/* rpc framework early response with return value */
 		trace_fastrpc_msg("wakeup_task: begin");
-		fastrpc_timeline_record(22, tgid_app, ctx->fl->fastrpc_timeline_obj);
+		fastrpc_timeline_record(22, ctx->pid, ctx->fl->fastrpc_timeline_obj);
 		complete(&ctx->work);
 		trace_fastrpc_msg("wakeup_task: end");
 		break;
@@ -10723,8 +11874,7 @@ static int fastrpc_handle_legacy_rsp(struct fastrpc_channel_ctx *cctx,
 			spin_unlock_irqrestore(&cctx->lock, flags);
 			return -EINVAL;
 	}
-	fastrpc_timeline_record(21, ctx->fl->tgid_app,
-		ctx->fl->fastrpc_timeline_obj);
+	fastrpc_timeline_record(21, ctx->pid, ctx->fl->fastrpc_timeline_obj);
 	fastrpc_notify_user_ctx(ctx, rsp.retval, rsp_flags, early_wake_time);
 
 	if (is_glink_wakeup && ctx->fl)
@@ -10864,6 +12014,10 @@ static int fastrpc_retrieve_legacy_info(struct fastrpc_domain *domain)
 		domain->legacy_id = ADSP_DOMAIN_ID;
 		break;
 	case FASTRPC_NSP:
+		if (domain->card != SOC_CARD_ID) {
+			err = -EINVAL;
+			break;
+		}
 		if (domain->instance_id == 0) {
 			domain->legacy_name = (char *)legacy_domains[CDSP_DOMAIN_ID];
 			domain->legacy_id = CDSP_DOMAIN_ID;
@@ -10954,14 +12108,14 @@ void fastrpc_log_internal(struct device *dev,
  * @return 0 on success, negative error code on failure.
  */
 static int fastrpc_add_domain_to_table(struct fastrpc_domain **domain,
-	u32 type, const char* label, u32 instance_id)
+	u32 type, const char* label, u32 instance_id, u32 card_id)
 {
 	struct fastrpc_domain *entry = NULL;
 	struct mutex *hmut = &g_frpc.hmut;
 	u32 phy_id = 0;
 	int err = 0;
 
-	phy_id = GENERATE_DSP_PHYSICAL_ID(type, instance_id);
+	phy_id = GENERATE_DSP_PHYSICAL_ID(card_id, type, instance_id);
 
 	/* Validate if there is an exisitng entry for phy_id */
 	entry = fastrpc_lookup_domain_in_table(phy_id, true);
@@ -10979,6 +12133,7 @@ static int fastrpc_add_domain_to_table(struct fastrpc_domain **domain,
 		entry->phy_id = phy_id;
 		entry->instance_id = instance_id;
 		entry->type = type;
+		entry->card = card_id;
 
 		/* Channel name will be generated as <dsp-type-name><physical-id> */
 		err = snprintf(entry->name, sizeof(entry->name), "%s%d", label, phy_id);
@@ -10989,7 +12144,8 @@ static int fastrpc_add_domain_to_table(struct fastrpc_domain **domain,
 			goto bail;
 		}
 
-		if (instance_id == 0 || (type == FASTRPC_NSP && instance_id == 1))  {
+		if (card_id == SOC_CARD_ID &&
+			(instance_id == 0 || (type == FASTRPC_NSP && instance_id == 1)))  {
 			/*
 			 * For LPASS, SDSP types only the dsp with instance_id 0 is
 			 *                 assigned as legacy adsp, slpi domains
@@ -11013,8 +12169,9 @@ static int fastrpc_add_domain_to_table(struct fastrpc_domain **domain,
 		}
 
 		mutex_lock(hmut);
-		g_frpc.dsp_counter[type]++;
-		entry->id = GENERATE_LOGICAL_DOMAIN_ID(type, g_frpc.dsp_counter[type]);
+		g_frpc.dsp_counter[card_id][type]++;
+		entry->id = (entry->card * 1000000)
+			+ GENERATE_LOGICAL_DOMAIN_ID(type, g_frpc.dsp_counter[card_id][type]);
 		hash_add(g_frpc.fastrpc_domains_table, &entry->node, phy_id);
 		mutex_unlock(hmut);
 	} else {
@@ -11140,8 +12297,9 @@ int fastrpc_populate_domain_from_dt(struct device *rdev,
 				struct fastrpc_domain **domain)
 {
 	const char *label = NULL;
-	u32 type = 0, instance_id = U32_MAX;
+	u32 type = 0, instance_id = U32_MAX, card_id = SOC_CARD_ID;
 	int err = 0;
+	struct device_node *card_node = NULL;
 	bool valid_label = false;
 
 	/* Retrieve the label of DSP from DT */
@@ -11188,6 +12346,37 @@ int fastrpc_populate_domain_from_dt(struct device *rdev,
 		return err;
 	}
 
+	/*
+	 * Retrieve card-id from the fastrpc DT node. Two forms accepted:
+	 *   qcom,card-id = <N>;             literal integer on this node
+	 *   qcom,card-id = <&parent_node>;  phandle to a parent that owns
+	 *                                   qcom,card-id = <N>
+	 * Integrated NSPs omit the property entirely; card_id stays
+	 * SOC_CARD_ID(0).
+	 */
+	card_node = of_parse_phandle(rdev->of_node, "qcom,card-id", 0);
+	if (card_node) {
+		err = of_property_read_u32(card_node, "qcom,card-id", &card_id);
+		if (err < 0) {
+			dev_err(rdev, "Error %d: %s: qcom,card-id phandle target %pOF has no qcom,card-id\n",
+				err, __func__, card_node);
+			of_node_put(card_node);
+			return err;
+		}
+		of_node_put(card_node);
+	} else {
+		err = of_property_read_u32(rdev->of_node, "qcom,card-id", &card_id);
+		if (err < 0) {
+			err = 0;
+			card_id = SOC_CARD_ID;
+		}
+	}
+	if (card_id > MAX_FW_CARD_ID) {
+		dev_err(rdev, "Error: %s: card-id %u from DT exceeds max supported %u\n",
+			__func__, card_id, MAX_FW_CARD_ID);
+		return -EINVAL;
+	}
+
 	/* Retrieve the instance id of the DSP, fail the call if not specified */
 	err = of_property_read_u32(rdev->of_node, "instance-id", &instance_id);
 	if (err < 0) {
@@ -11197,7 +12386,7 @@ int fastrpc_populate_domain_from_dt(struct device *rdev,
 	}
 
 	/* Add the info to the domain table */
-	err = fastrpc_add_domain_to_table(domain, type, label, instance_id);
+	err = fastrpc_add_domain_to_table(domain, type, label, instance_id, card_id);
 	if (err < 0) {
 		dev_err(rdev, "Error %d: %s: failed to add domain %s to table (type %u, instance id %u)",
 			err, __func__, label, type, instance_id);
@@ -11286,7 +12475,7 @@ bail:
 
 static int fastrpc_init(void)
 {
-	int ret, i;
+	int ret, i, j;
 #ifdef CONFIG_DEBUG_FS
 	struct dentry *debugfs_root = NULL;
 #endif
@@ -11296,8 +12485,9 @@ static int fastrpc_init(void)
 	idr_init(&g_frpc.mdctx_idr);
 	hash_init(g_frpc.fastrpc_domains_table);
 	fastrpc_sysfs_register_kset();
-	for (i = 0; i < FASTRPC_MAX_DSP_TYPE; i++) {
-		g_frpc.dsp_counter[i] = -1;
+	for (i = 0; i <= MAX_FW_CARD_ID; i++) {
+		for (j = 0; j < FASTRPC_MAX_DSP_TYPE; j++)
+			g_frpc.dsp_counter[i][j] = -1;
 	}
 	ret = platform_driver_register(&fastrpc_cb_driver);
 	if (ret < 0) {

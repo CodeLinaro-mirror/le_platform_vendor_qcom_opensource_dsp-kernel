@@ -412,6 +412,7 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	INIT_LIST_HEAD(&data->users);
 	INIT_LIST_HEAD(&data->gmaps);
 	INIT_LIST_HEAD(&data->rootheap_bufs.list);
+	INIT_LIST_HEAD(&data->discrete_rootheap_bufs.list);
 	mutex_init(&data->wake_mutex);
 	spin_lock_init(&data->lock);
 	spin_lock_init(&(data->gmsg_log.tx_lock));
@@ -431,7 +432,7 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 #if FRPC_RING_BUFFER_ENABLED
 	init_waitqueue_head(&data->log.wq);
 #endif
-	err = fastrpc_scheduler_init(&data->scheduler);
+	err = fastrpc_scheduler_init(&data->scheduler, domain);
 	if (err)
 		goto free_data;
 	data->domain_id = domain->id;

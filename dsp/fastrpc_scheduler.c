@@ -21,27 +21,26 @@
 #define FASTRPC_APP_PRIORITY_DEFAULT	1000
 
 /*
- * Build and post a workinfo notification for a work.
- * fastrpc_npu_post_workinfo() uses GFP_ATOMIC internally, so this is
- * safe to call under sched->lock.
+ * Build a workinfo payload from @work.  Cheap scalar copy, safe under
+ * sched->lock; fastrpc_workinfo_post() does the heavy lifting after unlock.
  */
-static void fastrpc_workinfo_notify(struct fastrpc_scheduler *sched,
-				    struct fastrpc_work_node *work,
-				    int event, u32 reason)
+static void fastrpc_workinfo_build(struct fastrpc_scheduler *sched,
+				   struct fastrpc_work_node *work,
+				   int event, u32 reason,
+				   struct npu_work_info *info)
 {
 	struct fastrpc_channel_ctx *cctx =
 		container_of(sched, struct fastrpc_channel_ctx,
 			     scheduler);
-	struct npu_work_info info = {};
 
-	info.timestamp_ms	 = ktime_to_ms(ktime_get_real());
-	info.event		 = (u32)event;
-	info.reason		 = reason;
-	info.uid		 = work->app_id;
-	info.debug_pid		 = work->app_id;
-	info.domain		 = cctx->domain_id;
-	info.job_priority	 = (s32)work->work_prio;
-	info.effective_priority	 = (s32)work->eff_prio;
+	info->timestamp_ms	 = ktime_to_ms(ktime_get_real());
+	info->event		 = (u32)event;
+	info->reason		 = reason;
+	info->uid		 = work->app_id;
+	info->debug_pid		 = work->app_id;
+	info->domain		 = cctx->domain_id;
+	info->job_priority	 = (s32)work->work_prio;
+	info->effective_priority = (s32)work->eff_prio;
 	/* group_id and debug_feature_id: encoding TBD with userspace */
 	pr_debug("%s: event=%s reason=%u handle=0x%llx app_id=%d work_prio=%d eff_prio=%d domain=%d\n",
 		__func__,
@@ -51,8 +50,36 @@ static void fastrpc_workinfo_notify(struct fastrpc_scheduler *sched,
 		(int)work->work_prio, (int)work->eff_prio,
 		cctx->domain_id);
 	trace_fastrpc_npu_workinfo(cctx->domain_id, (s32)work->work_id,
-		(s32)work->app_id, (u32)event, reason, 0);
+				   (s32)work->app_id, (u32)event, reason, 0);
+}
+
+/*
+ * Post a prebuilt payload to the HAL queue.  Takes @info by value (no
+ * reference to the work node), so it is safe to call after unlock even
+ * if the node has already been freed.
+ */
+static void fastrpc_workinfo_post(struct fastrpc_scheduler *sched,
+				  struct npu_work_info info)
+{
+	struct fastrpc_channel_ctx *cctx =
+		container_of(sched, struct fastrpc_channel_ctx,
+			     scheduler);
+
 	fastrpc_npu_post_workinfo(cctx, &info);
+}
+
+/*
+ * Build + post in one step, for callers not on the hot START/END path
+ * (kthread bulk-drain, teardown).  Must be called under sched->lock.
+ */
+static void fastrpc_workinfo_notify(struct fastrpc_scheduler *sched,
+				    struct fastrpc_work_node *work,
+				    int event, u32 reason)
+{
+	struct npu_work_info info = {};
+
+	fastrpc_workinfo_build(sched, work, event, reason, &info);
+	fastrpc_workinfo_post(sched, info);
 }
 
 /*
@@ -638,6 +665,7 @@ static int fastrpc_scheduler_thread(void *data)
 			!list_empty(&sched->abort_list) ||
 			!list_empty(&sched->done_list) ||
 			READ_ONCE(sched->prio_update_pending) ||
+			READ_ONCE(sched->admit_pending) ||
 			kthread_should_stop())) {
 			if (signal_pending(current)) {
 				/* Interrupted by signal; flush to avoid busy-spin */
@@ -649,6 +677,9 @@ static int fastrpc_scheduler_thread(void *data)
 			break;
 
 		spin_lock(&sched->lock);
+
+		/* Consume the inline-END admission hint before the stages run. */
+		sched->admit_pending = false;
 
 		/*
 		 * Stage 1: remove aborted PENDING works from the rbtree
@@ -831,6 +862,8 @@ int fastrpc_work_add(struct fastrpc_user *fl,
 	u32 cap = 0;
 	int result = 0;
 	int err = 0;
+	/* Inline fast-path payloads: built under lock, posted after unlock. */
+	struct npu_work_info wi_req = {}, wi_start = {};
 
 	/*
 	 * Gate: verify the caller is permitted to submit work for this
@@ -1012,23 +1045,24 @@ int fastrpc_work_add(struct fastrpc_user *fl,
 				wnode->result = NULL;
 
 				/*
-				 * Same two events, same order, that the
-				 * kthread emits from stage 3 and stage 5,
-				 * so the HAL's workinfo stream is
-				 * indistinguishable between paths.
+				 * Same two events, same order, as the
+				 * kthread's stage 3 and stage 5.
 				 */
-				fastrpc_workinfo_notify(sched, wnode,
+				fastrpc_workinfo_build(sched, wnode,
 					WORK_REQUESTED,
-					NPU_WORK_REASON_NONE);
-				fastrpc_workinfo_notify(sched, wnode,
+					NPU_WORK_REASON_NONE, &wi_req);
+				fastrpc_workinfo_build(sched, wnode,
 					WORK_STARTED,
-					NPU_WORK_REASON_START_INITIAL);
+					NPU_WORK_REASON_START_INITIAL, &wi_start);
 
 				pr_debug("%s: handle=0x%llx app_id=%d raw_prio=%u work_prio=%u eff_prio=%u ref_prio=%u -> ADMITTED (inline)\n",
 					__func__, work->handle, work->appid,
 					work->priority, wnode->work_prio,
 					wnode->eff_prio, sched->ref_prio);
 				spin_unlock(&sched->lock);
+				/* wi_req/wi_start are self-contained; safe to post after unlock. */
+				fastrpc_workinfo_post(sched, wi_req);
+				fastrpc_workinfo_post(sched, wi_start);
 				return 0;
 			}
 		}
@@ -1081,13 +1115,15 @@ int fastrpc_work_add(struct fastrpc_user *fl,
  *                        incoming_list; kthread kfrees during drain.
  *   PENDING  -> ABORTED: unblock waiter, move to abort_list.  Kthread
  *                        will rb_erase + kfree.
- *   ADMITTED -> DONE:    stage on done_list.  Kthread removes from
- *                        executing_list, recalcs ref_prio, sends
- *                        WORK_ENDED notification, and kfrees.
+ *   ADMITTED -> DONE:    if nothing is staged for the kthread, clean up
+ *                        inline (unlink, recalc ref_prio, WORK_ENDED,
+ *                        kfree); otherwise stage on done_list.
  *   ABORTED / DONE:      already being cleaned up; return -ENOENT.
  *
  * Returns 0 on success, -ENOENT if work not found or already removed.
- * This function does NOT call kfree.  The kthread is the sole owner.
+ *
+ * Ownership: the ADMITTED -> DONE cmpxchg grants this function exclusive
+ * ownership of the node, which is what makes the inline kfree safe.
  */
 int fastrpc_work_remove(struct fastrpc_user *fl,
 		       struct fastrpc_ioctl_remote_work *work)
@@ -1172,13 +1208,9 @@ int fastrpc_work_remove(struct fastrpc_user *fl,
 
 	case WORK_STATE_ADMITTED:
 		/*
-		 * Work was admitted and is on executing_list.
-		 * Transition to DONE and stage on done_list.
-		 * The kthread performs the structural cleanup
-		 * (exec_node removal, ref_prio recalc, notification)
-		 * and kfree via fastrpc_drain_done_list.
-		 * user_node is removed here to protect against fl
-		 * being freed before the kthread processes done_list.
+		 * Work was admitted; transition to DONE.  The cmpxchg is
+		 * the ownership gate -- once won, no other path can touch
+		 * this node, so we may clean it up ourselves inline.
 		 */
 		old = atomic_cmpxchg(&wnode->state,
 				     WORK_STATE_ADMITTED,
@@ -1190,6 +1222,60 @@ int fastrpc_work_remove(struct fastrpc_user *fl,
 		trace_fastrpc_npu_sched(__func__, wnode->handle, wnode->app_id, fl,
 					WORK_STATE_DONE, wnode->work_prio,
 					wnode->eff_prio, sched->ref_prio, 0);
+
+		/*
+		 * Eligible for inline cleanup only when nothing is already
+		 * staged for the kthread -- otherwise our WORK_ENDED would
+		 * jump ahead of an earlier one still owed by the kthread.
+		 * incoming_list/prio_update_pending don't gate WORK_ENDED
+		 * ordering, so they're not checked here.
+		 */
+		if (list_empty(&sched->done_list) &&
+		    list_empty(&sched->abort_list)) {
+			struct npu_work_info wi_end = {};
+			bool have_pending;
+
+			/*
+			 * Unlink before freeing: exec_node first (so
+			 * recalc_ref_prio below excludes this work), then
+			 * user_node and app_node (walked by user_cleanup()
+			 * and fastrpc_find_work() respectively -- must be
+			 * unlinked before the free to avoid a UAF).
+			 * staging_node needs no action; already well-formed.
+			 */
+			list_del(&wnode->exec_node);
+			list_del(&wnode->app_node);
+			list_del_init(&wnode->user_node);
+			fastrpc_recalc_ref_prio(sched);
+
+			/*
+			 * Freeing this work may make a PENDING work
+			 * admissible.  The kthread's wait condition doesn't
+			 * watch pending_tree, so signal it explicitly.
+			 */
+			have_pending = !RB_EMPTY_ROOT(&sched->pending_tree);
+			if (have_pending)
+				sched->admit_pending = true;
+
+			/* Build under lock, post after unlock (mirrors inline admit). */
+			fastrpc_workinfo_build(sched, wnode, WORK_ENDED,
+					       wnode->end_reason, &wi_end);
+			spin_unlock(&sched->lock);
+			fastrpc_workinfo_post(sched, wi_end);
+			fastrpc_work_node_free(wnode);
+			/* Wake the kthread only if a PENDING work might now be admissible. */
+			if (have_pending)
+				wake_up(&sched->wq);
+			return 0;
+		}
+
+		/*
+		 * Slow path: the kthread performs the structural cleanup
+		 * (exec_node removal, ref_prio recalc, notification)
+		 * and kfree via fastrpc_drain_done_list.
+		 * user_node is removed here to protect against fl
+		 * being freed before the kthread processes done_list.
+		 */
 		list_del_init(&wnode->user_node);
 		list_add_tail(&wnode->staging_node,
 			      &sched->done_list);
@@ -1216,11 +1302,23 @@ int fastrpc_work_remove(struct fastrpc_user *fl,
  * The kthread runs at SCHED_FIFO priority MAX_RT_PRIO/2 because every
  * remote_work_control(START) blocks on its admission pass; see the comment
  * at the kthread_create() call below.
+ * The NPU priority scheduler is only meaningful on the integrated NSP
+ * (cdsp) channel: the adsp (LPASS) channel never receives
+ * FASTRPC_INVOKE_REMOTE_WORK traffic, so the kthread is skipped for it.
+ * Discrete PCIe DSP cards (FASTRPC_DOMAIN_IS_DISCRETE) can receive
+ * that traffic, but the scheduler is not used for them either.
+ * For both cases, all data structures are still initialized and
+ * sched->stop is pre-set so that fastrpc_work_add() takes its existing
+ * early-reject path (-ESHUTDOWN) instead of blocking on a completion
+ * no kthread will ever signal.
  */
-int fastrpc_scheduler_init(struct fastrpc_scheduler *sched)
+int fastrpc_scheduler_init(struct fastrpc_scheduler *sched,
+			   struct fastrpc_domain *domain)
 {
 	struct sched_param param = { .sched_priority = MAX_RT_PRIO / 2 };
 	int ret = 0;
+	bool skip_kthread = FASTRPC_DOMAIN_IS_DISCRETE(domain) ||
+			    (domain && domain->type == FASTRPC_LPASS);
 
 	sched->pending_tree = RB_ROOT;
 	INIT_LIST_HEAD(&sched->executing_list);
@@ -1233,6 +1331,7 @@ int fastrpc_scheduler_init(struct fastrpc_scheduler *sched)
 	sched->ref_prio = U32_MAX;
 	atomic_set(&sched->workid_seq, 0);
 	sched->prio_update_pending = false;
+	sched->admit_pending = false;
 	sched->stop = false;
 	sched->kthread = NULL;
 
@@ -1252,6 +1351,17 @@ int fastrpc_scheduler_init(struct fastrpc_scheduler *sched)
 	 */
 	sched->kthread = kthread_create(fastrpc_scheduler_thread, sched,
 					"fastrpc_sched");
+	sched->stop = skip_kthread;
+	sched->kthread = NULL;
+
+	if (skip_kthread) {
+		pr_info("%s: scheduler kthread disabled for domain %s (id %u)\n",
+			__func__, domain->name, domain->id);
+		return 0;
+	}
+
+	sched->kthread = kthread_run(fastrpc_scheduler_thread, sched,
+				     "fastrpc_sched");
 	if (IS_ERR(sched->kthread)) {
 		ret = PTR_ERR(sched->kthread);
 

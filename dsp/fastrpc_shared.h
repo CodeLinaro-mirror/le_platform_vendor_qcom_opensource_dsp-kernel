@@ -26,12 +26,28 @@
 #include "../include/uapi/misc/fastrpc.h"
 #include "fastrpc_timeline.h"
 
+/* To check if config flag was present indicating discrete NSPs in system */
+#ifdef CONFIG_FASTRPC_QNA
+#include <linux/qna.h>
+#endif
+
+/* Alignment constants shared between dsp-kernel and qna-kernel */
+#define FASTRPC_MEM_ALIGN_4K    (4096)
+#define FASTRPC_MEM_ALIGN_1M    (1024 * 1024)
+
 #if (KERNEL_VERSION(6, 3, 0) <= LINUX_VERSION_CODE)
 #include <linux/cpu.h>
 #include <linux/firmware/qcom/qcom_scm.h>
 #else
 #include <linux/qcom_scm.h>
 #endif
+
+#ifdef CONFIG_FASTRPC_QNA
+#include <qna.h>
+#endif
+
+/* Opaque type; full definition lives in <qna.h> (CONFIG_FASTRPC_QNA only) */
+struct qna_discrete_alloc;
 
 #define ADSP_DOMAIN_ID (0)
 #define MDSP_DOMAIN_ID (1)
@@ -265,15 +281,19 @@
  *     Page 5 : map debug log buf
  *     Page 6 : DSP RTOS memory donation
  *     Page 7 : preload buf
- *     Page 8 : performance timeline buffer for userpsace
+ *     Page 8 : performance timeline buffer for userspace
  *     Page 9 : performance timeline buffer for rootpd
  */
-#define NUM_PAGES_WITH_SHARED_BUF 2
-#define NUM_PAGES_WITH_ROOTHEAP_BUF 3
-#define NUM_PAGES_WITH_PROC_INIT_SHAREDBUF 4
-#define NUM_PAGES_WITH_MAP_DEBUG_BUF 5
-#define NUM_PAGES_WITH_DSP_RTOS_MEM_DONATION 6
-#define NUM_PAGES_WITH_PRELOAD_BUF 7
+#define NUM_PAGES_WITH_INIT_MEM_BUF            1
+#define NUM_PAGES_WITH_SHARED_BUF              2
+#define NUM_PAGES_WITH_ROOTHEAP_BUF            3
+#define NUM_PAGES_WITH_PROC_INIT_SHAREDBUF     4
+#define NUM_PAGES_WITH_MAP_DEBUG_BUF           5
+#define NUM_PAGES_WITH_DSP_RTOS_MEM_DONATION   6
+#define NUM_PAGES_WITH_PRELOAD_BUF             7
+
+/* Max scatter-gather blocks per buffer. */
+#define FASTRPC_MAX_SG_PAGES_PER_BUF 16
 
 /*
  * Num of pages shared with init attach 2 call
@@ -463,19 +483,36 @@
 	(flag == FASTRPC_MAP_FD_EXTENDED || \
 	flag == FASTRPC_MAP_FD_DELAYED_EXTENDED)
 
+/* Card ID for the integrated SoC DSP. Discrete Firewheel cards use card >= 1. */
+#define SOC_CARD_ID 0
+
+/*
+ * Maximum Firewheel card index supported (cards 1 and 2, plus integrated card 0).
+ * Supports up to two discrete Firewheel (CPN3050) PCIe cards alongside the
+ * integrated NSP (card 0). Userspace (MAX_DYNAMIC_DOMAINS in fastrpc_internal.h)
+ * is sized accordingly — both constants must be updated together when scaling.
+ * dsp_counter is sized [MAX_FW_CARD_ID + 1] to cover indices 0..MAX_FW_CARD_ID.
+ */
+#define MAX_FW_CARD_ID 2
+
+/* Check if domain is a discrete DSP (card_id > SOC_CARD_ID) */
+#define FASTRPC_DOMAIN_IS_DISCRETE(domain) (domain && domain->card > SOC_CARD_ID)
+
 /*
  * Generates a physical ID for a DSP (Digital Signal Processor) device.
  *
  * The resulting physical ID is a composite value consisting of:
- *   Type identifier multiplied by 1000, plus the instance identifier
+ *   Card id multiplied by 1000000, plus type identifier multiplied by
+ *   1000, plus the instance identifier
  *
+ * @param card        : Card id
  * @param type        : Type identifier for the DSP device
  * @param instance_id : Instance identifier for the DSP device
  *
  * @return The generated physical ID for the DSP device
  */
-#define GENERATE_DSP_PHYSICAL_ID(type, instance_id) \
-	((type * 1000) + instance_id)
+#define GENERATE_DSP_PHYSICAL_ID(card, type, instance_id) \
+	((card * 1000000) + (type * 1000) + instance_id)
 
 /*
  * Generates a unique logical domain ID by combining a type and counter.
@@ -646,6 +683,10 @@ enum fastrpc_cb_pd_types {
 	USER_UNSIGNEDPD_POOL      = 9,  /* DSP User Dynamic Unsigned PD pool */
 	EXT_MAP_PD_TYPE           = 10, /* DSP extended mapping */
 	ASC_STATICPD              = 11, /* ADSP Camera static ASC PD */
+	NS_CHANNEL_SHARED         = 12, /* Non secure PD shared across channels
+	                                 * Allows multiple channels to share the
+	                                 * same context bank
+	                                 */
 	MAX_PD_TYPE,                    /* Max PD type */
 };
 
@@ -684,6 +725,7 @@ enum fastrpc_process_method_ids {
 	FASTRPC_RMID_KCOMM_REMOTE_CALL  = 14,
 	FASTRPC_RMID_INIT_ATTACH2       = 16,
 	FASTRPC_RMID_INIT_KERNEL_DISPATCH = 17,
+	FASTRPC_RMID_INIT_CREATE_ATTR_SGL = 18,
 	FASTRPC_RMID_INIT_MAX,
 };
 
@@ -890,6 +932,28 @@ struct frpc_transport_session_control {
 struct fastrpc_phy_page {
 	u64 addr;		/* physical address */
 	u64 size;		/* size of contiguous region */
+};
+
+/* Integrated NSP process create payload. */
+struct fastrpc_process_create_args {
+	int pgid;
+	u32 namelen;
+	u32 filelen;
+	u32 pageslen;
+	u32 attrs;
+	u32 siglen;
+};
+
+/* Discrete NSP process create payload. */
+struct fastrpc_process_create_sgl_args {
+	int pgid;
+	u32 namelen;
+	u32 filelen;
+	u32 buf_types_len;
+	u32 pages_per_buf_len;
+	u32 flat_pages_len;
+	u32 attrs;
+	u32 siglen;
 };
 
 struct fastrpc_phy_page2 {
@@ -1153,9 +1217,30 @@ struct fastrpc_map {
 	struct kref refcount;
 	int secure;
 	atomic_t state;
+	/*
+	 * Negative err set by map call if mem_map_to_dsp fails and
+	 * the dma_buf ref was never "transferred" into map->buf. Tells the
+	 * kref_release callback to skip dma_buf_put.
+	 */
+	int map_err;
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,16,0))
 	/* Retained IOVA address and size */
 	struct dma_iova_state iova_state;
+#endif
+	/*
+	 * Scatter-gather physical page list for discrete allocations.
+	 * NULL for regular SMMU-mapped buffers. Allocated
+	 * in fastrpc_discrete_map_create, freed in kref_release.
+	 */
+	struct fastrpc_phy_page *sg_pages;
+	unsigned int num_sg_pages;
+#ifdef CONFIG_FASTRPC_QNA
+	/*
+	 * Discrete allocation descriptor: address and size of each
+	 * scatter-gather block backing this map. Set in
+	 * fastrpc_discrete_map_create; NULL for regular SMMU-mapped buffers.
+	 */
+	struct qna_discrete_alloc *discrete_alloc;
 #endif
 };
 
@@ -1266,6 +1351,13 @@ struct heap_bufs {
 	/* Number of bufs */
 	unsigned int num;
 };
+
+#ifdef CONFIG_FASTRPC_QNA
+struct fastrpc_rootheap_sg_node {
+	struct list_head node;
+	struct qna_discrete_alloc *alloc;
+};
+#endif /* CONFIG_FASTRPC_QNA */
 
 struct fastrpc_domain;
 
@@ -1397,6 +1489,8 @@ struct fastrpc_channel_ctx {
 	atomic_t teardown;
 	/* Buffers donated to grow rootheap on DSP */
 	struct heap_bufs rootheap_bufs;
+	/* Discrete buffers donated to grow rootheap on DSP */
+	struct heap_bufs discrete_rootheap_bufs;
 	/* jobid counter to prepend into ctxid */
 	u64 jobid;
 	/* Flag to indicate CB pooling is enabled for channel */
@@ -1489,6 +1583,10 @@ struct fastrpc_domain {
 	 * using old legacy domain ids
 	 */
 	u32 legacy_id;
+
+	/* card id on which DSP is present */
+	u32 card;
+
 	/* Sysfs object for domain */
 	struct kobject kobj_sysfs;
 	/* Channel context for domain */
@@ -1560,6 +1658,8 @@ struct fastrpc_mdctx_info {
 	struct fastrpc_user *fl;
 	/* Kernel generated context id */
 	uint64_t ctx;
+	/* Context spans discrete DSPs */
+	bool is_discrete;
 };
 
 struct fastrpc_internal_config {
@@ -1625,6 +1725,8 @@ enum fastrpc_process_state {
 struct fastrpc_user {
 	struct list_head user;
 	struct list_head maps;
+	/* List of discrete fd maps for this user session */
+	struct list_head discrete_maps;
 	struct list_head pending;
 	struct list_head interrupted;
 	struct list_head mmaps;
@@ -1650,6 +1752,12 @@ struct fastrpc_user {
 	struct fastrpc_pool_ctx *extctx;
 
 	struct fastrpc_buf *init_mem;
+	/* SG allocation backing init_mem on discrete (Firewheel) DSP */
+	struct qna_discrete_alloc *init_mem_sg;
+	/* Rootheap SG donated by this spawn (borrowed; owned by cctx list) */
+	struct qna_discrete_alloc *rootheap_sg;
+	/* SG allocation backing dbglogbuf on discrete (Firewheel) DSP */
+	struct qna_discrete_alloc *dbglogbuf_sg;
 	/* Pre-allocated header buffer */
 	struct fastrpc_buf *pers_hdr_buf;
 	/* proc_init shared buffer */
@@ -1733,6 +1841,10 @@ struct fastrpc_user {
 	u32 max_threads;
 	bool multi_session_support;
 	bool untrusted_process;
+	/* This process currently owns the discrete card */
+	bool claimed_discrete;
+	/* card_id cached at claim time; used in release to avoid cctx/domain deref */
+	u32 claimed_discrete_card_id;
 	bool set_session_info;
 	/* Various states throughout process life cycle */
 	atomic_t state;

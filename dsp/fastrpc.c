@@ -7024,61 +7024,6 @@ static int fastrpc_multidomain_ctx_get_tgids(struct device *dev,
 	return err;
 }
 
-/* Returns true if phy_id is present in the multidomain context's DSP set */
-static bool fastrpc_domain_in_set(struct fastrpc_mdctx_info *set,
-	uint32_t phy_id)
-{
-	uint32_t i = 0;
-
-	for (i = 0; i < set->num_domains; i++) {
-		if (set->phy_ids[i] == phy_id)
-			return true;
-	}
-	return false;
-}
-
-/*
- * Returns true if two multidomain contexts span the same set of DSPs.
- *
- * phy_ids holds one entry per (domain, session) pair, so a multisession
- * context repeats the same phy_id once per session and num_domains carries
- * the session count rather than the number of distinct DSPs. Compare the
- * two contexts by containment in both directions: the forward pass rejects
- * a DSP that b lacks, the reverse pass rejects a DSP that a lacks. Both
- * passes are required - a single direction would report {nsp0} and
- * {nsp0, nsp1} as equal.
- */
-static bool fastrpc_domain_sets_equal(struct fastrpc_mdctx_info *a,
-	struct fastrpc_mdctx_info *b)
-{
-	uint32_t i = 0;
-
-	for (i = 0; i < a->num_domains; i++) {
-		if (!fastrpc_domain_in_set(b, a->phy_ids[i]))
-			return false;
-	}
-	for (i = 0; i < b->num_domains; i++) {
-		if (!fastrpc_domain_in_set(a, b->phy_ids[i]))
-			return false;
-	}
-	return true;
-}
-
-/* Returns true if two multidomain context DSP sets share at least one phy_id */
-static bool fastrpc_domain_sets_intersect(struct fastrpc_mdctx_info *a,
-	struct fastrpc_mdctx_info *b)
-{
-	uint32_t i = 0, j = 0;
-
-	for (i = 0; i < a->num_domains; i++) {
-		for (j = 0; j < b->num_domains; j++) {
-			if (a->phy_ids[i] == b->phy_ids[j])
-				return true;
-		}
-	}
-	return false;
-}
-
 /*
  * Ensure all domains in a multi-domain context share the same class:
  * either all integrated or all discrete. The first domain sets the class;
@@ -7096,29 +7041,6 @@ static int fastrpc_check_domain_class(struct fastrpc_domain *domain,
 		return -EINVAL;
 	}
 	return 0;
-}
-
-/*
- * fastrpc_discrete_combination_available() - Check if a discrete multi-domain
- * context can be created without conflicting with an existing combination.
- * @cand: candidate context, not yet inserted into the idr.
- *
- * Caller must hold g_frpc.gmut. Returns true if no conflict exists.
- */
-static bool fastrpc_discrete_combination_available(struct fastrpc_mdctx_info *cand)
-{
-	struct fastrpc_mdctx_info *other = NULL;
-	int id = 0;
-
-	idr_for_each_entry(&g_frpc.mdctx_idr, other, id) {
-		if (!other->is_discrete)
-			continue;
-		if (fastrpc_domain_sets_equal(other, cand))
-			continue;                 /* identical combination: allowed */
-		if (fastrpc_domain_sets_intersect(other, cand))
-			return false;             /* partial overlap: conflict */
-	}
-	return true;
 }
 
 /* Helper function to initialize multidomain context object */
@@ -7475,14 +7397,6 @@ static int fastrpc_multidomain_ctx_setup(struct fastrpc_user *fl,
 
 	/* Generate kernel context id */
 	mutex_lock(gmut);
-
-	if (mdctx->is_discrete &&
-		!fastrpc_discrete_combination_available(mdctx)) {
-		err = -EBUSY;
-		dev_err(dev, "Error %d: DSP already bound to a different multi-core combination",
-			err);
-		goto bail;
-	}
 
 	err = idr_alloc_cyclic(mdctx_idr, mdctx, 1,
 				FASTRPC_CTX_MAX, GFP_ATOMIC);

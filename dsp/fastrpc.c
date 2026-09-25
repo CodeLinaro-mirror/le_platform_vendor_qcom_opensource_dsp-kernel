@@ -3935,6 +3935,7 @@ static int fastrpc_qna_alloc(struct fastrpc_channel_ctx *cctx,
 		.domains     = &domain_id,
 		.num_domains = 1,
 		.card_no     = cctx->domain->card,
+		.label       = label,
 	};
 	struct qna_mem_req_payload req = {
 		.req_id = QNA_MEM_ALLOC,

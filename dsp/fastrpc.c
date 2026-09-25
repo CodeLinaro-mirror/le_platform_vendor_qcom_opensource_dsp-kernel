@@ -3881,13 +3881,6 @@ return 0;
 }
 #endif
 
-/* Returns true for discrete DSPs. */
-static bool fastrpc_is_discrete_dsp(struct fastrpc_user *fl)
-{
-	return fl && fl->cctx && fl->cctx->domain &&
-		fl->cctx->domain->card != SOC_CARD_ID;
-}
-
 #ifdef CONFIG_FASTRPC_QNA
 /*
  * fastrpc_discrete_free_sg - release a QNA SG allocation.
@@ -4006,11 +3999,17 @@ static int fastrpc_discrete_alloc_rootheap(struct fastrpc_user *fl, u64 size)
 
 	/* Track the donation on the channel and publish it for this spawn. */
 	spin_lock_irqsave(&cctx->lock, flags);
+	if (atomic_read(&cctx->teardown)) {
+		spin_unlock_irqrestore(&cctx->lock, flags);
+		fastrpc_discrete_free_sg(&node->alloc);
+		kfree(node);
+		return -EPIPE;
+	}
 	list_add_tail(&node->node, &cctx->discrete_rootheap_bufs.list);
 	cctx->discrete_rootheap_bufs.num++;
+	fl->rootheap_sg = node->alloc;
 	spin_unlock_irqrestore(&cctx->lock, flags);
 
-	fl->rootheap_sg = node->alloc;
 	return 0;
 }
 
@@ -4024,28 +4023,23 @@ static int fastrpc_discrete_alloc_rootheap(struct fastrpc_user *fl, u64 size)
  */
 static void fastrpc_discrete_drop_rootheap(struct fastrpc_channel_ctx *cctx)
 {
-	struct fastrpc_rootheap_sg_node *n, *found;
+	struct fastrpc_rootheap_sg_node *n, *tmp;
 	unsigned long flags;
+	LIST_HEAD(local);
 
 	if (!cctx)
 		return;
 
-	do {
-		found = NULL;
-		spin_lock_irqsave(&cctx->lock, flags);
-		list_for_each_entry(n, &cctx->discrete_rootheap_bufs.list, node) {
-			list_del(&n->node);
-			cctx->discrete_rootheap_bufs.num--;
-			found = n;
-			break;
-		}
-		spin_unlock_irqrestore(&cctx->lock, flags);
+	spin_lock_irqsave(&cctx->lock, flags);
+	list_splice_init(&cctx->discrete_rootheap_bufs.list, &local);
+	cctx->discrete_rootheap_bufs.num = 0;
+	spin_unlock_irqrestore(&cctx->lock, flags);
 
-		if (found) {
-			fastrpc_discrete_free_sg(&found->alloc);
-			kfree(found);
-		}
-	} while (found);
+	list_for_each_entry_safe(n, tmp, &local, node) {
+		list_del(&n->node);
+		fastrpc_discrete_free_sg(&n->alloc);
+		kfree(n);
+	}
 }
 
 /*
@@ -4519,7 +4513,7 @@ static int fastrpc_alloc_rootheap_buf(struct fastrpc_user *fl,
 	const unsigned int NUM_ROOTHEAP_BUFS =
 		(cctx->rootheap_buf_count != 0) ? cctx->rootheap_buf_count :
 		FASTRPC_DEFAULT_ROOTHEAP_BUF_COUNT;
-	bool is_discrete = fastrpc_is_discrete_dsp(fl);
+	bool is_discrete = FASTRPC_DOMAIN_IS_DISCRETE(fl->cctx->domain);
 	unsigned int donated_rootheap_bufs =
 		is_discrete ? cctx->discrete_rootheap_bufs.num : cctx->rootheap_bufs.num;
 
@@ -4896,8 +4890,9 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	struct fastrpc_invoke_args args[FASTRPC_CREATE_PROCESS_NARGS] = {0};
 	struct fastrpc_enhanced_invoke ioctl;
 	struct fastrpc_phy_page pages[NUM_PAGES_WITH_PERF_TIMLINE_DSP_K_SHAREDBUF] = {0};
-	struct fastrpc_phy_page flat_pages[(NUM_PAGES_WITH_PERF_TIMLINE_DSP_K_SHAREDBUF - 3) +
-		3 * FASTRPC_MAX_SG_PAGES_PER_BUF] = {0};
+	struct fastrpc_phy_page flat_pages[(NUM_PAGES_WITH_PERF_TIMLINE_DSP_K_SHAREDBUF -
+		FASTRPC_NUM_SG_CAPABLE_BUFS) +
+		FASTRPC_NUM_SG_CAPABLE_BUFS * FASTRPC_MAX_SG_PAGES_PER_BUF] = {0};
 	struct fastrpc_map *configmap = NULL;
 	struct fastrpc_buf *imem = NULL;
 	struct fastrpc_pool_ctx *sctx = NULL;
@@ -5047,7 +5042,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 
 	memlen = INIT_MEMLEN_MAX;
 
-	discrete_spawn = fastrpc_is_discrete_dsp(fl);
+	discrete_spawn = FASTRPC_DOMAIN_IS_DISCRETE(fl->cctx->domain);
 
 	if (discrete_spawn)
 		err = fastrpc_qna_alloc(fl->cctx, memlen, "init_mem", 0,
@@ -5296,10 +5291,12 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 
 err_cleanup:
 	/* Free all allocations made during process spawn setup. */
-	if (fl->init_mem) {
-		fastrpc_buf_free(fl->init_mem, false);
-		fl->init_mem = NULL;
-	}
+	spin_lock(&fl->lock);
+	imem = fl->init_mem;
+	fl->init_mem = NULL;
+	spin_unlock(&fl->lock);
+	if (imem)
+		fastrpc_buf_free(imem, false);
 	fastrpc_discrete_free_sg(&fl->init_mem_sg);
 	/*
 	 * rootheap_sg is a borrow pointer into the channel-owned
@@ -5391,16 +5388,19 @@ static inline void fastrpc_channel_update_invoke_cnt(
 void fastrpc_free_user(struct fastrpc_user *fl)
 {
 	struct fastrpc_map *map = NULL, *m = NULL;
+	struct fastrpc_buf *imem = NULL;
 
 	/* Abort all scheduler jobs owned by this user */
 	fastrpc_scheduler_user_cleanup(fl);
 
 	fastrpc_context_list_free(fl);
 
-	if (fl->init_mem) {
-		fastrpc_buf_free(fl->init_mem, false);
-		fl->init_mem = NULL;
-	}
+	spin_lock(&fl->lock);
+	imem = fl->init_mem;
+	fl->init_mem = NULL;
+	spin_unlock(&fl->lock);
+	if (imem)
+		fastrpc_buf_free(imem, false);
 	fastrpc_discrete_free_sg(&fl->init_mem_sg);
 	/*
 	 * rootheap_sg is a borrow pointer into the channel-owned

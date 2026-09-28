@@ -226,6 +226,9 @@
 * First page for init-mem and second page for proc-attrs
 */
 #define PAGESLEN_WITH_SHAREDBUF 2
+/* Max pages including proc_init shared buffer */
+#define NUM_PAGES_WITH_PROC_INIT_SHAREDBUF 3
+#define FASTRPC_ROOT_SHAREDBUF_MAX_SIZE (4 * 1024 * 1024)
 
 /* Unique index flag used for mini dump */
 static int md_unique_index_flag[MAX_UNIQUE_ID] = { 0, 0, 0, 0, 0 };
@@ -4014,8 +4017,10 @@ int fastrpc_internal_invoke2(struct fastrpc_file *fl,
 		if (err)
 			goto bail;
 
-		fl->sharedbuf_info.buf_fd = p.buff_info.buf_fd;
-		fl->sharedbuf_info.buf_size = p.buff_info.buf_size;
+		fl->sharedbuf_info.user_fd = p.buff_info.user_fd;
+		fl->sharedbuf_info.user_size = p.buff_info.user_size;
+		fl->sharedbuf_info.root_addr = p.buff_info.root_addr;
+		fl->sharedbuf_info.root_size = p.buff_info.root_size;
 		break;
 	case FASTRPC_INVOKE2_SESS_INFO:
 		VERIFY(err,
@@ -4159,6 +4164,60 @@ bail:
  * on the remote subsystem.
  * Example: all compute offloads to CDSP
  */
+/**
+ * fastrpc_pack_root_sharedpage() - Packs shared page for rootPD.
+ * @fl: fastrpc user instance.
+ * @pages: pages to be packed for DSP.
+ * @pageslen: Number of pages.
+ *
+ * fastrpc_pack_root_sharedpage packs root shared page during
+ * creation of a dynamic process.
+ *
+ * Return: 0 on success.
+ */
+static int fastrpc_pack_root_sharedpage(struct fastrpc_file *fl,
+	struct smq_phy_page *pages, u32 *pageslen)
+{
+	int err = 0;
+
+	/* Allocate kernel buffer for rootPD shared page */
+	if (fl->sharedbuf_info.root_addr && fl->sharedbuf_info.root_size) {
+		if (fl->sharedbuf_info.root_size > FASTRPC_ROOT_SHAREDBUF_MAX_SIZE) {
+			ADSPRPC_ERR("root_size %u exceeds max allowed\n",
+					fl->sharedbuf_info.root_size);
+			return -EINVAL;
+		}
+		err = fastrpc_buf_alloc(fl, fl->sharedbuf_info.root_size,
+				0, 0, INITMEM_BUF, &fl->proc_init_sharedbuf);
+		if (err) {
+			ADSPRPC_ERR("failed to allocate buffer\n");
+			return err;
+		}
+		/* Copy contents from userspace buffer containing data for rootPD */
+		if (copy_from_user(fl->proc_init_sharedbuf->virt,
+				(void __user *)(uintptr_t)fl->sharedbuf_info.root_addr,
+				fl->sharedbuf_info.root_size)) {
+			err = -EFAULT;
+			goto err_sharedbuf_fail;
+		}
+		/* Update parameters of process-spawn with buffer info */
+		*pageslen = NUM_PAGES_WITH_PROC_INIT_SHAREDBUF;
+		pages[NUM_PAGES_WITH_PROC_INIT_SHAREDBUF - 1].addr =
+			fl->proc_init_sharedbuf->phys;
+		pages[NUM_PAGES_WITH_PROC_INIT_SHAREDBUF - 1].size =
+			fl->proc_init_sharedbuf->size;
+	}
+
+	return 0;
+
+err_sharedbuf_fail:
+	if (fl->proc_init_sharedbuf) {
+		fastrpc_buf_free(fl->proc_init_sharedbuf, 0);
+		fl->proc_init_sharedbuf = NULL;
+	}
+	return err;
+}
+
 static int fastrpc_init_create_dynamic_process(struct fastrpc_file *fl,
 				struct fastrpc_ioctl_init_attrs *uproc)
 {
@@ -4166,7 +4225,7 @@ static int fastrpc_init_create_dynamic_process(struct fastrpc_file *fl,
 	struct fastrpc_ioctl_invoke_async ioctl;
 	struct fastrpc_ioctl_init *init = &uproc->init;
 	 /* First page for init-mem and second page for proc-attrs */
-	struct smq_phy_page pages[PAGESLEN_WITH_SHAREDBUF];
+	struct smq_phy_page pages[NUM_PAGES_WITH_PROC_INIT_SHAREDBUF] = {0};
 	struct fastrpc_mmap *file = NULL;
 	struct fastrpc_buf *imem = NULL;
 	unsigned long imem_dma_attr = 0;
@@ -4298,10 +4357,10 @@ static int fastrpc_init_create_dynamic_process(struct fastrpc_file *fl,
 	fl->init_mem = imem;
 
 	inbuf.pageslen = 1;
-	if ((fl->sharedbuf_info.buf_fd != -1) && fl->sharedbuf_info.buf_size) {
+	if ((fl->sharedbuf_info.user_fd != -1) && fl->sharedbuf_info.user_size) {
 		mutex_lock(&fl->map_mutex);
-		err = fastrpc_mmap_create(fl, fl->sharedbuf_info.buf_fd, NULL, 0,
-			0, fl->sharedbuf_info.buf_size, mflags, &sharedbuf_map);
+		err = fastrpc_mmap_create(fl, fl->sharedbuf_info.user_fd, NULL, 0,
+			0, fl->sharedbuf_info.user_size, mflags, &sharedbuf_map);
 		if (sharedbuf_map)
 			sharedbuf_map->is_filemap = true;
 		mutex_unlock(&fl->map_mutex);
@@ -4311,6 +4370,9 @@ static int fastrpc_init_create_dynamic_process(struct fastrpc_file *fl,
 		/* if shared buff is available send this as the second page and set pageslen as 2 */
 		inbuf.pageslen = PAGESLEN_WITH_SHAREDBUF;
 	}
+
+	/* Process spawn should not fail if unable to pack root buffer */
+	fastrpc_pack_root_sharedpage(fl, pages, &inbuf.pageslen);
 
 	/*
 	 * Prepare remote arguments for dynamic process create
@@ -4333,7 +4395,7 @@ static int fastrpc_init_create_dynamic_process(struct fastrpc_file *fl,
 	pages[0].size = imem->size;
 
 	/* Update IOVA of second page shared with DSP */
-	if (inbuf.pageslen > 1) {
+	if (sharedbuf_map && inbuf.pageslen > 1) {   /* add explicit sharedbuf_map guard */
 		pages[1].addr = sharedbuf_map->phys;
 		pages[1].size = sharedbuf_map->size;
 	}
@@ -4370,6 +4432,11 @@ static int fastrpc_init_create_dynamic_process(struct fastrpc_file *fl,
 	err = fastrpc_internal_invoke(fl, FASTRPC_MODE_PARALLEL, KERNEL_MSG_WITH_ZERO_PID, &ioctl);
 	if (err)
 		goto bail;
+	/* remove buffer on success as no longer required */
+	if (fl->proc_init_sharedbuf) {
+		fastrpc_buf_free(fl->proc_init_sharedbuf, 0);
+		fl->proc_init_sharedbuf = NULL;
+	}
 bail:
 	/*
 	 * Shell is loaded into the donated memory on remote subsystem. So, the
@@ -4382,6 +4449,11 @@ bail:
 		mutex_unlock(&fl->map_mutex);
 	}
 
+	/* Free proc_init_sharedbuf on error path */
+	if (err && fl->proc_init_sharedbuf) {
+		fastrpc_buf_free(fl->proc_init_sharedbuf, 0);
+		fl->proc_init_sharedbuf = NULL;
+	}
 	spin_lock(&fl->hlock);
 	locked = 1;
 	if (err) {
@@ -6628,7 +6700,7 @@ static int fastrpc_device_open(struct inode *inode, struct file *filp)
 	init_completion(&fl->dma_invoke);
 	fl->file_close = FASTRPC_PROCESS_DEFAULT_STATE;
 	filp->private_data = fl;
-	fl->sharedbuf_info.buf_fd = -1;
+	fl->sharedbuf_info.user_fd = -1;
 	mutex_init(&fl->internal_map_mutex);
 	mutex_init(&fl->map_mutex);
 	spin_lock_irqsave(&me->hlock, irq_flags);

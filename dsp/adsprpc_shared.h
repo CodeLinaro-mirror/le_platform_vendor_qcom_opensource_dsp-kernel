@@ -186,8 +186,10 @@ struct remote_buf {
 * during process initialization.
 */
 struct fastrpc_proc_sharedbuf_info {
-	int buf_fd;
-	int buf_size;
+   int user_fd;
+   int user_size;
+   uint64_t root_addr;
+   uint32_t root_size;
 };
 
 struct remote_dma_handle {
@@ -864,6 +866,8 @@ struct fastrpc_file {
 	unsigned int num_pers_hdrs;
 	/* Pre-allocated header buffer */
 	struct fastrpc_buf *pers_hdr_buf;
+	/* proc_init shared buffer */
+	struct fastrpc_buf *proc_init_sharedbuf;
 	/* Pre-allocated buffer divided into N chunks */
 	struct fastrpc_buf *hdr_bufs;
 	/* Store snapshot of memory occupied by different buffers */

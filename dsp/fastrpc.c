@@ -8600,7 +8600,7 @@ int fastrpc_npu_post_workinfo(struct fastrpc_channel_ctx *cctx,
 	spin_lock_irqsave(&cctx->lock, flags);
 	if (cctx->npu_workinfo_queue_len >= NPU_WORKINFO_QUEUE_MAX) {
 		spin_unlock_irqrestore(&cctx->lock, flags);
-		dev_err(cctx->dev, "NPU workinfo: queue full (%d), dropping event\n",
+		dev_warn_ratelimited(cctx->dev, "NPU workinfo: queue full (%d), dropping event\n",
 			NPU_WORKINFO_QUEUE_MAX);
 		trace_fastrpc_npu_workinfo(cctx->domain_id, node->info.id,
 					   node->info.uid, node->info.event,

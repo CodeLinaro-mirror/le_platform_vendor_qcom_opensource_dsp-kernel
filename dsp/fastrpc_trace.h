@@ -1,8 +1,8 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
-/* Copyright (c) 2019-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022, 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Copyright (c) 2019-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
-
 #if !defined(TRACE_FASTRPC_H) || defined(TRACE_HEADER_MULTI_READ)
 #define TRACE_FASTRPC_H
 
@@ -612,6 +612,60 @@ TRACE_EVENT(fastrpc_npu_prio_update,
 
 	TP_printk("domain=%d num_configs=%u retval=%d",
 		__entry->domain, __entry->num_configs, __entry->retval)
+);
+
+TRACE_EVENT(fastrpc_discrete_mem_fd_map,
+
+	TP_PROTO(int fd, int card_no, int domain_id,
+		uint64_t size, uint64_t num_blocks, int map_refs, int flags),
+
+	TP_ARGS(fd, card_no, domain_id, size, num_blocks, map_refs, flags),
+
+	TP_STRUCT__entry(
+		__field(int, fd)
+		__field(int, card_no)
+		__field(int, domain_id)
+		__field(u64, size)
+		__field(u64, num_blocks)
+		__field(int, map_refs)
+		__field(int, flags)
+	),
+
+	TP_fast_assign(
+		__entry->fd = fd;
+		__entry->card_no = card_no;
+		__entry->domain_id = domain_id;
+		__entry->size = size;
+		__entry->num_blocks = num_blocks;
+		__entry->map_refs = map_refs;
+		__entry->flags = flags;
+	),
+
+	TP_printk("fd %d mapped: card %d, domain %d, size %llu bytes, blocks %llu, map_refs %d, flags 0x%x",
+		__entry->fd, __entry->card_no, __entry->domain_id,
+		__entry->size, __entry->num_blocks, __entry->map_refs, __entry->flags)
+);
+
+TRACE_EVENT(fastrpc_discrete_mem_fd_unmap,
+
+	TP_PROTO(int fd, int domain_id, uint64_t size),
+
+	TP_ARGS(fd, domain_id, size),
+
+	TP_STRUCT__entry(
+		__field(int, fd)
+		__field(int, domain_id)
+		__field(u64, size)
+	),
+
+	TP_fast_assign(
+		__entry->fd = fd;
+		__entry->domain_id = domain_id;
+		__entry->size = size;
+	),
+
+	TP_printk("fd %d unmapped: domain %d, size %llu bytes",
+		__entry->fd, __entry->domain_id, __entry->size)
 );
 
 #endif

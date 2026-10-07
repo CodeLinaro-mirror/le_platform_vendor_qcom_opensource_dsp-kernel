@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Copyright (c) 2011-2018, The Linux Foundation. All rights reserved.
  * Copyright (c) 2018, Linaro Limited
- * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 #include <linux/devcoredump.h>
 #include <linux/completion.h>
@@ -655,6 +655,9 @@ static int fastrpc_discrete_map_create(struct fastrpc_user *fl, int fd, int flag
 	list_add_tail(&map->node, &fl->discrete_maps);
 	spin_unlock(&fl->lock);
 
+	trace_fastrpc_discrete_mem_fd_map(fd, fl->cctx->domain->card, fl->cctx->domain_id,
+		map->size, alloc->num_blocks, kref_read(&map->refcount), flags);
+
 	*discrete_map = map;
 	return 0;
 }
@@ -671,6 +674,8 @@ static void fastrpc_discrete_map_free(struct fastrpc_user *fl,
 {
 	if (!fl || !tmap)
 		return;
+
+	trace_fastrpc_discrete_mem_fd_unmap(tmap->fd, fl->cctx->domain_id, tmap->size);
 
 	spin_lock(&fl->lock);
 	list_del(&tmap->node);
@@ -3881,13 +3886,6 @@ return 0;
 }
 #endif
 
-/* Returns true for discrete DSPs. */
-static bool fastrpc_is_discrete_dsp(struct fastrpc_user *fl)
-{
-	return fl && fl->cctx && fl->cctx->domain &&
-		fl->cctx->domain->card != SOC_CARD_ID;
-}
-
 #ifdef CONFIG_FASTRPC_QNA
 /*
  * fastrpc_discrete_free_sg - release a QNA SG allocation.
@@ -3942,6 +3940,7 @@ static int fastrpc_qna_alloc(struct fastrpc_channel_ctx *cctx,
 		.domains     = &domain_id,
 		.num_domains = 1,
 		.card_no     = cctx->domain->card,
+		.label       = label,
 	};
 	struct qna_mem_req_payload req = {
 		.req_id = QNA_MEM_ALLOC,
@@ -4006,11 +4005,17 @@ static int fastrpc_discrete_alloc_rootheap(struct fastrpc_user *fl, u64 size)
 
 	/* Track the donation on the channel and publish it for this spawn. */
 	spin_lock_irqsave(&cctx->lock, flags);
+	if (atomic_read(&cctx->teardown)) {
+		spin_unlock_irqrestore(&cctx->lock, flags);
+		fastrpc_discrete_free_sg(&node->alloc);
+		kfree(node);
+		return -EPIPE;
+	}
 	list_add_tail(&node->node, &cctx->discrete_rootheap_bufs.list);
 	cctx->discrete_rootheap_bufs.num++;
+	fl->rootheap_sg = node->alloc;
 	spin_unlock_irqrestore(&cctx->lock, flags);
 
-	fl->rootheap_sg = node->alloc;
 	return 0;
 }
 
@@ -4024,28 +4029,23 @@ static int fastrpc_discrete_alloc_rootheap(struct fastrpc_user *fl, u64 size)
  */
 static void fastrpc_discrete_drop_rootheap(struct fastrpc_channel_ctx *cctx)
 {
-	struct fastrpc_rootheap_sg_node *n, *found;
+	struct fastrpc_rootheap_sg_node *n, *tmp;
 	unsigned long flags;
+	LIST_HEAD(local);
 
 	if (!cctx)
 		return;
 
-	do {
-		found = NULL;
-		spin_lock_irqsave(&cctx->lock, flags);
-		list_for_each_entry(n, &cctx->discrete_rootheap_bufs.list, node) {
-			list_del(&n->node);
-			cctx->discrete_rootheap_bufs.num--;
-			found = n;
-			break;
-		}
-		spin_unlock_irqrestore(&cctx->lock, flags);
+	spin_lock_irqsave(&cctx->lock, flags);
+	list_splice_init(&cctx->discrete_rootheap_bufs.list, &local);
+	cctx->discrete_rootheap_bufs.num = 0;
+	spin_unlock_irqrestore(&cctx->lock, flags);
 
-		if (found) {
-			fastrpc_discrete_free_sg(&found->alloc);
-			kfree(found);
-		}
-	} while (found);
+	list_for_each_entry_safe(n, tmp, &local, node) {
+		list_del(&n->node);
+		fastrpc_discrete_free_sg(&n->alloc);
+		kfree(n);
+	}
 }
 
 /*
@@ -4519,7 +4519,7 @@ static int fastrpc_alloc_rootheap_buf(struct fastrpc_user *fl,
 	const unsigned int NUM_ROOTHEAP_BUFS =
 		(cctx->rootheap_buf_count != 0) ? cctx->rootheap_buf_count :
 		FASTRPC_DEFAULT_ROOTHEAP_BUF_COUNT;
-	bool is_discrete = fastrpc_is_discrete_dsp(fl);
+	bool is_discrete = FASTRPC_DOMAIN_IS_DISCRETE(fl->cctx->domain);
 	unsigned int donated_rootheap_bufs =
 		is_discrete ? cctx->discrete_rootheap_bufs.num : cctx->rootheap_bufs.num;
 
@@ -4896,8 +4896,9 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 	struct fastrpc_invoke_args args[FASTRPC_CREATE_PROCESS_NARGS] = {0};
 	struct fastrpc_enhanced_invoke ioctl;
 	struct fastrpc_phy_page pages[NUM_PAGES_WITH_PERF_TIMLINE_DSP_K_SHAREDBUF] = {0};
-	struct fastrpc_phy_page flat_pages[(NUM_PAGES_WITH_PERF_TIMLINE_DSP_K_SHAREDBUF - 3) +
-		3 * FASTRPC_MAX_SG_PAGES_PER_BUF] = {0};
+	struct fastrpc_phy_page flat_pages[(NUM_PAGES_WITH_PERF_TIMLINE_DSP_K_SHAREDBUF -
+		FASTRPC_NUM_SG_CAPABLE_BUFS) +
+		FASTRPC_NUM_SG_CAPABLE_BUFS * FASTRPC_MAX_SG_PAGES_PER_BUF] = {0};
 	struct fastrpc_map *configmap = NULL;
 	struct fastrpc_buf *imem = NULL;
 	struct fastrpc_pool_ctx *sctx = NULL;
@@ -5047,7 +5048,7 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 
 	memlen = INIT_MEMLEN_MAX;
 
-	discrete_spawn = fastrpc_is_discrete_dsp(fl);
+	discrete_spawn = FASTRPC_DOMAIN_IS_DISCRETE(fl->cctx->domain);
 
 	if (discrete_spawn)
 		err = fastrpc_qna_alloc(fl->cctx, memlen, "init_mem", 0,
@@ -5296,10 +5297,12 @@ static int fastrpc_init_create_process(struct fastrpc_user *fl,
 
 err_cleanup:
 	/* Free all allocations made during process spawn setup. */
-	if (fl->init_mem) {
-		fastrpc_buf_free(fl->init_mem, false);
-		fl->init_mem = NULL;
-	}
+	spin_lock(&fl->lock);
+	imem = fl->init_mem;
+	fl->init_mem = NULL;
+	spin_unlock(&fl->lock);
+	if (imem)
+		fastrpc_buf_free(imem, false);
 	fastrpc_discrete_free_sg(&fl->init_mem_sg);
 	/*
 	 * rootheap_sg is a borrow pointer into the channel-owned
@@ -5391,16 +5394,19 @@ static inline void fastrpc_channel_update_invoke_cnt(
 void fastrpc_free_user(struct fastrpc_user *fl)
 {
 	struct fastrpc_map *map = NULL, *m = NULL;
+	struct fastrpc_buf *imem = NULL;
 
 	/* Abort all scheduler jobs owned by this user */
 	fastrpc_scheduler_user_cleanup(fl);
 
 	fastrpc_context_list_free(fl);
 
-	if (fl->init_mem) {
-		fastrpc_buf_free(fl->init_mem, false);
-		fl->init_mem = NULL;
-	}
+	spin_lock(&fl->lock);
+	imem = fl->init_mem;
+	fl->init_mem = NULL;
+	spin_unlock(&fl->lock);
+	if (imem)
+		fastrpc_buf_free(imem, false);
 	fastrpc_discrete_free_sg(&fl->init_mem_sg);
 	/*
 	 * rootheap_sg is a borrow pointer into the channel-owned
@@ -7023,44 +7029,6 @@ static int fastrpc_multidomain_ctx_get_tgids(struct device *dev,
 	return err;
 }
 
-/* Returns true if two multidomain context DSP sets contain the same phy_ids */
-static bool fastrpc_domain_sets_equal(struct fastrpc_mdctx_info *a,
-	struct fastrpc_mdctx_info *b)
-{
-	uint32_t i = 0, j = 0;
-	bool found = false;
-
-	if (a->num_domains != b->num_domains)
-		return false;
-	for (i = 0; i < a->num_domains; i++) {
-		found = false;
-		for (j = 0; j < b->num_domains; j++) {
-			if (a->phy_ids[i] == b->phy_ids[j]) {
-				found = true;
-				break;
-			}
-		}
-		if (!found)
-			return false;
-	}
-	return true;
-}
-
-/* Returns true if two multidomain context DSP sets share at least one phy_id */
-static bool fastrpc_domain_sets_intersect(struct fastrpc_mdctx_info *a,
-	struct fastrpc_mdctx_info *b)
-{
-	uint32_t i = 0, j = 0;
-
-	for (i = 0; i < a->num_domains; i++) {
-		for (j = 0; j < b->num_domains; j++) {
-			if (a->phy_ids[i] == b->phy_ids[j])
-				return true;
-		}
-	}
-	return false;
-}
-
 /*
  * Ensure all domains in a multi-domain context share the same class:
  * either all integrated or all discrete. The first domain sets the class;
@@ -7078,29 +7046,6 @@ static int fastrpc_check_domain_class(struct fastrpc_domain *domain,
 		return -EINVAL;
 	}
 	return 0;
-}
-
-/*
- * fastrpc_discrete_combination_available() - Check if a discrete multi-domain
- * context can be created without conflicting with an existing combination.
- * @cand: candidate context, not yet inserted into the idr.
- *
- * Caller must hold g_frpc.gmut. Returns true if no conflict exists.
- */
-static bool fastrpc_discrete_combination_available(struct fastrpc_mdctx_info *cand)
-{
-	struct fastrpc_mdctx_info *other = NULL;
-	int id = 0;
-
-	idr_for_each_entry(&g_frpc.mdctx_idr, other, id) {
-		if (!other->is_discrete)
-			continue;
-		if (fastrpc_domain_sets_equal(other, cand))
-			continue;                 /* identical combination: allowed */
-		if (fastrpc_domain_sets_intersect(other, cand))
-			return false;             /* partial overlap: conflict */
-	}
-	return true;
 }
 
 /* Helper function to initialize multidomain context object */
@@ -7457,14 +7402,6 @@ static int fastrpc_multidomain_ctx_setup(struct fastrpc_user *fl,
 
 	/* Generate kernel context id */
 	mutex_lock(gmut);
-
-	if (mdctx->is_discrete &&
-		!fastrpc_discrete_combination_available(mdctx)) {
-		err = -EBUSY;
-		dev_err(dev, "Error %d: DSP already bound to a different multi-core combination",
-			err);
-		goto bail;
-	}
 
 	err = idr_alloc_cyclic(mdctx_idr, mdctx, 1,
 				FASTRPC_CTX_MAX, GFP_ATOMIC);

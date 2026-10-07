@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/*
- * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
- */
+/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. */
 
 #include <linux/errno.h>
 #include <linux/types.h>

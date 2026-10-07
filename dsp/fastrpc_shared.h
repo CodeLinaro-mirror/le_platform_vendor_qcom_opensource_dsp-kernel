@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
-/* Copyright (c) 2011-2018, The Linux Foundation. All rights reserved.
+/*
+ * Copyright (c) 2011-2018, The Linux Foundation. All rights reserved.
  * Copyright (c) 2018, Linaro Limited
- * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
-
 #ifndef __FASTRPC_SHARED_H__
 #define __FASTRPC_SHARED_H__
 
@@ -294,6 +294,12 @@ struct qna_discrete_alloc;
 
 /* Max scatter-gather blocks per buffer. */
 #define FASTRPC_MAX_SG_PAGES_PER_BUF 16
+
+/*
+ * Exactly 3 of the 9 buffer types (init_mem/rootheap/dbglogbuf) can be SG,
+ * the other 6 are single-page.
+ */
+#define FASTRPC_NUM_SG_CAPABLE_BUFS 3
 
 /*
  * Num of pages shared with init attach 2 call

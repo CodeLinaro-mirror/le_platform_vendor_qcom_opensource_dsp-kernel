@@ -68,6 +68,8 @@ struct fastrpc_work_node {
 	u32			work_prio;	/* work priority from userspace */
 	u32			eff_prio;	/* app_prio + work_prio; sort key */
 	int			app_id;		/* process tgid */
+	uid_t			uid;		/* caller uid captured at START */
+	s32			debug_pid;	/* debug pid captured at START */
 	char			*group_id;	/* inference group ID string */
 	char			*feature_id;	/* feature ID string */
 	u32			work_id;	/* monotonic id for workinfo correlation */

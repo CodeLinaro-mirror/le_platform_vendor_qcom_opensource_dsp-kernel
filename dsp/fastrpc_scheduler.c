@@ -199,7 +199,7 @@ static int fastrpc_npu_check_access(struct fastrpc_channel_ctx *cctx,
 
 	/* Rule 3: caller not registered in the priority table */
 	if (!found) {
-		dev_warn(cctx->dev, "%s: uid %u not in NPU priority table, allowing once and notifying NPU manager\n",
+		dev_warn_ratelimited(cctx->dev, "%s: uid %u not in NPU priority table, allowing once and notifying NPU manager\n",
 			__func__, caller_uid);
 		return 0;
 	}

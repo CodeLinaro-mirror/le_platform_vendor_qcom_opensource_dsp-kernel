@@ -5680,15 +5680,18 @@ skip_user_cleanup:
 	mutex_destroy(&fl->signal_create_mutex);
 	mutex_destroy(&fl->map_mutex);
 	mutex_destroy(&fl->pm_qos_mutex);
-	kfree(fl);
-
 	if (user) {
+		complete(&fl->release_done);
+		if (atomic_dec_and_test(&fl->release_owners_cnt))
+			kfree(fl);
+
 		spin_lock_irqsave(&cctx->lock, flags);
 		fastrpc_channel_update_invoke_cnt(cctx, false);
 		spin_unlock_irqrestore(&cctx->lock, flags);
 
 		fastrpc_channel_ctx_put(cctx);
 	} else {
+		kfree(fl);
 		/*
 		 * Default user-object will be deleted only when the last
 		 * reference to the channel-ctx object is removed. So there is no
@@ -5721,8 +5724,19 @@ static void fastrpc_user_release(struct kref *ref)
 static int fastrpc_device_release(struct inode *inode, struct file *file)
 {
 	struct fastrpc_user *fl = (struct fastrpc_user *)file->private_data;
+	unsigned long ret;
 
 	fastrpc_file_put(fl, false);
+
+	ret = wait_for_completion_timeout(&fl->release_done,
+			msecs_to_jiffies(FASTRPC_RELEASE_TIMEOUT_MS));
+	if (!ret)
+		pr_err("%s: tgid %d timeout, refcount=%d\n",
+			__func__, fl->tgid_frpc, kref_read(&fl->refcount));
+
+	if (atomic_dec_and_test(&fl->release_owners_cnt))
+		kfree(fl);
+
 	file->private_data = NULL;
 	return 0;
 }
@@ -5799,6 +5813,8 @@ static int fastrpc_user_obj_create(struct file *filp,
 	init_waitqueue_head(&fl->proc_state_notif.notif_wait_queue);
 	spin_lock_init(&fl->proc_state_notif.nqlock);
 	init_completion(&fl->dma_invoke);
+	init_completion(&fl->release_done);
+	atomic_set(&fl->release_owners_cnt, FASTRPC_RELEASE_OWNERS_CNT);
 	kref_init(&fl->refcount);
 	INIT_WORK(&fl->put_work, fastrpc_file_put_worker);
 

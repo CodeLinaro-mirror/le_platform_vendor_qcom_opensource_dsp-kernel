@@ -36,11 +36,13 @@ static void fastrpc_workinfo_build(struct fastrpc_scheduler *sched,
 	info->timestamp_ms	 = ktime_to_ms(ktime_get_real());
 	info->event		 = (u32)event;
 	info->reason		 = reason;
-	info->uid		 = work->app_id;
-	info->debug_pid		 = work->app_id;
+	info->uid		 = (s32)work->uid;
+	info->debug_pid		 = work->debug_pid;
+	info->original_uid	 = work->app_id;
 	info->domain		 = cctx->domain_id;
 	info->job_priority	 = (s32)work->work_prio;
 	info->effective_priority = (s32)work->eff_prio;
+	info->version		 = NPU_WORKINFO_VERSION;
 	/* group_id and debug_feature_id: encoding TBD with userspace */
 	pr_debug("%s: event=%s reason=%u handle=0x%llx app_id=%d work_prio=%d eff_prio=%d domain=%d\n",
 		__func__,
@@ -199,7 +201,7 @@ static int fastrpc_npu_check_access(struct fastrpc_channel_ctx *cctx,
 
 	/* Rule 3: caller not registered in the priority table */
 	if (!found) {
-		dev_warn(cctx->dev, "%s: uid %u not in NPU priority table, allowing once and notifying NPU manager\n",
+		dev_warn_ratelimited(cctx->dev, "%s: uid %u not in NPU priority table, allowing once and notifying NPU manager\n",
 			__func__, caller_uid);
 		return 0;
 	}
@@ -925,6 +927,8 @@ int fastrpc_work_add(struct fastrpc_user *fl,
 	wnode->handle = work->handle;
 	wnode->work_type = work->type;
 	wnode->app_id = work->appid;
+	wnode->uid = fl->uid;
+	wnode->debug_pid = fl->tgid_app;
 
 	/*
 	 * Scale the wnode priority to a 1000-unit range using the

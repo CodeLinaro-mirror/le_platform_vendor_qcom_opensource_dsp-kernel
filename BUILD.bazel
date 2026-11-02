@@ -39,6 +39,11 @@ define_vm_modules("seraph-oemvm", "debug-defconfig")
 define_vm_modules("seraph-tuivm", "defconfig")
 define_vm_modules("seraph-oemvm", "defconfig")
 
+define_vm_modules("shikra-tuivm", "debug-defconfig")
+define_vm_modules("shikra-oemvm", "debug-defconfig")
+
+define_vm_modules("shikra-tuivm", "defconfig")
+define_vm_modules("shikra-oemvm", "defconfig")
 define_vm_modules("pikachu-tuivm", "debug-defconfig")
 define_vm_modules("pikachu-oemvm", "debug-defconfig")
 
